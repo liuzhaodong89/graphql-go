@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
@@ -294,15 +295,21 @@ func executeSubFields(p executeFieldsParams) map[string]interface{} {
 		p.Fields = map[string][]*ast.Field{}
 	}
 
+	test := sync.WaitGroup{}
+	test.Add(len(p.Fields))
+
 	finalResults := make(map[string]interface{}, len(p.Fields))
 	for responseName, fieldASTs := range p.Fields {
-		fieldPath := p.Path.WithKey(responseName)
-		resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs, fieldPath)
-		if state.hasNoFieldDefs {
-			continue
-		}
-		finalResults[responseName] = resolved
+		go func() {
+			fieldPath := p.Path.WithKey(responseName)
+			resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs, fieldPath)
+			if !state.hasNoFieldDefs {
+				finalResults[responseName] = resolved
+				test.Done()
+			}
+		}()
 	}
+	test.Wait()
 
 	return finalResults
 }
