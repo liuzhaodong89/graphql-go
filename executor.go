@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	cmap "github.com/orcaman/concurrent-map/v2"
 	"reflect"
 	"sort"
 	"strings"
@@ -299,11 +300,13 @@ func executeSubFields(p executeFieldsParams) map[string]interface{} {
 	test.Add(len(p.Fields))
 
 	mutex := sync.RWMutex{}
-	finalResults := make(map[string]interface{}, len(p.Fields))
+	//finalResults := make(map[string]interface{}, len(p.Fields))
+	finalResults := cmap.New[interface{}]()
 
 	mapSetFunc := func(key string, value interface{}) {
 		mutex.Lock()
-		finalResults[key] = value
+		//finalResults[key] = value
+		finalResults.Set(key, value)
 		mutex.Unlock()
 	}
 
@@ -320,7 +323,7 @@ func executeSubFields(p executeFieldsParams) map[string]interface{} {
 	}
 	test.Wait()
 
-	return finalResults
+	return finalResults.Items()
 }
 
 // dethunkQueue is a structure that allows us to execute a classic breadth-first traversal.
