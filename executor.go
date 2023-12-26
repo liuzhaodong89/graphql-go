@@ -296,18 +296,20 @@ func executeSubFields(p executeFieldsParams) map[string]interface{} {
 		p.Fields = map[string][]*ast.Field{}
 	}
 
-	test := sync.WaitGroup{}
-	test.Add(len(p.Fields))
+	signal := sync.WaitGroup{}
+	signal.Add(len(p.Fields))
 
-	mutex := sync.RWMutex{}
+	//mutex := sync.RWMutex{}
 	//finalResults := make(map[string]interface{}, len(p.Fields))
 	finalResults := cmap.New[interface{}]()
+	//finalResults := sync.Map{}
 
 	mapSetFunc := func(key string, value interface{}) {
-		mutex.Lock()
+		//mutex.Lock()
 		//finalResults[key] = value
 		finalResults.Set(key, value)
-		mutex.Unlock()
+		//finalResults.Store(key, value)
+		//mutex.Unlock()
 	}
 
 	for responseName, fieldASTs := range p.Fields {
@@ -317,11 +319,11 @@ func executeSubFields(p executeFieldsParams) map[string]interface{} {
 			if !state.hasNoFieldDefs {
 				//finalResults[responseName] = resolved
 				mapSetFunc(responseName, resolved)
-				test.Done()
+				signal.Done()
 			}
 		}()
 	}
-	test.Wait()
+	signal.Wait()
 
 	return finalResults.Items()
 }
