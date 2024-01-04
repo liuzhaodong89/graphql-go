@@ -307,6 +307,7 @@ func executeSubFields(p executeFieldsParams) map[string]interface{} {
 	mapSetFunc := func(key string, value interface{}) {
 		//mutex.Lock()
 		//finalResults[key] = value
+		//test := sync.Mutex{}
 		finalResults.Set(key, value)
 		//finalResults.Store(key, value)
 		//mutex.Unlock()
@@ -314,12 +315,13 @@ func executeSubFields(p executeFieldsParams) map[string]interface{} {
 
 	for responseName, fieldASTs := range p.Fields {
 		go func() {
+			defer signal.Done()
+
 			fieldPath := p.Path.WithKey(responseName)
 			resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs, fieldPath)
 			if !state.hasNoFieldDefs {
 				//finalResults[responseName] = resolved
 				mapSetFunc(responseName, resolved)
-				signal.Done()
 			}
 		}()
 	}
