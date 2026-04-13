@@ -2,6 +2,7 @@ package graphql
 
 import (
 	"context"
+	"github.com/graphql-go/graphql/language/ast"
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/parser"
@@ -38,7 +39,14 @@ func Do(p Params) *Result {
 		Body: []byte(p.RequestString),
 		Name: "GraphQL request",
 	})
+	//extErrs := make([]gqlerrors.FormattedError, 0)
+	var parseFinishFn parseFinishFuncHandler
+	var AST *ast.Document
+	var err error
 
+	//astVal, exist := LocalASTbuffer.Get(p.RequestString)
+
+	//if !exist {
 	// run init on the extensions
 	extErrs := handleExtensionsInits(&p)
 	if len(extErrs) != 0 {
@@ -46,16 +54,21 @@ func Do(p Params) *Result {
 			Errors: extErrs,
 		}
 	}
+	//} else if astVal != nil {
+	//	AST = astVal.(*ast.Document)
+	//}
 
-	extErrs, parseFinishFn := handleExtensionsParseDidStart(&p)
+	extErrs, parseFinishFn = handleExtensionsParseDidStart(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
 		}
 	}
 
+	//if AST == nil {
 	// parse the source
-	AST, err := parser.Parse(parser.ParseParams{Source: source})
+	//fmt.Println("local buffer AST is nil")
+	AST, err = parser.Parse(parser.ParseParams{Source: source})
 	if err != nil {
 		// run parseFinishFuncs for extensions
 		extErrs = parseFinishFn(err)
@@ -104,6 +117,8 @@ func Do(p Params) *Result {
 			Errors: extErrs,
 		}
 	}
+	//LocalASTbuffer.Set(p.RequestString, AST)
+	//}
 
 	return Execute(ExecuteParams{
 		Schema:        p.Schema,
