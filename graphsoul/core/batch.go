@@ -15,8 +15,14 @@ func (br *BatchResult) IsInterrupt() bool {
 }
 
 type Batch struct {
+	//id越大代表顺序越靠后
+	batchId    uint32
 	concurrent bool
 	steps      []Step
+}
+
+func (b *Batch) GetBatchId() uint32 {
+	return b.batchId
 }
 
 func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {

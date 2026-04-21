@@ -17,11 +17,7 @@ func NewRundata(originalParams map[string]any) *Rundata {
 	return rundata
 }
 
-func (r *Rundata) SetFieldResult(fieldId uint32, fieldResult any, path []string) {
-	fieldResponse := &FieldResponse{
-		response:  fieldResult,
-		fieldPath: path,
-	}
+func (r *Rundata) SetFieldResult(fieldId uint32, fieldResponse *FieldResponse) {
 	r.fieldResultMap.Set(fieldId, fieldResponse)
 }
 
@@ -60,6 +56,10 @@ func (r *Rundata) GetOriginalParamByKey(inputKey string) any {
 	return r.originalParams[inputKey]
 }
 
+func (r *Rundata) GetAllFieldErrors() []*FieldError {
+	return nil
+}
+
 type FieldErrorType uint8
 
 const FIELD_ERROR_TYPE_FIELD = 0
@@ -72,7 +72,15 @@ type FieldError struct {
 	fieldPath []string
 }
 
+type FieldResponseType uint8
+
+const FIELD_RESPONSE_TYPE_NORMAL FieldResponseType = 0
+const FIELD_RESPONSE_TYPE_ARRAY FieldResponseType = 1
+
 type FieldResponse struct {
-	response  any
-	fieldPath []string
+	responseType       FieldResponseType
+	responses          []any
+	fieldPaths         [][]string
+	arrayParentKeyMap  map[any]any
+	indexOfParentArray uint32
 }
