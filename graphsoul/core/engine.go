@@ -21,9 +21,13 @@ func (r *SGraphResult) GetErrors() []*FieldError {
 
 type SGraphEngine struct{}
 
-func (e *SGraphEngine) Execute(plan *build.SGraphPlan, originalParams map[string]any) *SGraphResult {
+func (e *SGraphEngine) Execute(plan *build.SGraphPlan) *SGraphResult {
 	//组装Rundata和context
-	rundata := NewRundata(originalParams)
+	var maxFieldId uint32
+	if plan != nil {
+		maxFieldId = plan.MaxFieldId()
+	}
+	rundata := NewRundata(plan.GetOriginalInputs(), maxFieldId)
 	ctx := context.TODO()
 	//组装Batches
 	if plan != nil {
@@ -159,8 +163,9 @@ func (e *SGraphEngine) assembleGraphResult(plan *build.SGraphPlan, rundata *Rund
 		return result
 	}
 
-	responseMap := make(map[string]any)
 	roots := plan.GetRoots()
+	responseMap := make(map[string]any, len(roots))
+
 	for _, root := range roots {
 		if root.GetFieldIsList() {
 			responseMap[root.GetResponseName()] = e.buildListValues(root, rundata)
@@ -181,10 +186,10 @@ func (e *SGraphEngine) assembleGraphResult(plan *build.SGraphPlan, rundata *Rund
 
 func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, rundata *Rundata) map[string]any {
 	if field != nil {
-		result := make(map[string]any)
-
 		fieldResponse := rundata.GetFieldResultByFieldId(field.GetFieldId())
 		children := field.GetChildrenFields()
+
+		result := make(map[string]any, len(children))
 		for _, child := range children {
 			if child.GetFieldIsList() {
 				result[child.GetResponseName()] = e.buildListValues(child, rundata)
@@ -245,10 +250,11 @@ func (e *SGraphEngine) buildListValues(field *build.FieldPlan, rundata *Rundata)
 }
 
 func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFieldResponseMap map[string]any, rundata *Rundata) map[string]any {
-	result := make(map[string]any)
+	var result map[string]any
 	//TODO 获取当前字段的子字段，遍历每个子字段的类型组装Map
 	if field != nil {
 		children := field.GetChildrenFields()
+		result = make(map[string]any, len(children))
 		for _, child := range children {
 			if child.GetFieldIsList() {
 				result[child.GetResponseName()] = e.buildListValuesInListObject(child, currentFieldResponseMap, rundata)
@@ -276,7 +282,7 @@ func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFie
 }
 
 func (e *SGraphEngine) buildListValuesInListObject(field *build.FieldPlan, parentFieldResponse map[string]any, rundata *Rundata) []any {
-	result := make([]any, 0)
+	result := make([]any, 0, len(field.GetChildrenFields()))
 	if field != nil {
 		fieldResult := rundata.GetFieldResultByFieldId(field.GetFieldId())
 		if fieldResult == nil {
@@ -307,7 +313,7 @@ func (e *SGraphEngine) buildListValuesInListObject(field *build.FieldPlan, paren
 }
 
 func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, parentResponse map[string]any, rundata *Rundata) map[string]any {
-	result := make(map[string]any)
+	var result map[string]any
 	if field != nil {
 		fieldResult := rundata.GetFieldResultByFieldId(field.GetFieldId())
 		if fieldResult == nil {
@@ -319,6 +325,7 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 
 			//TODO 根据子节点继续遍历生成map
 			children := field.GetChildrenFields()
+			result = make(map[string]any, len(children))
 			for _, child := range children {
 				if child.GetFieldIsList() {
 					if responseMap, ok := responseVal.(map[string]any); ok {

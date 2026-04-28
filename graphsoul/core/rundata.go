@@ -1,31 +1,31 @@
 package core
 
-import lmap "github.com/liuzhaodong89/lockfree-collection/map"
+import (
+	"sync/atomic"
+)
 
 type Rundata struct {
-	originalParams map[string]any
-	fieldResultMap *lmap.Lmap[uint32, *FieldResponse]
-	fieldErrorMap  *lmap.Lmap[uint32, *FieldError]
+	originalParams   map[string]any
+	fieldResultSlice []atomic.Pointer[FieldResponse]
+	fieldErrorSlice  []atomic.Pointer[FieldError]
 }
 
-func NewRundata(originalParams map[string]any) *Rundata {
+func NewRundata(originalParams map[string]any, maxFieldId uint32) *Rundata {
+	size := int(maxFieldId) + 1
 	rundata := &Rundata{
-		originalParams: originalParams,
-		fieldResultMap: lmap.New[uint32, *FieldResponse](),
-		fieldErrorMap:  lmap.New[uint32, *FieldError](),
+		originalParams:   originalParams,
+		fieldResultSlice: make([]atomic.Pointer[FieldResponse], size),
+		fieldErrorSlice:  make([]atomic.Pointer[FieldError], size),
 	}
 	return rundata
 }
 
 func (r *Rundata) SetFieldResult(fieldId uint32, fieldResponse *FieldResponse) {
-	r.fieldResultMap.Set(fieldId, fieldResponse)
+	r.fieldResultSlice[fieldId].Store(fieldResponse)
 }
 
 func (r *Rundata) GetFieldResultByFieldId(fieldId uint32) *FieldResponse {
-	val, existed := r.fieldResultMap.Get(fieldId)
-	if !existed {
-		return nil
-	}
+	val := r.fieldResultSlice[fieldId].Load()
 	return val
 }
 
@@ -34,15 +34,12 @@ func (r *Rundata) AddFieldError(fieldId uint32, err error, path []string) *Field
 		fieldPath: path,
 		err:       err,
 	}
-	r.fieldErrorMap.Set(fieldId, fieldError)
+	r.fieldErrorSlice[fieldId].Store(fieldError)
 	return fieldError
 }
 
 func (r *Rundata) GetFieldErrorByFieldId(fieldId uint32) *FieldError {
-	val, existed := r.fieldErrorMap.Get(fieldId)
-	if !existed {
-		return nil
-	}
+	val := r.fieldErrorSlice[fieldId].Load()
 	return val
 }
 
@@ -52,8 +49,10 @@ func (r *Rundata) GetOriginalParamByKey(inputKey string) any {
 
 func (r *Rundata) GetAllFieldErrors() []*FieldError {
 	result := make([]*FieldError, 0)
-	for _, key := range r.fieldErrorMap.Keys() {
-		result = append(result, r.GetFieldErrorByFieldId(key))
+	for _, fieldErrorPtr := range r.fieldErrorSlice {
+		if fieldError := fieldErrorPtr.Load(); fieldError != nil {
+			result = append(result, fieldError)
+		}
 	}
 	return result
 }
