@@ -57,5 +57,5 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 			}
 		}
 	}
-	return nil
+	return &BatchResult{interrupt: false}
 }

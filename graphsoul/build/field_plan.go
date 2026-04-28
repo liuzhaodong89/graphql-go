@@ -1,6 +1,10 @@
 package build
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strings"
+)
 
 type FieldType uint8
 
@@ -44,6 +48,14 @@ func (pp *ParamPlan) GetInputName() string {
 	return pp.inputName
 }
 
+func (pp *ParamPlan) GetFieldResultPaths() []string {
+	return pp.fieldResultPaths
+}
+
+func (pp *ParamPlan) GetConstValue() any {
+	return pp.constValue
+}
+
 type FieldPlan struct {
 	fieldName         string
 	responseName      string
@@ -56,8 +68,8 @@ type FieldPlan struct {
 	fieldId           uint32
 	parentFieldId     uint32
 	parentFieldNotNil bool
-	//单次调用时必须在方法调用的参数中存在，且name一致
-	parentFieldKeyName string
+	// 单次/遍历调用时用于标识父节点关联关系的字段名列表，支持多字段组合 key
+	parentKeyFieldNames []string
 	//批量调用时返回值中代表父节点映射key的字段name，获得返回结果后要根据这个字段name获取value并作为父子映射map的key
 	arrayResultParentKeyName string
 	paths                    []string
@@ -118,10 +130,35 @@ func (fp *FieldPlan) GetFieldNotNil() bool {
 	return fp.fieldNotNil
 }
 
-func (fp *FieldPlan) GetParentFieldKeyName() string {
-	return fp.parentFieldKeyName
+func (fp *FieldPlan) GetParentKeyFieldNames() []string {
+	return fp.parentKeyFieldNames
 }
 
 func (fp *FieldPlan) GetArrayResultParentKeyName() string {
 	return fp.arrayResultParentKeyName
+}
+
+// GetValueByPath 按 paths 路径从嵌套数据中逐层取值。
+// 例如 paths=["order","user","name"] 等价于 data["order"]["user"]["name"]。
+// 中途任一层不是 map[string]any 则返回 nil。
+func GetValueByPath(data any, paths []string) any {
+	current := data
+	for _, key := range paths {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil
+		}
+		current = m[key]
+	}
+	return current
+}
+
+// BuildCompositeKey 将 source 中多个字段的值拼接为复合 key，字段顺序决定唯一性。
+// 例如 fieldNames=["orderId","itemId"], source={"orderId":1,"itemId":5} → "1:5"
+func BuildCompositeKey(fieldNames []string, source map[string]any) string {
+	parts := make([]string, 0, len(fieldNames))
+	for _, name := range fieldNames {
+		parts = append(parts, fmt.Sprintf("%v", source[name]))
+	}
+	return strings.Join(parts, ":")
 }

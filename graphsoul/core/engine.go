@@ -10,6 +10,15 @@ type SGraphResult struct {
 	response map[string]any
 	errors   []*FieldError
 }
+
+func (r *SGraphResult) GetResponse() map[string]any {
+	return r.response
+}
+
+func (r *SGraphResult) GetErrors() []*FieldError {
+	return r.errors
+}
+
 type SGraphEngine struct{}
 
 func (e *SGraphEngine) Execute(plan *build.SGraphPlan, originalParams map[string]any) *SGraphResult {
@@ -38,6 +47,7 @@ func (e *SGraphEngine) buildBatches(plan *build.SGraphPlan) []*Batch {
 	if plan != nil {
 		//第一个batch加入到batch切片里
 		firstBatch := &Batch{
+			batchId:    0,
 			steps:      make([]Step, 0),
 			concurrent: true,
 		}
@@ -51,6 +61,11 @@ func (e *SGraphEngine) buildBatches(plan *build.SGraphPlan) []*Batch {
 			}
 			firstBatch.steps = append(firstBatch.steps, step)
 
+			//增加根节点的参数依赖关系到map里，方便后续子节点查找
+			for _, paramPlan := range root.GetParamPlans() {
+				paramDepFieldIdBatchIdMap[paramPlan.GetDependentFieldId()] = firstBatch
+			}
+
 			//针对每个根节点递归遍历，为子节点创建step和对应的batch
 			children := root.GetChildrenFields()
 			for _, child := range children {
@@ -62,17 +77,20 @@ func (e *SGraphEngine) buildBatches(plan *build.SGraphPlan) []*Batch {
 }
 
 func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, batches []*Batch, paramDepFieldIdBatchIdMap map[uint32]*Batch) ([]*Batch, map[uint32]*Batch) {
+	if fp == nil {
+		return batches, paramDepFieldIdBatchIdMap
+	}
 	//TODO 如果父节点非Array，当前节点有Resolver，则当前节点为Normal
 	var step Step
 	if !parentFP.GetFieldIsList() {
-		if fp != nil && fp.GetResolverFunc() != nil {
+		if fp.GetResolverFunc() != nil {
 			step = &NormalStep{
 				fieldPlan: fp,
 			}
 		}
 	} else {
 		//TODO 如果父节点为Array，当前节点有Resolver，则当前节点为Iterator
-		if fp != nil && (fp.GetResolverFunc() != nil || fp.GetArrayResolverFunc() != nil) {
+		if fp.GetResolverFunc() != nil || fp.GetArrayResolverFunc() != nil {
 			step = &IteratorStep{
 				fieldPlan: fp,
 			}
@@ -90,6 +108,10 @@ func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, batches []*Ba
 	var latestBatchId uint32 = 0
 	var newBatch *Batch
 	for _, argsPlan := range argsPlans {
+		// CONST 和 INPUT 不依赖任何 field 结果，不参与 batch 调度
+		if argsPlan.GetParamType() != build.PARAM_TYPE_FIELD_RESULT {
+			continue
+		}
 		depFieldId := argsPlan.GetDependentFieldId()
 		b := paramDepFieldIdBatchIdMap[depFieldId]
 		if b != nil {
@@ -100,16 +122,29 @@ func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, batches []*Ba
 		} else {
 			//如果出现新建batch的场景，中断循环优先按照新建batch推进
 			newBatch = &Batch{
-				steps: make([]Step, 0),
+				batchId: uint32(len(batches)),
+				steps:   make([]Step, 0),
 			}
-			newBatch.steps = append(newBatch.steps, step)
+			if step != nil {
+				newBatch.steps = append(newBatch.steps, step)
+			}
 			batches = append(batches, newBatch)
 			paramDepFieldIdBatchIdMap[depFieldId] = newBatch
 			break
 		}
 	}
 	if newBatch == nil && latestBatch != nil {
-		latestBatch.steps = append(latestBatch.steps, step)
+		if step != nil {
+			latestBatch.steps = append(latestBatch.steps, step)
+		}
+	} else if newBatch == nil && latestBatch == nil && step != nil {
+		//无参数依赖的节点，直接加入到第一个batch里
+		batches[0].steps = append(batches[0].steps, step)
+	}
+
+	// 递归处理子节点
+	for _, child := range fp.GetChildrenFields() {
+		batches, paramDepFieldIdBatchIdMap = appendBatches(child, fp, batches, paramDepFieldIdBatchIdMap)
 	}
 
 	return batches, paramDepFieldIdBatchIdMap
@@ -119,6 +154,9 @@ func (e *SGraphEngine) assembleGraphResult(plan *build.SGraphPlan, rundata *Rund
 	result := &SGraphResult{
 		response: make(map[string]any),
 		errors:   make([]*FieldError, 0),
+	}
+	if plan == nil {
+		return result
 	}
 
 	responseMap := make(map[string]any)
@@ -135,8 +173,8 @@ func (e *SGraphEngine) assembleGraphResult(plan *build.SGraphPlan, rundata *Rund
 		}
 
 	}
-	//TODO 组装errors
-
+	result.response = responseMap
+	result.errors = rundata.GetAllFieldErrors()
 	return result
 
 }
@@ -155,12 +193,16 @@ func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, rundata *Rundata
 				case build.FIELD_TYPE_OBJECT:
 					result[child.GetResponseName()] = e.buildObjectValue(child, rundata)
 				case build.FIELD_TYPE_SCALAR:
-					if fieldResMap, ok := fieldResponse.responses[0].(map[string]any); ok {
-						result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, fieldResMap, rundata)
+					if fieldResponse != nil && len(fieldResponse.responses) > 0 {
+						if fieldResMap, ok := fieldResponse.responses[0].(map[string]any); ok {
+							result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, fieldResMap, rundata)
+						}
 					}
 				case build.FIELD_TYPE_ENUM:
-					if fieldResMap, ok := fieldResponse.responses[0].(map[string]any); ok {
-						result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, fieldResMap, rundata)
+					if fieldResponse != nil && len(fieldResponse.responses) > 0 {
+						if fieldResMap, ok := fieldResponse.responses[0].(map[string]any); ok {
+							result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, fieldResMap, rundata)
+						}
 					}
 				}
 			}
@@ -177,6 +219,9 @@ func (e *SGraphEngine) buildListValues(field *build.FieldPlan, rundata *Rundata)
 		fieldResponse := rundata.GetFieldResultByFieldId(field.GetFieldId())
 		switch field.GetFieldType() {
 		case build.FIELD_TYPE_OBJECT:
+			if fieldResponse == nil {
+				return result
+			}
 			for _, response := range fieldResponse.responses {
 				//TODO 如果当前的array的字段类型是Object，需要循环创建对应的map并加入到切片中
 				if resMap, ok := response.(map[string]any); ok {
@@ -185,17 +230,15 @@ func (e *SGraphEngine) buildListValues(field *build.FieldPlan, rundata *Rundata)
 			}
 			return result
 		case build.FIELD_TYPE_SCALAR:
-			for _, response := range fieldResponse.responses {
-				if resMap, ok := response.(map[string]any); ok {
-					result = append(result, e.buildScalarOrEnumValue(field, resMap, rundata))
-				}
+			if fieldResponse == nil {
+				return result
 			}
+			result = append(result, fieldResponse.responses...)
 		case build.FIELD_TYPE_ENUM:
-			for _, response := range fieldResponse.responses {
-				if resMap, ok := response.(map[string]any); ok {
-					result = append(result, e.buildScalarOrEnumValue(field, resMap, rundata))
-				}
+			if fieldResponse == nil {
+				return result
 			}
+			result = append(result, fieldResponse.responses...)
 		}
 	}
 	return result
@@ -213,10 +256,18 @@ func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFie
 				switch child.GetFieldType() {
 				case build.FIELD_TYPE_OBJECT:
 					result[child.GetResponseName()] = e.buildObjectValueInListObject(child, currentFieldResponseMap, rundata)
-				case build.FIELD_TYPE_SCALAR:
-					result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, currentFieldResponseMap, rundata)
-				case build.FIELD_TYPE_ENUM:
-					result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, currentFieldResponseMap, rundata)
+				case build.FIELD_TYPE_SCALAR, build.FIELD_TYPE_ENUM:
+					childResult := rundata.GetFieldResultByFieldId(child.GetFieldId())
+					if childResult != nil && childResult.HasParentResultBinding() {
+						compositeKey := build.BuildCompositeKey(child.GetParentKeyFieldNames(), currentFieldResponseMap)
+						if val, ok := childResult.LookupParentResult(compositeKey); ok {
+							result[child.GetResponseName()] = val
+						} else {
+							result[child.GetResponseName()] = nil
+						}
+					} else {
+						result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, currentFieldResponseMap, rundata)
+					}
 				}
 			}
 		}
@@ -228,11 +279,13 @@ func (e *SGraphEngine) buildListValuesInListObject(field *build.FieldPlan, paren
 	result := make([]any, 0)
 	if field != nil {
 		fieldResult := rundata.GetFieldResultByFieldId(field.GetFieldId())
+		if fieldResult == nil {
+			return result
+		}
 
-		//TODO筛选出当前父节点的子节点结果数组
-		parentFieldKeyName := field.GetParentFieldKeyName()
-		parentFieldKeyValue := parentFieldResponse[parentFieldKeyName]
-		currentFieldVal := fieldResult.arrayParentKeyMap[parentFieldKeyValue]
+		//筛选出当前父节点的子节点结果数组
+		compositeKey := build.BuildCompositeKey(field.GetParentKeyFieldNames(), parentFieldResponse)
+		currentFieldVal, _ := fieldResult.LookupParentResult(compositeKey)
 		if currentFieldResponseArray, ok := currentFieldVal.([]any); ok {
 			switch field.GetFieldType() {
 			case build.FIELD_TYPE_OBJECT:
@@ -257,10 +310,12 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 	result := make(map[string]any)
 	if field != nil {
 		fieldResult := rundata.GetFieldResultByFieldId(field.GetFieldId())
-		parentKeyFieldName := field.GetParentFieldKeyName()
-		parentKeyFieldValue := parentResponse[parentKeyFieldName]
-		if parentKeyFieldValue != nil {
-			responseVal := fieldResult.arrayParentKeyMap[parentKeyFieldValue]
+		if fieldResult == nil {
+			return result
+		}
+		compositeKey := build.BuildCompositeKey(field.GetParentKeyFieldNames(), parentResponse)
+		if compositeKey != "" {
+			responseVal, _ := fieldResult.LookupParentResult(compositeKey)
 
 			//TODO 根据子节点继续遍历生成map
 			children := field.GetChildrenFields()
@@ -304,13 +359,17 @@ func (e *SGraphEngine) buildScalarOrEnumValueInListObject(field *build.FieldPlan
 		//TODO 先获取当前节点的全部数据
 		fieldResult := rundata.GetFieldResultByFieldId(field.GetFieldId())
 		if fieldResult != nil {
-			//TODO 获取parentKey的名称
-			parentKeyFieldName := field.GetArrParamPlan().GetParamKey()
-			//TODO 根据parentKey获取父节点response里对应的key值
+			arrParamPlan := field.GetArrParamPlan()
+			if arrParamPlan == nil {
+				return parentResponse[field.GetResponseName()]
+			}
+			//获取parentKey的名称
+			parentKeyFieldName := arrParamPlan.GetParamKey()
+			//根据parentKey获取父节点response里对应的key值
 			parentKeyFieldVal, ok := parentResponse[parentKeyFieldName]
 			if ok {
-				//TODO 根据key值获取到当前节点里对应的数据
-				response := fieldResult.arrayParentKeyMap[parentKeyFieldVal]
+				//根据key值获取到当前节点里对应的数据
+				response, _ := fieldResult.LookupParentResult(parentKeyFieldVal)
 				return response
 			}
 		} else {
