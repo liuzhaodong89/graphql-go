@@ -52,17 +52,15 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 			return fe
 		}
 		//结果写入Rundata
-		fieldResponse := &FieldResponse{
-			responseType: FIELD_RESPONSE_TYPE_NORMAL,
-			responses:    make([]any, 0),
-			fieldPaths:   make([][]string, 0),
-		}
+		fieldResponse := AcquireFieldResponse(FIELD_RESPONSE_TYPE_NORMAL)
+
 		// list 字段将返回的数组展开为多条 response，与 IteratorStep 的结果结构保持一致
 		if s.fieldPlan.GetFieldIsList() {
 			if resArr, ok := res.([]any); ok {
+				basePath := append([]string{}, s.fieldPlan.GetPaths()...)
 				for i, item := range resArr {
 					fieldResponse.responses = append(fieldResponse.responses, item)
-					path := append(append([]string{}, s.fieldPlan.GetPaths()...), strconv.Itoa(i))
+					path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(i))
 					fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
 				}
 			}
@@ -76,7 +74,7 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 }
 
 func (s *NormalStep) prepareParams(paramPlans []*build.ParamPlan, rundata *Rundata) (map[string]any, error) {
-	params := make(map[string]any)
+	params := make(map[string]any, len(paramPlans))
 	for _, pp := range paramPlans {
 		switch pp.GetParamType() {
 		case build.PARAM_TYPE_CONST:
@@ -112,12 +110,9 @@ const ITERATOR_PARAM_DEFAULT_KEY = "ITERATOR_PARAM_DEFAULT_KEY"
 func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldError {
 	if s.fieldPlan != nil {
 		//初始化结果对象
-		fieldResponse := &FieldResponse{
-			responseType:      FIELD_RESPONSE_TYPE_ARRAY,
-			responses:         make([]any, 0),
-			fieldPaths:        make([][]string, 0),
-			arrayParentKeyMap: make(map[any]any),
-		}
+		fieldResponse := AcquireFieldResponse(FIELD_RESPONSE_TYPE_ARRAY)
+		fieldResponse.arrayParentKeyMap = make(map[any]any)
+
 		//判断父节点数据是否允许为空
 		parentRes := rundata.GetFieldResultByFieldId(s.fieldPlan.GetParentFieldId())
 		if s.fieldPlan.IsParentFieldNotNil() && parentRes == nil {
@@ -146,11 +141,12 @@ func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldErro
 			}
 
 			if resArr, ok := res.([]any); ok {
+				basePath := append([]string{}, s.fieldPlan.GetPaths()...)
 				for index, singleResVal := range resArr {
 					fieldResponse.responses = append(fieldResponse.responses, singleResVal)
 
 					//注意！返回值数组中元素的顺序必须和入参中的顺序保持一致！
-					path := append(s.fieldPlan.GetPaths(), strconv.Itoa(index))
+					path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(index))
 					fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
 
 					//TODO 在批量查询的结果中要写入当前结果和父节点数据之间的映射关系
@@ -181,14 +177,16 @@ func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldErro
 				fe.fieldType = FIELD_ERROR_TYPE_FIELD
 				return fe
 			}
+
+			resolverFunc := s.fieldPlan.GetResolverFunc()
+			if resolverFunc == nil {
+				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), errors.New("resolver is nil"), s.fieldPlan.GetPaths())
+				fe.message = "resolver is nil"
+				fe.fieldType = FIELD_ERROR_TYPE_FIELD
+				return fe
+			}
+			basePath := append([]string{}, s.fieldPlan.GetPaths()...)
 			for index, item := range callItems {
-				resolverFunc := s.fieldPlan.GetResolverFunc()
-				if resolverFunc == nil {
-					fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), errors.New("resolver is nil"), s.fieldPlan.GetPaths())
-					fe.message = "resolver is nil"
-					fe.fieldType = FIELD_ERROR_TYPE_FIELD
-					return fe
-				}
 				res, err := resolverFunc(parentRes, item.params, ctx)
 				if err != nil {
 					fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), err, s.fieldPlan.GetPaths())
@@ -198,7 +196,7 @@ func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldErro
 				}
 				fieldResponse.responses = append(fieldResponse.responses, res)
 				//在path中要加入所属数据在父节点中的序号
-				path := append(s.fieldPlan.GetPaths(), strconv.Itoa(index))
+				path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(index))
 				fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
 
 				//在批量查询的结果中要写入当前结果和父节点数据之间的映射关系
@@ -222,7 +220,7 @@ func (s *IteratorStep) prepareIteratorParams(paramPlans []*build.ParamPlan, rund
 	}
 	result := make([]iteratorCallItem, 0, len(parentResult.responses))
 	for _, parentResponse := range parentResult.responses {
-		params := make(map[string]any)
+		params := make(map[string]any, len(paramPlans))
 		for _, pp := range paramPlans {
 			switch pp.GetParamType() {
 			case build.PARAM_TYPE_CONST:

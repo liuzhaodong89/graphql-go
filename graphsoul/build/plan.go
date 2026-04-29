@@ -1,5 +1,10 @@
 package build
 
+import (
+	"strconv"
+	"strings"
+)
+
 type SGraphPlan struct {
 	originalInputs map[string]any
 	roots          []*FieldPlan
@@ -11,6 +16,25 @@ func (s *SGraphPlan) GetRoots() []*FieldPlan {
 
 func (s *SGraphPlan) GetOriginalInputs() map[string]any {
 	return s.originalInputs
+}
+
+func (s *SGraphPlan) GetCacheKey() string {
+	var sb strings.Builder
+	for _, root := range s.roots {
+		s.loopCreateCacheKey(root, &sb)
+	}
+	return sb.String()
+}
+
+func (s *SGraphPlan) loopCreateCacheKey(fp *FieldPlan, keyBuilder *strings.Builder) {
+	if fp == nil {
+		return
+	}
+	keyBuilder.WriteString(strconv.FormatUint(uint64(fp.GetFieldId()), 10))
+	keyBuilder.WriteString("-")
+	for _, child := range fp.GetChildrenFields() {
+		s.loopCreateCacheKey(child, keyBuilder)
+	}
 }
 
 // MaxFieldId 遍历整棵字段树，返回最大的 fieldId。

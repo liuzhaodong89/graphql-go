@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sync"
 	"sync/atomic"
 )
 
@@ -8,6 +9,7 @@ type Rundata struct {
 	originalParams   map[string]any
 	fieldResultSlice []atomic.Pointer[FieldResponse]
 	fieldErrorSlice  []atomic.Pointer[FieldError]
+	fieldErrorCount  atomic.Int32
 }
 
 func NewRundata(originalParams map[string]any, maxFieldId uint32) *Rundata {
@@ -35,6 +37,7 @@ func (r *Rundata) AddFieldError(fieldId uint32, err error, path []string) *Field
 		err:       err,
 	}
 	r.fieldErrorSlice[fieldId].Store(fieldError)
+	r.fieldErrorCount.Add(1)
 	return fieldError
 }
 
@@ -48,13 +51,20 @@ func (r *Rundata) GetOriginalParamByKey(inputKey string) any {
 }
 
 func (r *Rundata) GetAllFieldErrors() []*FieldError {
-	result := make([]*FieldError, 0)
-	for _, fieldErrorPtr := range r.fieldErrorSlice {
-		if fieldError := fieldErrorPtr.Load(); fieldError != nil {
+	if r.GetFieldErrorCount() == 0 {
+		return nil
+	}
+	result := make([]*FieldError, 0, r.GetFieldErrorCount())
+	for i := range r.fieldErrorSlice {
+		if fieldError := r.fieldErrorSlice[i].Load(); fieldError != nil {
 			result = append(result, fieldError)
 		}
 	}
 	return result
+}
+
+func (r *Rundata) GetFieldErrorCount() int32 {
+	return r.fieldErrorCount.Load()
 }
 
 type FieldErrorType uint8
@@ -112,4 +122,41 @@ func (fr *FieldResponse) GetFirstResponse() any {
 		return nil
 	}
 	return fr.responses[0]
+}
+
+var fieldResponsePool = sync.Pool{
+	New: func() any {
+		return &FieldResponse{
+			responses:         make([]any, 0),
+			fieldPaths:        make([][]string, 0),
+			arrayParentKeyMap: make(map[any]any),
+		}
+	},
+}
+
+func AcquireFieldResponse(reponseType FieldResponseType) *FieldResponse {
+	frVal := fieldResponsePool.Get().(*FieldResponse)
+	frVal.responseType = reponseType
+	frVal.responses = frVal.responses[:0]
+	frVal.fieldPaths = frVal.fieldPaths[:0]
+	frVal.indexOfParentArray = 0
+	frVal.arrayParentKeyMap = nil
+	return frVal
+}
+
+func ReleaseFieldResponse(fr *FieldResponse) {
+	if fr == nil {
+		return
+	}
+	for i := range fr.responses {
+		fr.responses[i] = nil
+	}
+	fr.responses = fr.responses[:0]
+	for i := range fr.fieldPaths {
+		fr.fieldPaths[i] = nil
+	}
+	fr.fieldPaths = fr.fieldPaths[:0]
+	fr.indexOfParentArray = 0
+	fr.arrayParentKeyMap = nil
+	fieldResponsePool.Put(fr)
 }
