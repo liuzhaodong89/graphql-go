@@ -37,7 +37,7 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 		for _, step := range b.steps {
 			go func() {
 				fieldErr := step.Execute(rundata, ctx)
-				if fieldErr != nil && fieldErr.fieldType == FIELD_ERROR_TYPE_TREE {
+				if fieldErr != nil && fieldErr.errorType == FIELD_ERROR_TYPE_TREE {
 					semaphore.Add(1)
 				}
 				wg.Done()
@@ -53,7 +53,7 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 		//串行执行step
 		for _, step := range b.steps {
 			fieldErr := step.Execute(rundata, ctx)
-			if fieldErr != nil && fieldErr.fieldType == FIELD_ERROR_TYPE_TREE {
+			if fieldErr != nil && fieldErr.errorType == FIELD_ERROR_TYPE_TREE {
 				//判断是否有需要中断整个流程的错误
 				return &BatchResult{interrupt: true}
 			}

@@ -66,9 +66,9 @@ type FieldPlan struct {
 	resolverFunc      ResolverFunc
 	arrayResolverFunc ResolverFunc
 	//从1开始自增
-	fieldId           uint32
-	parentFieldId     uint32
-	parentFieldNotNil bool
+	fieldId       uint32
+	parentFieldId uint32
+	//parentFieldNotNil bool
 	// 单次/遍历调用时用于标识父节点关联关系的字段名列表，支持多字段组合 key
 	parentKeyFieldNames []string
 	//批量调用时返回值中代表父节点映射key的字段name，获得返回结果后要根据这个字段name获取value并作为父子映射map的key
@@ -77,6 +77,7 @@ type FieldPlan struct {
 	childrenFields           []*FieldPlan
 	fieldNotNil              bool
 	fieldIsList              bool
+	fieldListNotNil          bool
 }
 
 func (fp *FieldPlan) GetFieldId() uint32 {
@@ -87,9 +88,9 @@ func (fp *FieldPlan) GetParentFieldId() uint32 {
 	return fp.parentFieldId
 }
 
-func (fp *FieldPlan) IsParentFieldNotNil() bool {
-	return fp.parentFieldNotNil
-}
+//func (fp *FieldPlan) IsParentFieldNotNil() bool {
+//	return fp.parentFieldNotNil
+//}
 
 func (fp *FieldPlan) GetPaths() []string {
 	return fp.paths
@@ -129,6 +130,10 @@ func (fp *FieldPlan) GetFieldIsList() bool {
 
 func (fp *FieldPlan) GetFieldNotNil() bool {
 	return fp.fieldNotNil
+}
+
+func (fp *FieldPlan) GetFieldListNotNil() bool {
+	return fp.fieldListNotNil
 }
 
 func (fp *FieldPlan) GetParentKeyFieldNames() []string {

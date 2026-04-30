@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 
 	"github.com/graphql-go/graphql/graphsoul/build"
 )
@@ -21,52 +20,66 @@ type NormalStep struct {
 func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError {
 	if s.fieldPlan != nil {
 		//判断父节点数据是否允许空
-		parentRes := rundata.GetFieldResultByFieldId(s.fieldPlan.GetParentFieldId())
-		if s.fieldPlan.IsParentFieldNotNil() && parentRes == nil {
-			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), errors.New("parent field is nil"), s.fieldPlan.GetPaths())
-			fe.message = "parent field is nil"
-			fe.fieldType = FIELD_ERROR_TYPE_FIELD
-			return fe
-		}
+		// parentRes := rundata.GetFieldResultByFieldId(s.fieldPlan.GetParentFieldId())
+		//if s.fieldPlan.IsParentFieldNotNil() && parentRes == nil {
+		//	fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, errors.New("parent field is nil"), s.fieldPlan.GetPaths())
+		//	fe.message = "parent field is nil"
+		//	fe.fieldType = FIELD_ERROR_TYPE_FIELD
+		//	return fe
+		//}
 		//获取参数
 		params, paramErr := s.prepareParams(s.fieldPlan.GetParamPlans(), rundata)
 		if paramErr != nil {
-			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), paramErr, s.fieldPlan.GetPaths())
-			fe.message = paramErr.Error()
-			fe.fieldType = FIELD_ERROR_TYPE_FIELD
+			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, paramErr, s.fieldPlan.GetPaths())
 			return fe
 		}
 		//方法调用
 		resolverFunc := s.fieldPlan.GetResolverFunc()
 		if resolverFunc == nil {
-			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), errors.New("resolver is nil"), s.fieldPlan.GetPaths())
-			fe.message = "resolver is nil"
-			fe.fieldType = FIELD_ERROR_TYPE_FIELD
+			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, errors.New("resolver is nil"), s.fieldPlan.GetPaths())
 			return fe
 		}
-		res, err := resolverFunc(parentRes, params, ctx)
+		res, err := resolverFunc(nil, params, ctx)
 		if err != nil {
-			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), err, s.fieldPlan.GetPaths())
-			fe.fieldType = FIELD_ERROR_TYPE_FIELD
-			fe.message = err.Error()
+			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, err, s.fieldPlan.GetPaths())
 			return fe
 		}
+
 		//结果写入Rundata
 		fieldResponse := AcquireFieldResponse(FIELD_RESPONSE_TYPE_NORMAL)
 
 		// list 字段将返回的数组展开为多条 response，与 IteratorStep 的结果结构保持一致
 		if s.fieldPlan.GetFieldIsList() {
+			//判断当前List能否为空，若non-null但返回nil则报错
+			if s.fieldPlan.GetFieldListNotNil() && res == nil {
+				nilErr := errors.New("non-null list response is nil")
+				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+				return fe
+			}
 			if resArr, ok := res.([]any); ok {
-				basePath := append([]string{}, s.fieldPlan.GetPaths()...)
-				for i, item := range resArr {
+				//basePath := append([]string{}, s.fieldPlan.GetPaths()...)
+				for _, item := range resArr {
+					//判断当前List中的元素是否为空，若non-null但返回nil则报错
+					if s.fieldPlan.GetFieldNotNil() && item == nil {
+						nilErr := errors.New("non-null field response is nil")
+						fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+						return fe
+					}
 					fieldResponse.responses = append(fieldResponse.responses, item)
-					path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(i))
-					fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
+					//path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(i))
+					//fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
 				}
 			}
 		} else {
+			//如果当前字段的返回值不是List
+			//判断结果能否为空，若non-null但返回nil则报错
+			if res == nil && s.fieldPlan.GetFieldNotNil() {
+				nilErr := errors.New("non-null field response is nil")
+				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+				return fe
+			}
 			fieldResponse.responses = append(fieldResponse.responses, res)
-			fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, s.fieldPlan.GetPaths())
+			//fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, s.fieldPlan.GetPaths())
 		}
 		rundata.SetFieldResult(s.fieldPlan.GetFieldId(), fieldResponse)
 	}
@@ -114,90 +127,149 @@ func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldErro
 		fieldResponse.arrayParentKeyMap = make(map[any]any)
 
 		//判断父节点数据是否允许为空
-		parentRes := rundata.GetFieldResultByFieldId(s.fieldPlan.GetParentFieldId())
-		if s.fieldPlan.IsParentFieldNotNil() && parentRes == nil {
-			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), errors.New("parent field is nil"), s.fieldPlan.GetPaths())
-			fe.message = "parent field is nil"
-			fe.fieldType = FIELD_ERROR_TYPE_FIELD
-			return fe
-		}
+		// parentRes := rundata.GetFieldResultByFieldId(s.fieldPlan.GetParentFieldId())
+		//if s.fieldPlan.IsParentFieldNotNil() && parentRes == nil {
+		//	fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, errors.New("parent field is nil"), s.fieldPlan.GetPaths())
+		//	fe.message = "parent field is nil"
+		//	fe.fieldType = FIELD_ERROR_TYPE_FIELD
+		//	return fe
+		//}
 
 		if arrayResolverFunc := s.fieldPlan.GetArrayResolverFunc(); arrayResolverFunc != nil {
 			//获取批量模式参数
 			arrParams, arrParamsErr := s.prepareArrayParams(s.fieldPlan.GetArrParamPlan(), rundata)
 			if arrParamsErr != nil {
-				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), arrParamsErr, s.fieldPlan.GetPaths())
+				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, arrParamsErr, s.fieldPlan.GetPaths())
 				fe.message = arrParamsErr.Error()
-				fe.fieldType = FIELD_ERROR_TYPE_FIELD
+				fe.errorType = FIELD_ERROR_TYPE_FIELD
 				return fe
 			}
 
-			res, err := arrayResolverFunc(parentRes, arrParams, ctx)
+			res, err := arrayResolverFunc(nil, arrParams, ctx)
 			if err != nil {
-				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), err, s.fieldPlan.GetPaths())
+				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, err, s.fieldPlan.GetPaths())
 				fe.message = err.Error()
-				fe.fieldType = FIELD_ERROR_TYPE_FIELD
+				fe.errorType = FIELD_ERROR_TYPE_FIELD
 				return fe
 			}
 
+			//入参是数组，默认返回值一定也是数组
 			if resArr, ok := res.([]any); ok {
-				basePath := append([]string{}, s.fieldPlan.GetPaths()...)
-				for index, singleResVal := range resArr {
+				//basePath := append([]string{}, s.fieldPlan.GetPaths()...)
+				for _, singleResVal := range resArr {
+					if s.fieldPlan.GetFieldIsList() {
+						//判断当前节点的返回值类型，如果是List则判断List能否为空，若non-null但返回nil则报错
+						if s.fieldPlan.GetFieldListNotNil() && singleResVal == nil {
+							nilErr := errors.New("non-null list response is nil")
+							fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+							return fe
+						}
+					} else {
+						if s.fieldPlan.GetFieldNotNil() && singleResVal != nil {
+							nilErr := errors.New("non-null field response is nil")
+							fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+							return fe
+						}
+					}
 					fieldResponse.responses = append(fieldResponse.responses, singleResVal)
 
 					//注意！返回值数组中元素的顺序必须和入参中的顺序保持一致！
-					path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(index))
-					fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
+					//path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(index))
+					//fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
 
 					//TODO 在批量查询的结果中要写入当前结果和父节点数据之间的映射关系
 					if singleResMap, resMapOk := singleResVal.(map[string]any); resMapOk {
-						//TODO 返回值是Object
+						//返回值是Object
 						fieldKeyName := s.fieldPlan.GetArrayResultParentKeyName()
 						fieldKeyValue := fmt.Sprintf("%v", singleResMap[fieldKeyName])
 						fieldResponse.BindParentResult(fieldKeyValue, singleResMap)
-					} else if singleResInArr, resArrOk := singleResVal.([]any); resArrOk {
+					} else if singleResAsArr, resArrOk := singleResVal.([]any); resArrOk {
 						//TODO 返回值是Array
-						if len(singleResInArr) > 0 {
-							firstSingleResValInArr := singleResInArr[0]
+						if len(singleResAsArr) > 0 {
+							//如果每个元素是List，还要检查当前字段是否允许List中的元素为空，如果non-null返回的元素有nil则报错
+							for _, valInSingleResAsArr := range singleResAsArr {
+								if valInSingleResAsArr == nil {
+									if s.fieldPlan.GetFieldNotNil() {
+										nilErr := errors.New("non-null field response is nil")
+										fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+										return fe
+									}
+								}
+							}
+							firstSingleResValInArr := singleResAsArr[0]
 							if firstSingleResValInArrMap, firstSingleResValInArrMapOk := firstSingleResValInArr.(map[string]any); firstSingleResValInArrMapOk {
 								fieldKeyName := s.fieldPlan.GetArrayResultParentKeyName()
 								fieldKeyValue := fmt.Sprintf("%v", firstSingleResValInArrMap[fieldKeyName])
-								fieldResponse.BindParentResult(fieldKeyValue, singleResInArr)
+								fieldResponse.BindParentResult(fieldKeyValue, singleResAsArr)
 							}
 						}
 					}
 				}
+			} else {
+				//TODO如果返回值不是数组类型，应该报错
 			}
 		} else {
 			//获取遍历模式调用项（父节点响应 + 本次参数）
 			callItems, paramErr := s.prepareIteratorParams(s.fieldPlan.GetParamPlans(), rundata)
 			if paramErr != nil {
-				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), paramErr, s.fieldPlan.GetPaths())
+				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, paramErr, s.fieldPlan.GetPaths())
 				fe.message = paramErr.Error()
-				fe.fieldType = FIELD_ERROR_TYPE_FIELD
+				fe.errorType = FIELD_ERROR_TYPE_FIELD
 				return fe
 			}
 
 			resolverFunc := s.fieldPlan.GetResolverFunc()
 			if resolverFunc == nil {
-				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), errors.New("resolver is nil"), s.fieldPlan.GetPaths())
+				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, errors.New("resolver is nil"), s.fieldPlan.GetPaths())
 				fe.message = "resolver is nil"
-				fe.fieldType = FIELD_ERROR_TYPE_FIELD
+				fe.errorType = FIELD_ERROR_TYPE_FIELD
 				return fe
 			}
-			basePath := append([]string{}, s.fieldPlan.GetPaths()...)
-			for index, item := range callItems {
-				res, err := resolverFunc(parentRes, item.params, ctx)
+			//basePath := append([]string{}, s.fieldPlan.GetPaths()...)
+			for _, item := range callItems {
+				res, err := resolverFunc(nil, item.params, ctx)
 				if err != nil {
-					fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), err, s.fieldPlan.GetPaths())
+					fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, err, s.fieldPlan.GetPaths())
 					fe.message = err.Error()
-					fe.fieldType = FIELD_ERROR_TYPE_FIELD
+					fe.errorType = FIELD_ERROR_TYPE_FIELD
 					return fe
+				}
+				if s.fieldPlan.GetFieldIsList() {
+					//如果是List类型的字段，先判断List能否为空，若non-null但List为nil则报错
+					if res == nil {
+						if s.fieldPlan.GetFieldListNotNil() {
+							nilErr := errors.New("non-null list response is nil")
+							fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+							return fe
+						}
+					} else {
+						//再判断里面的元素能否为空，若non-null但元素有nil就报错
+						if resArr, ok := res.([]any); ok {
+							for _, val := range resArr {
+								if val == nil {
+									if s.fieldPlan.GetFieldNotNil() {
+										nilErr := errors.New("non-null field response is nil")
+										fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+										return fe
+									}
+								}
+							}
+						} else {
+							//TODO 应该返回list但不是，报错
+						}
+					}
+				} else {
+					//如果是普通类型字段，判断是否允许返回值为空，若non-null但返回值是nil则报错
+					if s.fieldPlan.GetFieldNotNil() && res == nil {
+						nilErr := errors.New("non-null field response is nil")
+						fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, nilErr, s.fieldPlan.GetPaths())
+						return fe
+					}
 				}
 				fieldResponse.responses = append(fieldResponse.responses, res)
 				//在path中要加入所属数据在父节点中的序号
-				path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(index))
-				fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
+				//path := append(basePath[:len(basePath):len(basePath)], strconv.Itoa(index))
+				//fieldResponse.fieldPaths = append(fieldResponse.fieldPaths, path)
 
 				//在批量查询的结果中要写入当前结果和父节点数据之间的映射关系
 				compositeKey := ""

@@ -9,6 +9,7 @@ type FieldPlanOptions struct {
 	FieldType                FieldType
 	FieldIsList              bool
 	FieldNotNil              bool
+	FieldListNotNil          bool
 	ParentFieldNotNil        bool
 	Paths                    []string
 	ParentKeyFieldNames      []string
@@ -23,14 +24,15 @@ type FieldPlanOptions struct {
 // NewFieldPlan 通过 FieldPlanOptions 构造一个 FieldPlan。
 func NewFieldPlan(opts FieldPlanOptions) *FieldPlan {
 	fp := &FieldPlan{
-		fieldId:                  opts.FieldId,
-		parentFieldId:            opts.ParentFieldId,
-		fieldName:                opts.FieldName,
-		responseName:             opts.ResponseName,
-		fieldType:                opts.FieldType,
-		fieldIsList:              opts.FieldIsList,
-		fieldNotNil:              opts.FieldNotNil,
-		parentFieldNotNil:        opts.ParentFieldNotNil,
+		fieldId:         opts.FieldId,
+		parentFieldId:   opts.ParentFieldId,
+		fieldName:       opts.FieldName,
+		responseName:    opts.ResponseName,
+		fieldType:       opts.FieldType,
+		fieldIsList:     opts.FieldIsList,
+		fieldNotNil:     opts.FieldNotNil,
+		fieldListNotNil: opts.FieldListNotNil,
+		//parentFieldNotNil:        opts.ParentFieldNotNil,
 		paths:                    opts.Paths,
 		parentKeyFieldNames:      opts.ParentKeyFieldNames,
 		arrayResultParentKeyName: opts.ArrayResultParentKeyName,

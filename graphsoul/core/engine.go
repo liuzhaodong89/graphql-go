@@ -37,11 +37,11 @@ func (e *SGraphEngine) getBatchesFromCacheOrCreate(plan *build.SGraphPlan) []*Ba
 	cacheKey := plan.GetCacheKey()
 	if batches, ok := e.batchCache.Get(cacheKey); ok {
 		return batches
-	} else {
-		batches := BuildBatches(plan)
-		e.batchCache.Set(cacheKey, batches)
-		return batches
 	}
+
+	batches := BuildBatches(plan)
+	e.batchCache.Set(cacheKey, batches)
+	return batches
 }
 
 func (e *SGraphEngine) Execute(plan *build.SGraphPlan) *SGraphResult {
@@ -89,12 +89,45 @@ func (e *SGraphEngine) assembleGraphResult(plan *build.SGraphPlan, rundata *Rund
 
 	for _, root := range roots {
 		if root.GetFieldIsList() {
-			responseMap[root.GetResponseName()] = e.buildListValues(root, rundata)
+			rootResult := e.buildListValues(root, rundata)
+			//null值传递
+			if root.GetFieldListNotNil() && rootResult == nil {
+				responseMap = nil
+				break
+			} else {
+				if rootResult == nil {
+					responseMap[root.GetResponseName()] = nil
+				} else {
+					responseMap[root.GetResponseName()] = rootResult
+				}
+			}
 		} else {
 			if root.GetFieldType() == build.FIELD_TYPE_OBJECT {
-				responseMap[root.GetResponseName()] = e.buildObjectValue(root, rundata)
+				rootResult := e.buildObjectValue(root, rundata)
+				//null值传递
+				if rootResult == nil && root.GetFieldNotNil() {
+					responseMap = nil
+					break
+				} else {
+					if rootResult == nil {
+						responseMap[root.GetResponseName()] = nil
+					} else {
+						responseMap[root.GetResponseName()] = rootResult
+					}
+				}
 			} else if root.GetFieldType() == build.FIELD_TYPE_SCALAR || root.GetFieldType() == build.FIELD_TYPE_ENUM {
-				responseMap[root.GetResponseName()] = e.buildScalarOrEnumValue(root, nil, rundata)
+				rootResult := e.buildScalarOrEnumValue(root, nil, rundata)
+				//null值传递
+				if rootResult == nil && root.GetFieldNotNil() {
+					responseMap = nil
+					break
+				} else {
+					if rootResult == nil {
+						responseMap[root.GetResponseName()] = nil
+					} else {
+						responseMap[root.GetResponseName()] = rootResult
+					}
+				}
 			}
 		}
 
@@ -111,23 +144,53 @@ func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, rundata *Rundata
 		children := field.GetChildrenFields()
 
 		result := make(map[string]any, len(children))
+		//如果当前字段的结果为空，不再遍历子字段
+		if fieldResponse == nil || fieldResponse.responses == nil || (len(fieldResponse.responses) > 0 && fieldResponse.responses[0] == nil) {
+			return nil
+		}
 		for _, child := range children {
 			if child.GetFieldIsList() {
-				result[child.GetResponseName()] = e.buildListValues(child, rundata)
+				//如果子字段是List类型且List为non-null但是出现nil，则判断当前字段是否为non-null，如果是则清空当前字段的数据返回nil
+				childResult := e.buildListValues(child, rundata)
+				//null值传递，如果子字段non-null但返回nil，当前字段直接返回nil
+				if childResult == nil && child.GetFieldListNotNil() {
+					return nil
+				}
+				if childResult == nil {
+					result[child.GetResponseName()] = nil
+				} else {
+					result[child.GetResponseName()] = childResult
+				}
 			} else {
 				switch child.GetFieldType() {
 				case build.FIELD_TYPE_OBJECT:
-					result[child.GetResponseName()] = e.buildObjectValue(child, rundata)
-				case build.FIELD_TYPE_SCALAR:
-					if fieldResponse != nil && len(fieldResponse.responses) > 0 {
-						if fieldResMap, ok := fieldResponse.responses[0].(map[string]any); ok {
-							result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, fieldResMap, rundata)
-						}
+					//null值传递
+					childResult := e.buildObjectValue(child, rundata)
+					if childResult == nil && child.GetFieldNotNil() {
+						return nil
 					}
-				case build.FIELD_TYPE_ENUM:
-					if fieldResponse != nil && len(fieldResponse.responses) > 0 {
+					if childResult == nil {
+						result[child.GetResponseName()] = nil
+					} else {
+						result[child.GetResponseName()] = childResult
+					}
+				case build.FIELD_TYPE_SCALAR, build.FIELD_TYPE_ENUM:
+					if len(fieldResponse.responses) > 0 {
 						if fieldResMap, ok := fieldResponse.responses[0].(map[string]any); ok {
-							result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, fieldResMap, rundata)
+							childResult := e.buildScalarOrEnumValue(child, fieldResMap, rundata)
+							//null值传递
+							if child.GetFieldNotNil() && childResult == nil {
+								return nil
+							}
+							if childResult == nil {
+								result[child.GetResponseName()] = nil
+							} else {
+								result[child.GetResponseName()] = childResult
+							}
+						} else {
+							if fieldResponse.responses[0] == nil && child.GetFieldNotNil() {
+								return nil
+							}
 						}
 					}
 				}
@@ -140,50 +203,81 @@ func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, rundata *Rundata
 }
 
 func (e *SGraphEngine) buildListValues(field *build.FieldPlan, rundata *Rundata) []any {
-	var result []any
 	if field != nil {
+		var result []any
 		fieldResponse := rundata.GetFieldResultByFieldId(field.GetFieldId())
+		if fieldResponse == nil || fieldResponse.responses == nil {
+			return nil
+		}
+		result = make([]any, 0, len(fieldResponse.responses))
 
 		switch field.GetFieldType() {
 		case build.FIELD_TYPE_OBJECT:
-			if fieldResponse == nil {
-				return result
-			}
 			for _, response := range fieldResponse.responses {
 				//TODO 如果当前的array的字段类型是Object，需要循环创建对应的map并加入到切片中
 				if resMap, ok := response.(map[string]any); ok {
-					result = append(result, e.buildObjectValueInList(field, resMap, rundata))
+					objectResult := e.buildObjectValueInList(field, resMap, rundata)
+					if objectResult != nil {
+						result = append(result, objectResult)
+					} else {
+						//如果当前List字段要求元素non-null但有元素是nil，则整个字段返回nil
+						if field.GetFieldNotNil() {
+							return nil
+						}
+					}
 				}
 			}
 			return result
-		case build.FIELD_TYPE_SCALAR:
-			if fieldResponse == nil {
-				return result
+		case build.FIELD_TYPE_SCALAR, build.FIELD_TYPE_ENUM:
+			//如果当前List字段要求元素non-null但有元素是nil，则整个字段返回nil
+			if field.GetFieldNotNil() {
+				for _, response := range fieldResponse.responses {
+					if response == nil {
+						return nil
+					}
+				}
 			}
+
 			result = append(result, fieldResponse.responses...)
-		case build.FIELD_TYPE_ENUM:
-			if fieldResponse == nil {
-				return result
-			}
-			result = append(result, fieldResponse.responses...)
+			return result
 		}
 	}
-	return result
+	return nil
 }
 
 func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFieldResponseMap map[string]any, rundata *Rundata) map[string]any {
 	var result map[string]any
+	//如果当前元素的response为空，则直接返回，不再遍历子字段
+	if currentFieldResponseMap == nil {
+		return result
+	}
 	//TODO 获取当前字段的子字段，遍历每个子字段的类型组装Map
 	if field != nil {
 		children := field.GetChildrenFields()
 		result = make(map[string]any, len(children))
 		for _, child := range children {
 			if child.GetFieldIsList() {
-				result[child.GetResponseName()] = e.buildListValuesInListObject(child, currentFieldResponseMap, rundata)
+				childResult := e.buildListValuesInListObject(child, currentFieldResponseMap, rundata)
+				if childResult != nil {
+					result[child.GetResponseName()] = childResult
+				} else {
+					//null值传递
+					if field.GetFieldListNotNil() {
+						return nil
+					}
+				}
 			} else {
 				switch child.GetFieldType() {
 				case build.FIELD_TYPE_OBJECT:
-					result[child.GetResponseName()] = e.buildObjectValueInListObject(child, currentFieldResponseMap, rundata)
+					childResult := e.buildObjectValueInListObject(child, currentFieldResponseMap, rundata)
+					if childResult != nil {
+						result[child.GetResponseName()] = childResult
+					} else {
+						//null值传递
+						if field.GetFieldNotNil() {
+							return nil
+						}
+					}
 				case build.FIELD_TYPE_SCALAR, build.FIELD_TYPE_ENUM:
 					childResult := rundata.GetFieldResultByFieldId(child.GetFieldId())
 					if childResult != nil && childResult.HasParentResultBinding() {
@@ -191,10 +285,23 @@ func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFie
 						if val, ok := childResult.LookupParentResult(compositeKey); ok {
 							result[child.GetResponseName()] = val
 						} else {
+							//null值传递
+							if child.GetFieldNotNil() {
+								return nil
+							}
 							result[child.GetResponseName()] = nil
 						}
 					} else {
-						result[child.GetResponseName()] = e.buildScalarOrEnumValue(child, currentFieldResponseMap, rundata)
+						//TODO 这里考虑修改buildScalarOrEnumValue方法，直接从父节点数据中组装，不用再查询rundata本节点的数据
+						scalarOrEnumResult := e.buildScalarOrEnumValue(child, currentFieldResponseMap, rundata)
+						if scalarOrEnumResult != nil {
+							result[child.GetResponseName()] = scalarOrEnumResult
+						} else {
+							//null值传递
+							if field.GetFieldNotNil() {
+								return nil
+							}
+						}
 					}
 				}
 			}
@@ -208,6 +315,10 @@ func (e *SGraphEngine) buildListValuesInListObject(field *build.FieldPlan, paren
 	if field != nil {
 		fieldResult := rundata.GetFieldResultByFieldId(field.GetFieldId())
 		if fieldResult == nil {
+			//如果发现当前节点没有数据，判断当前字段是否non-null，如果是则返回nil
+			if field.GetFieldListNotNil() {
+				result = nil
+			}
 			return result
 		}
 
@@ -221,13 +332,29 @@ func (e *SGraphEngine) buildListValuesInListObject(field *build.FieldPlan, paren
 					if responseMap, ok := response.(map[string]any); ok {
 						result = append(result, e.buildObjectValueInList(field, responseMap, rundata))
 					} else {
-
+						//如果当前List中的元素要non-null，但是有nil的元素返回，则整个结果返回nil
+						if response == nil && field.GetFieldNotNil() {
+							return nil
+						}
 					}
 				}
-			case build.FIELD_TYPE_SCALAR:
+			case build.FIELD_TYPE_SCALAR, build.FIELD_TYPE_ENUM:
+				//null值传递
+				if field.GetFieldNotNil() {
+					for _, response := range currentFieldResponseArray {
+						if response == nil {
+							return nil
+						}
+					}
+				}
 				result = append(result, currentFieldResponseArray...)
-			case build.FIELD_TYPE_ENUM:
-				result = append(result, currentFieldResponseArray...)
+			}
+		} else {
+			//如果当前父元素对应的数组为空，判断字段是否允许List为null，不允许则整体返回nil
+			if currentFieldVal == nil {
+				if field.GetFieldListNotNil() {
+					return nil
+				}
 			}
 		}
 	}
@@ -244,6 +371,10 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 		compositeKey := build.BuildCompositeKey(field.GetParentKeyFieldNames(), parentResponse)
 		if compositeKey != "" {
 			responseVal, _ := fieldResult.LookupParentResult(compositeKey)
+			//如果当前字段为non-null，返回值为nil，将nil直接返回
+			if responseVal == nil && field.GetFieldNotNil() {
+				return result
+			}
 
 			//TODO 根据子节点继续遍历生成map
 			children := field.GetChildrenFields()
@@ -251,7 +382,12 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 			for _, child := range children {
 				if child.GetFieldIsList() {
 					if responseMap, ok := responseVal.(map[string]any); ok {
-						result[child.GetResponseName()] = e.buildListValuesInListObject(child, responseMap, rundata)
+						childResult := e.buildListValuesInListObject(child, responseMap, rundata)
+						//null值传递
+						if childResult == nil && field.GetFieldListNotNil() {
+							return nil
+						}
+						result[child.GetResponseName()] = childResult
 					} else {
 						//TODO 报错
 					}
@@ -259,19 +395,23 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 					switch child.GetFieldType() {
 					case build.FIELD_TYPE_OBJECT:
 						if responseMap, ok := responseVal.(map[string]any); ok {
-							result[child.GetResponseName()] = e.buildObjectValueInListObject(child, responseMap, rundata)
+							childResult := e.buildObjectValueInListObject(child, responseMap, rundata)
+							//null值传递
+							if childResult == nil && child.GetFieldNotNil() {
+								return nil
+							}
+							result[child.GetResponseName()] = childResult
 						} else {
 							//TODO 报错
 						}
-					case build.FIELD_TYPE_SCALAR:
+					case build.FIELD_TYPE_SCALAR, build.FIELD_TYPE_ENUM:
 						if fieldResMap, ok := responseVal.(map[string]any); ok {
-							result[child.GetResponseName()] = e.buildScalarOrEnumValueInListObject(child, fieldResMap, rundata)
-						} else {
-							//TODO 报错
-						}
-					case build.FIELD_TYPE_ENUM:
-						if fieldResMap, ok := responseVal.(map[string]any); ok {
-							result[child.GetResponseName()] = e.buildScalarOrEnumValueInListObject(child, fieldResMap, rundata)
+							childResult := e.buildScalarOrEnumValueInListObject(child, fieldResMap, rundata)
+							//null值传递
+							if childResult == nil && field.GetFieldNotNil() {
+								return nil
+							}
+							result[child.GetResponseName()] = childResult
 						} else {
 							//TODO 报错
 						}
