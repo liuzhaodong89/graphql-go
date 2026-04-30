@@ -209,7 +209,7 @@ func (p *planner) buildField(
 	}
 
 	// Determine field type characteristics by unwrapping the graphql type.
-	fieldType, isList, nonNull, namedType, err := analyzeType(fieldDef.Type)
+	fieldType, isList, listNotNil, itemNotNil, namedType, err := analyzeType(fieldDef.Type)
 	if err != nil {
 		return nil, fmt.Errorf("prepare1: field %q type analysis: %w", fieldName, err)
 	}
@@ -260,17 +260,18 @@ func (p *planner) buildField(
 	}
 
 	fp := build.NewFieldPlan(build.FieldPlanOptions{
-		FieldId:        fieldId,
-		ParentFieldId:  parentFieldId,
-		FieldName:      fieldName,
-		ResponseName:   responseKey,
-		FieldType:      fieldType,
-		FieldIsList:    isList,
-		FieldNotNil:    nonNull,
-		Paths:          path,
-		ParamPlans:     paramPlans,
-		ResolverFunc:   resolverFunc,
-		ChildrenFields: children,
+		FieldId:         fieldId,
+		ParentFieldId:   parentFieldId,
+		FieldName:       fieldName,
+		ResponseName:    responseKey,
+		FieldType:       fieldType,
+		FieldIsList:     isList,
+		FieldNotNil:     itemNotNil,
+		FieldListNotNil: listNotNil,
+		Paths:           path,
+		ParamPlans:      paramPlans,
+		ResolverFunc:    resolverFunc,
+		ChildrenFields:  children,
 	})
 	return fp, nil
 }
@@ -373,9 +374,11 @@ func argValueToParamPlan(paramKey string, val ast.Value) (*build.ParamPlan, erro
 //   - Whether the field is a list (isList)
 //   - Whether the field is non-null (nonNull)
 //   - The innermost named graphql.Type for further child resolution
-func analyzeType(t graphql.Output) (build.FieldType, bool, bool, graphql.Type, error) {
+func analyzeType(t graphql.Output) (build.FieldType, bool, bool, bool, graphql.Type, error) {
 	isList := false
-	nonNull := false
+	preListNonNull := false  // NonNull 在 List 之前：列表本身非空（[T]!）
+	postListNonNull := false // NonNull 在 List 之后：列表元素非空（[T!]）
+	seenList := false
 
 	// Use interface{} to allow seamless re-assignment across different
 	// graphql type interfaces (Output / Type share the same method set but
@@ -384,25 +387,42 @@ func analyzeType(t graphql.Output) (build.FieldType, bool, bool, graphql.Type, e
 	for {
 		switch ct := current.(type) {
 		case *graphql.NonNull:
-			nonNull = true
+			if seenList {
+				postListNonNull = true
+			} else {
+				preListNonNull = true
+			}
 			current = ct.OfType
 		case *graphql.List:
 			isList = true
+			seenList = true
 			current = ct.OfType
 		case *graphql.Scalar:
-			return build.FIELD_TYPE_SCALAR, isList, nonNull, ct, nil
+			// itemNotNil: 元素/标量本身非空（对列表是元素，对非列表是字段本身）
+			itemNotNil := postListNonNull || (!isList && preListNonNull)
+			// listNotNil: 列表容器本身非空（仅对列表类型有意义）
+			listNotNil := isList && preListNonNull
+			return build.FIELD_TYPE_SCALAR, isList, listNotNil, itemNotNil, ct, nil
 		case *graphql.Enum:
-			return build.FIELD_TYPE_ENUM, isList, nonNull, ct, nil
+			itemNotNil := postListNonNull || (!isList && preListNonNull)
+			listNotNil := isList && preListNonNull
+			return build.FIELD_TYPE_ENUM, isList, listNotNil, itemNotNil, ct, nil
 		case *graphql.Object:
-			return build.FIELD_TYPE_OBJECT, isList, nonNull, ct, nil
+			itemNotNil := postListNonNull || (!isList && preListNonNull)
+			listNotNil := isList && preListNonNull
+			return build.FIELD_TYPE_OBJECT, isList, listNotNil, itemNotNil, ct, nil
 		case *graphql.Interface:
-			return build.FIELD_TYPE_OBJECT, isList, nonNull, ct, nil
+			itemNotNil := postListNonNull || (!isList && preListNonNull)
+			listNotNil := isList && preListNonNull
+			return build.FIELD_TYPE_OBJECT, isList, listNotNil, itemNotNil, ct, nil
 		case *graphql.Union:
 			// Union resolution requires runtime type discrimination; return
 			// OBJECT and let callers handle the sub-selection limitations.
-			return build.FIELD_TYPE_OBJECT, isList, nonNull, ct, nil
+			itemNotNil := postListNonNull || (!isList && preListNonNull)
+			listNotNil := isList && preListNonNull
+			return build.FIELD_TYPE_OBJECT, isList, listNotNil, itemNotNil, ct, nil
 		default:
-			return build.FIELD_TYPE_SCALAR, isList, nonNull, nil,
+			return build.FIELD_TYPE_SCALAR, isList, false, false, nil,
 				fmt.Errorf("unsupported graphql type %T", current)
 		}
 	}
