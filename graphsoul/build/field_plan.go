@@ -12,7 +12,7 @@ type FieldType uint8
 const FIELD_TYPE_SCALAR FieldType = 0
 const FIELD_TYPE_OBJECT FieldType = 1
 
-// const FIELD_TYPE_ARRAY FieldType = 2
+// const FIELD_TYPE_TYPENAME FieldType = 2
 const FIELD_TYPE_ENUM FieldType = 3
 
 type ParamType uint8
@@ -20,8 +20,20 @@ type ParamType uint8
 const PARAM_TYPE_CONST ParamType = 0
 const PARAM_TYPE_INPUT ParamType = 1
 const PARAM_TYPE_FIELD_RESULT ParamType = 2
+const PARAM_TYPE_FIELD_FULLRESULT ParamType = 3
 
 type ResolverFunc func(source any, params map[string]any, ctx context.Context) (any, error)
+
+const DEFAULT_PARAM_KEY_TYPENAME = "typeName"
+
+var TypeNameResolverFunc = func(source any, params map[string]any, ctx context.Context) (any, error) {
+	if params != nil {
+		if typeName, ok := params[DEFAULT_PARAM_KEY_TYPENAME].(string); ok {
+			return typeName, nil
+		}
+	}
+	return nil, nil
+}
 
 type ParamPlan struct {
 	paramKey   string
@@ -78,6 +90,9 @@ type FieldPlan struct {
 	fieldNotNil              bool
 	fieldIsList              bool
 	fieldListNotNil          bool
+	allowedRuntimeTypeNames  map[string]bool
+	runtimeTypeResolverFunc  DynamicTypeResolverFunction
+	compiledTypeName         string
 }
 
 func (fp *FieldPlan) GetFieldId() uint32 {
@@ -142,6 +157,18 @@ func (fp *FieldPlan) GetParentKeyFieldNames() []string {
 
 func (fp *FieldPlan) GetArrayResultParentKeyName() string {
 	return fp.arrayResultParentKeyName
+}
+
+func (fp *FieldPlan) GetAllowedRuntimeTypeNames() map[string]bool {
+	return fp.allowedRuntimeTypeNames
+}
+
+func (fp *FieldPlan) GetRuntimeTypeResolverFunc() DynamicTypeResolverFunction {
+	return fp.runtimeTypeResolverFunc
+}
+
+func (fp *FieldPlan) GetCompiledTypeName() string {
+	return fp.compiledTypeName
 }
 
 // GetValueByPath 按 paths 路径从嵌套数据中逐层取值。

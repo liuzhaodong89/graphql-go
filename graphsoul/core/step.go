@@ -17,6 +17,8 @@ type NormalStep struct {
 	fieldPlan *build.FieldPlan
 }
 
+const DEFAULT_PARAM_KEY_FIELD_FULLRESULT = "DEFAULT_PARAM_KEY_FIELD_FULLRESULT"
+
 func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError {
 	if s.fieldPlan != nil {
 		//判断父节点数据是否允许空
@@ -32,6 +34,20 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 		if paramErr != nil {
 			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FIELD_ERROR_TYPE_FIELD, paramErr, s.fieldPlan.GetPaths())
 			return fe
+		}
+
+		var shouldExecute bool
+		if isFieldPlanCompiledType(s.fieldPlan) {
+			shouldExecute = shouldExecuteFieldAsCompiledType(s.fieldPlan, &ctx)
+		} else {
+			parentFullResult := params[DEFAULT_PARAM_KEY_FIELD_FULLRESULT]
+			if parentFullResult == nil {
+				return nil
+			}
+			shouldExecute = shouldExecuteFieldAsRuntimeType(s.fieldPlan, parentFullResult, &ctx)
+		}
+		if !shouldExecute {
+			return nil
 		}
 		//方法调用
 		resolverFunc := s.fieldPlan.GetResolverFunc()
@@ -100,6 +116,9 @@ func (s *NormalStep) prepareParams(paramPlans []*build.ParamPlan, rundata *Runda
 				return nil, fmt.Errorf("dependent field %d has no result", pp.GetDependentFieldId())
 			}
 			params[pp.GetParamKey()] = build.GetValueByPath(fieldResult.responses[0], pp.GetFieldResultPaths())
+		case build.PARAM_TYPE_FIELD_FULLRESULT:
+			fieldResult := rundata.GetFieldResultByFieldId(pp.GetDependentFieldId())
+			params[DEFAULT_PARAM_KEY_FIELD_FULLRESULT] = fieldResult
 		}
 	}
 	return params, nil
@@ -338,4 +357,30 @@ func (s *IteratorStep) prepareArrayParams(arrParamPlan *build.ParamPlan, rundata
 
 func (s *IteratorStep) GetFieldPlan() *build.FieldPlan {
 	return s.fieldPlan
+}
+
+func isFieldPlanCompiledType(fp *build.FieldPlan) bool {
+	if fp.GetRuntimeTypeResolverFunc() == nil {
+		return true
+	}
+	return false
+}
+
+func shouldExecuteFieldAsCompiledType(fp *build.FieldPlan, ctx *context.Context) bool {
+	return fp.GetAllowedRuntimeTypeNames()[fp.GetCompiledTypeName()]
+}
+
+func shouldExecuteFieldAsRuntimeType(fp *build.FieldPlan, parentData any, ctx *context.Context) bool {
+	if fp == nil || len(fp.GetAllowedRuntimeTypeNames()) == 0 {
+		return true
+	}
+	if fp.GetRuntimeTypeResolverFunc() != nil {
+		typeName := fp.GetRuntimeTypeResolverFunc()(parentData, ctx)
+		if typeName == "" {
+			return false
+		}
+		return fp.GetAllowedRuntimeTypeNames()[typeName]
+	}
+
+	return true
 }
