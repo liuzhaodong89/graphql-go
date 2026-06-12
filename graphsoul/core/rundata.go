@@ -71,8 +71,8 @@ func (r *Rundata) GetFieldErrorCount() int32 {
 
 type FieldErrorType uint8
 
-const FIELD_ERROR_TYPE_FIELD FieldErrorType = 0
-const FIELD_ERROR_TYPE_TREE FieldErrorType = 1
+const FieldErrorTypeField FieldErrorType = 0
+const FieldErrorTypeTree FieldErrorType = 1
 
 type FieldError struct {
 	err       error
@@ -83,13 +83,12 @@ type FieldError struct {
 
 type FieldResponseType uint8
 
-const FIELD_RESPONSE_TYPE_NORMAL FieldResponseType = 0
-const FIELD_RESPONSE_TYPE_ARRAY FieldResponseType = 1
+const FieldResponseTypeNormal FieldResponseType = 0
+const FieldResponseTypeArray FieldResponseType = 1
 
 type FieldResponse struct {
-	responseType FieldResponseType
-	responses    []any
-	//fieldPaths         [][]string
+	responseType       FieldResponseType
+	responses          []any
 	arrayParentKeyMap  map[any]any
 	indexOfParentArray uint32
 }
@@ -140,7 +139,6 @@ func AcquireFieldResponse(reponseType FieldResponseType) *FieldResponse {
 	frVal := fieldResponsePool.Get().(*FieldResponse)
 	frVal.responseType = reponseType
 	frVal.responses = frVal.responses[:0]
-	//frVal.fieldPaths = frVal.fieldPaths[:0]
 	frVal.indexOfParentArray = 0
 	frVal.arrayParentKeyMap = nil
 	return frVal

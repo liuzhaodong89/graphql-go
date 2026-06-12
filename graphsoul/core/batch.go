@@ -37,7 +37,7 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 		for _, step := range b.steps {
 			go func() {
 				fieldErr := step.Execute(rundata, ctx)
-				if fieldErr != nil && fieldErr.errorType == FIELD_ERROR_TYPE_TREE {
+				if fieldErr != nil && fieldErr.errorType == FieldErrorTypeTree {
 					semaphore.Add(1)
 				}
 				wg.Done()
@@ -53,7 +53,7 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 		//串行执行step
 		for _, step := range b.steps {
 			fieldErr := step.Execute(rundata, ctx)
-			if fieldErr != nil && fieldErr.errorType == FIELD_ERROR_TYPE_TREE {
+			if fieldErr != nil && fieldErr.errorType == FieldErrorTypeTree {
 				//判断是否有需要中断整个流程的错误
 				return &BatchResult{interrupt: true}
 			}
@@ -104,7 +104,8 @@ func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, batches []*Ba
 	}
 	//TODO 如果父节点非Array，当前节点有Resolver，则当前节点为Normal
 	var step Step
-	if !parentFP.GetFieldIsList() {
+	valueMetaInfo := parentFP.GetFieldValueMetaInfo()
+	if !valueMetaInfo.IsList {
 		if fp.GetResolverFunc() != nil {
 			step = &NormalStep{
 				fieldPlan: fp,
@@ -121,8 +122,8 @@ func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, batches []*Ba
 
 	argsPlans := make([]*build.ParamPlan, 0)
 	argsPlans = append(argsPlans, fp.GetParamPlans()...)
-	if fp.GetArrParamPlan() != nil {
-		argsPlans = append(argsPlans, fp.GetArrParamPlan())
+	if fp.GetArrParamPlans() != nil {
+		argsPlans = append(argsPlans, fp.GetArrParamPlans()...)
 	}
 
 	//TODO 根据参数查找最下层的batch，如果有参数没有找到batch则新建batch并加入到最下层
@@ -131,7 +132,7 @@ func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, batches []*Ba
 	var newBatch *Batch
 	for _, argsPlan := range argsPlans {
 		// CONST 和 INPUT 不依赖任何 field 结果，不参与 batch 调度
-		if argsPlan.GetParamType() != build.PARAM_TYPE_FIELD_RESULT {
+		if argsPlan.GetParamType() != build.ParamTypeFieldResult {
 			continue
 		}
 		depFieldId := argsPlan.GetDependentFieldId()

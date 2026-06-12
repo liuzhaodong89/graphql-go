@@ -5,43 +5,25 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/graphql-go/graphql"
 )
-
-type FieldType uint8
-
-const FIELD_TYPE_SCALAR FieldType = 0
-const FIELD_TYPE_OBJECT FieldType = 1
-
-// const FIELD_TYPE_TYPENAME FieldType = 2
-const FIELD_TYPE_ENUM FieldType = 3
 
 type ParamType uint8
 
-const PARAM_TYPE_CONST ParamType = 0
-const PARAM_TYPE_INPUT ParamType = 1
-const PARAM_TYPE_FIELD_RESULT ParamType = 2
-const PARAM_TYPE_FIELD_FULLRESULT ParamType = 3
+const ParamTypeConst ParamType = 0
+const ParamTypeInput ParamType = 1
+const ParamTypeFieldResult ParamType = 2
+const ParamTypeFieldFullResult ParamType = 3
 
 type ResolverFunc func(source any, params map[string]any, ctx context.Context) (any, error)
 
-const DEFAULT_PARAM_KEY_TYPENAME = "typeName"
-
-var TypeNameResolverFunc = func(source any, params map[string]any, ctx context.Context) (any, error) {
-	if params != nil {
-		if typeName, ok := params[DEFAULT_PARAM_KEY_TYPENAME].(string); ok {
-			return typeName, nil
-		}
-	}
-	return nil, nil
-}
-
 type ParamPlan struct {
-	paramKey   string
-	paramType  ParamType
-	constValue any
-	inputName  string
-	//如果是root节点，依赖的field节点ID默认为0。root节点的fieldId从1开始
-	dependentFieldId uint32
+	paramKey         string
+	paramType        ParamType
+	constValue       any
+	inputName        string
+	dependentFieldId uint32 //如果是root节点，依赖的field节点ID默认为0。root节点的fieldId从1开始
 	fieldResultPaths []string
 }
 
@@ -69,30 +51,122 @@ func (pp *ParamPlan) GetConstValue() any {
 	return pp.constValue
 }
 
+type DirectiveCompileResult struct {
+	IncludeDecision      *bool
+	RuntimePlans         []*DirectivePlan
+	DependencyParamPlans []*ParamPlan
+}
+
+type DirectiveCompiler interface {
+	Compile(Name string, Location string, Args map[string]any, Variables map[string]any, schema *graphql.Schema) (*DirectiveCompileResult, error)
+}
+
+type SkipDirectiveCompiler struct{}
+
+func (SkipDirectiveCompiler) Compile(name string, location string, args map[string]any, variables map[string]any, schema *graphql.Schema) (*DirectiveCompileResult, error) {
+	skipIf, _ := args["if"].(bool)
+
+	if skipIf {
+		include := false
+		return &DirectiveCompileResult{IncludeDecision: &include}, nil
+	}
+
+	return &DirectiveCompileResult{}, nil
+}
+
+type IncludeDirectiveCompiler struct{}
+
+func (IncludeDirectiveCompiler) Compile(name string, location string, args map[string]any, variables map[string]any, schema *graphql.Schema) (*DirectiveCompileResult, error) {
+	includeIf, _ := args["if"].(bool)
+
+	if !includeIf {
+		include := false
+		return &DirectiveCompileResult{IncludeDecision: &include}, nil
+	}
+
+	return &DirectiveCompileResult{}, nil
+}
+
+type DirectiveRuntimeHandler interface {
+	ShouldExecute(fieldPlan *FieldPlan, params map[string]any, parentResponse any, originalInputs map[string]any, ctx context.Context) (bool, error)
+	BeforeResolve(fieldPlan *FieldPlan, params map[string]any, parentResponse any, originalInputs map[string]any, ctx context.Context) (map[string]any, error)
+	AfterResolve(fieldPlan *FieldPlan, params map[string]any, parentResponse any, currentResponse any, ctx context.Context) (any, error)
+}
+
+type DefaultEmptyDirectiveRuntimeHandler struct {
+}
+
+func (DefaultEmptyDirectiveRuntimeHandler) ShouldExecute(fieldPlan *FieldPlan, params map[string]any, parentResponse any, originalInputs map[string]any, ctx context.Context) (bool, error) {
+	return true, nil
+}
+
+func (DefaultEmptyDirectiveRuntimeHandler) BeforeResolve(fieldPlan *FieldPlan, params map[string]any, parentResponse any, originalInputs map[string]any, ctx context.Context) (map[string]any, error) {
+	return nil, nil
+}
+
+func (DefaultEmptyDirectiveRuntimeHandler) AfterResolve(fieldPlan *FieldPlan, params map[string]any, parentResponse any, currentResponse any, ctx context.Context) (any, error) {
+	return nil, nil
+}
+
+type DirectiveStage uint8
+
+const DirectiveStageMetadataOnly DirectiveStage = 1
+const DirectiveStageShouldExecute DirectiveStage = 2
+const DirectiveStageBeforeResolve DirectiveStage = 3
+const DirectiveStageAfterResolve DirectiveStage = 4
+
+type DirectivePlan struct {
+	Name           string
+	Location       string
+	Args           map[string]any
+	Stage          DirectiveStage
+	Metadata       map[string]any
+	RuntimeHandler DirectiveRuntimeHandler
+}
+
+type FieldValueType uint8
+
+const FieldValueTypeScalar FieldValueType = 0
+const FieldValueTypeObject FieldValueType = 1
+const FieldValueTypeEnum FieldValueType = 2
+const FieldValueTypeList FieldValueType = 3
+
+// 字段返回值的封装类型元信息结构体
+type FieldValueMetaInfo struct {
+	NotNil       bool           //是否允许为null
+	IsList       bool           //是否为List类型
+	ValueType    FieldValueType //字段基础类型
+	OriginalType graphql.Type
+	ElementType  *FieldValueMetaInfo //如果是List类型，里面元素的封装类型元信息
+}
+
+func (fm *FieldValueMetaInfo) GetBaseElementOriginalType() graphql.Type {
+	if fm.ElementType == nil {
+		return fm.OriginalType
+	}
+	return fm.ElementType.GetBaseElementOriginalType()
+}
+
 type FieldPlan struct {
-	fieldName         string
-	responseName      string
-	fieldType         FieldType
-	paramPlans        []*ParamPlan
-	arrParamPlan      *ParamPlan
-	resolverFunc      ResolverFunc
-	arrayResolverFunc ResolverFunc
-	//从1开始自增
-	fieldId       uint32
-	parentFieldId uint32
-	//parentFieldNotNil bool
-	// 单次/遍历调用时用于标识父节点关联关系的字段名列表，支持多字段组合 key
-	parentKeyFieldNames []string
-	//批量调用时返回值中代表父节点映射key的字段name，获得返回结果后要根据这个字段name获取value并作为父子映射map的key
-	arrayResultParentKeyName string
-	paths                    []string
-	childrenFields           []*FieldPlan
-	fieldNotNil              bool
-	fieldIsList              bool
-	fieldListNotNil          bool
-	allowedRuntimeTypeNames  map[string]bool
-	runtimeTypeResolverFunc  DynamicTypeResolverFunction
-	compiledTypeName         string
+	fieldId      uint32 //字段自增ID，从1开始
+	fieldName    string //schema中的字段名称
+	responseName string //组装最后结果时的字段名称，如果有alias就使用alias
+	//fieldNamedType           FieldNamedType //基础类型，Object/Scalar/Enum
+	paramPlans              []*ParamPlan //单次参数计划List，NormalStep和IteratorStep中遍历模式执行时使用
+	arrParamPlans           []*ParamPlan //批量参数计划，IteratorStep中批量模式执行时使用
+	resolverFunc            ResolverFunc //单次执行Resolver方法，NormalStep和IteratorStep中遍历模式执行时使用
+	arrayResolverFunc       ResolverFunc //批量执行Resolver方法，IteratorStep中批量模式执行时使用
+	parentFieldId           uint32       //父字段ID，root节点该字段为0
+	parentKeyFieldName      string       //单次/遍历调用时用于标识父节点关联关系的字段名，默认是父节点中的id
+	resultParentKeyName     string       //批量调用时返回值中代表父节点映射key的字段name，获得返回结果后要根据这个字段name获取value并作为父子映射map的key
+	paths                   []string
+	childrenFields          []*FieldPlan
+	allowedRuntimeTypeNames map[string]bool
+	runtimeTypeResolverFunc DynamicTypeResolverFunction
+	compiledTypeName        string
+	fieldValueMetaInfo      FieldValueMetaInfo //字段返回值的封装类型元信息
+	directivePlans          []*DirectivePlan
+	directiveParamPlans     []*ParamPlan
 }
 
 func (fp *FieldPlan) GetFieldId() uint32 {
@@ -103,9 +177,9 @@ func (fp *FieldPlan) GetParentFieldId() uint32 {
 	return fp.parentFieldId
 }
 
-//func (fp *FieldPlan) IsParentFieldNotNil() bool {
-//	return fp.parentFieldNotNil
-//}
+func (fp *FieldPlan) GetFieldName() string {
+	return fp.fieldName
+}
 
 func (fp *FieldPlan) GetPaths() []string {
 	return fp.paths
@@ -115,8 +189,8 @@ func (fp *FieldPlan) GetParamPlans() []*ParamPlan {
 	return fp.paramPlans
 }
 
-func (fp *FieldPlan) GetArrParamPlan() *ParamPlan {
-	return fp.arrParamPlan
+func (fp *FieldPlan) GetArrParamPlans() []*ParamPlan {
+	return fp.arrParamPlans
 }
 
 func (fp *FieldPlan) GetResolverFunc() ResolverFunc {
@@ -127,8 +201,8 @@ func (fp *FieldPlan) GetArrayResolverFunc() ResolverFunc {
 	return fp.arrayResolverFunc
 }
 
-func (fp *FieldPlan) GetFieldType() FieldType {
-	return fp.fieldType
+func (fp *FieldPlan) GetFieldType() FieldValueType {
+	return fp.fieldValueMetaInfo.ValueType
 }
 
 func (fp *FieldPlan) GetChildrenFields() []*FieldPlan {
@@ -139,24 +213,16 @@ func (fp *FieldPlan) GetResponseName() string {
 	return fp.responseName
 }
 
-func (fp *FieldPlan) GetFieldIsList() bool {
-	return fp.fieldIsList
+func (fp *FieldPlan) GetFieldValueMetaInfo() FieldValueMetaInfo {
+	return fp.fieldValueMetaInfo
 }
 
-func (fp *FieldPlan) GetFieldNotNil() bool {
-	return fp.fieldNotNil
+func (fp *FieldPlan) GetParentKeyFieldName() string {
+	return fp.parentKeyFieldName
 }
 
-func (fp *FieldPlan) GetFieldListNotNil() bool {
-	return fp.fieldListNotNil
-}
-
-func (fp *FieldPlan) GetParentKeyFieldNames() []string {
-	return fp.parentKeyFieldNames
-}
-
-func (fp *FieldPlan) GetArrayResultParentKeyName() string {
-	return fp.arrayResultParentKeyName
+func (fp *FieldPlan) GetResultParentKeyFieldName() string {
+	return fp.resultParentKeyName
 }
 
 func (fp *FieldPlan) GetAllowedRuntimeTypeNames() map[string]bool {
@@ -169,6 +235,18 @@ func (fp *FieldPlan) GetRuntimeTypeResolverFunc() DynamicTypeResolverFunction {
 
 func (fp *FieldPlan) GetCompiledTypeName() string {
 	return fp.compiledTypeName
+}
+
+func (fp *FieldPlan) GetDirectivePlans() []*DirectivePlan {
+	return fp.directivePlans
+}
+
+func (fp *FieldPlan) GetDirectiveParamPlans() []*ParamPlan {
+	return fp.directiveParamPlans
+}
+
+func (fp *FieldPlan) IsIntrospectionTypeNameField() bool {
+	return fp.fieldName == IntrospectionFieldNameTypename
 }
 
 // GetValueByPath 按 paths 路径从嵌套数据中逐层取值。
@@ -186,9 +264,9 @@ func GetValueByPath(data any, paths []string) any {
 	return current
 }
 
-// BuildCompositeKey 将 source 中多个字段的值拼接为复合 key，字段顺序决定唯一性。
+// GenerateCompositeKey 将 source 中多个字段的值拼接为复合 key，字段顺序决定唯一性。
 // 例如 fieldNames=["orderId","itemId"], source={"orderId":1,"itemId":5} → "1:5"
-func BuildCompositeKey(fieldNames []string, source map[string]any) string {
+func GenerateCompositeKey(fieldNames []string, source map[string]any) string {
 	parts := make([]string, 0, len(fieldNames))
 	for _, name := range fieldNames {
 		parts = append(parts, valueToString(source[name]))

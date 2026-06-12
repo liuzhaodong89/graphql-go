@@ -621,13 +621,16 @@ type ArgumentConfig struct {
 
 type FieldDefinitionMap map[string]*FieldDefinition
 type FieldDefinition struct {
-	Name              string         `json:"name"`
-	Description       string         `json:"description"`
-	Type              Output         `json:"type"`
-	Args              []*Argument    `json:"args"`
-	Resolve           FieldResolveFn `json:"-"`
-	Subscribe         FieldResolveFn `json:"-"`
-	DeprecationReason string         `json:"deprecationReason"`
+	Name                       string         `json:"name"`
+	Description                string         `json:"description"`
+	Type                       Output         `json:"type"`
+	Args                       []*Argument    `json:"args"`
+	BatchArgs                  []*Argument    `json:"batchArgs"`
+	Resolve                    FieldResolveFn `json:"-"`
+	Subscribe                  FieldResolveFn `json:"-"`
+	BatchResolve               FieldResolveFn `json:"-"`
+	DeprecationReason          string         `json:"deprecationReason"`
+	BatchResultMappedFieldName string         `json:"batchResultMappedFieldName"`
 }
 
 type FieldArgument struct {
