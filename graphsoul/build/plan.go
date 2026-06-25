@@ -17,6 +17,10 @@ type SGraphPlan struct {
 	roots          []*FieldPlan
 }
 
+func (s *SGraphPlan) GetOperationType() SGraphPlanOperationType {
+	return s.operationType
+}
+
 func (s *SGraphPlan) GetRoots() []*FieldPlan {
 	return s.roots
 }
@@ -27,6 +31,8 @@ func (s *SGraphPlan) GetOriginalInputs() map[string]any {
 
 func (s *SGraphPlan) GetCacheKey() string {
 	var sb strings.Builder
+	sb.WriteString(strconv.FormatUint(uint64(s.GetOperationType()), 10))
+	sb.WriteString("_")
 	for _, root := range s.roots {
 		s.loopCreateCacheKey(root, &sb)
 	}
@@ -37,8 +43,31 @@ func (s *SGraphPlan) loopCreateCacheKey(fp *FieldPlan, keyBuilder *strings.Build
 	if fp == nil {
 		return
 	}
+	//keyBuilder.WriteString(strconv.FormatUint(uint64(fp.GetFieldId()), 10))
+	keyBuilder.WriteString(fp.GetFieldName())
+	keyBuilder.WriteString("-")
+	keyBuilder.WriteString(fp.GetResponseName())
+	keyBuilder.WriteString("-")
 	keyBuilder.WriteString(strconv.FormatUint(uint64(fp.GetFieldId()), 10))
 	keyBuilder.WriteString("-")
+	keyBuilder.WriteString(strconv.FormatUint(uint64(fp.GetParentFieldId()), 10))
+	keyBuilder.WriteString("-")
+	keyBuilder.WriteString(strconv.FormatUint(uint64(fp.GetFieldType()), 10))
+	keyBuilder.WriteString("-")
+	keyBuilder.WriteString(strconv.FormatBool(fp.GetFieldValueMetaInfo().NotNil))
+	keyBuilder.WriteString("-")
+	keyBuilder.WriteString(strconv.FormatBool(fp.GetFieldValueMetaInfo().IsList))
+	keyBuilder.WriteString("-")
+	keyBuilder.WriteString(strconv.FormatBool(fp.GetResolverFunc() != nil))
+	keyBuilder.WriteString("-")
+	keyBuilder.WriteString(strconv.FormatBool(fp.GetArrayResolverFunc() != nil))
+	keyBuilder.WriteString("-")
+	if len(fp.GetDirectivePlans()) > 0 {
+		for _, directivePlan := range fp.GetDirectivePlans() {
+			keyBuilder.WriteString(directivePlan.Name)
+			keyBuilder.WriteString(";")
+		}
+	}
 	for _, child := range fp.GetChildrenFields() {
 		s.loopCreateCacheKey(child, keyBuilder)
 	}

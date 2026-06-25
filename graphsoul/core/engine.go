@@ -9,16 +9,84 @@ import (
 )
 
 type SGraphResult struct {
-	response map[string]any
-	errors   []*FieldError
+	response         map[string]any
+	orderedResponses *SGraphResponseOrderedMap
+	errors           []*FieldError
 }
 
 func (r *SGraphResult) GetResponse() map[string]any {
+
 	return r.response
+}
+
+func (r *SGraphResult) GetOrderedResponses() *SGraphResponseOrderedMap {
+	if r.orderedResponses == nil {
+		return nil
+	}
+	return r.orderedResponses
 }
 
 func (r *SGraphResult) GetErrors() []*FieldError {
 	return r.errors
+}
+
+type OrderedFieldResponse struct {
+	key   string
+	value any
+}
+
+func (f OrderedFieldResponse) GetKey() string {
+	return f.key
+}
+
+func (f OrderedFieldResponse) GetValue() any {
+	return f.value
+}
+
+type SGraphResponseOrderedMap struct {
+	fieldResponses []OrderedFieldResponse
+	indexs         map[string]uint8
+}
+
+func NewSGraphResponseOrderedMap(capacity int) *SGraphResponseOrderedMap {
+	return &SGraphResponseOrderedMap{
+		fieldResponses: make([]OrderedFieldResponse, 0, capacity),
+		indexs:         make(map[string]uint8, capacity),
+	}
+}
+
+func (r *SGraphResponseOrderedMap) Set(key string, value any) {
+	if r == nil {
+		return
+	}
+
+	if index, ok := r.indexs[key]; ok {
+		r.fieldResponses[index].value = value
+		return
+	}
+
+	r.indexs[key] = uint8(len(r.fieldResponses))
+	r.fieldResponses = append(r.fieldResponses, OrderedFieldResponse{key, value})
+}
+
+func (r *SGraphResponseOrderedMap) Get(key string) (any, bool) {
+	if r == nil {
+		return nil, false
+	}
+
+	if index, ok := r.indexs[key]; !ok {
+		return nil, false
+	} else {
+		return r.fieldResponses[index].value, true
+	}
+
+}
+
+func (r *SGraphResponseOrderedMap) Fields() []OrderedFieldResponse {
+	if r == nil {
+		return nil
+	}
+	return r.fieldResponses
 }
 
 type SGraphEngine struct {
@@ -45,23 +113,24 @@ func (e *SGraphEngine) getBatchesFromCacheOrCreate(plan *build.SGraphPlan) []*Ba
 	return batches
 }
 
-func (e *SGraphEngine) Execute(plan *build.SGraphPlan) *SGraphResult {
-	//组装Rundata和context
-	var maxFieldId uint32
-	if plan != nil {
-		maxFieldId = plan.MaxFieldId()
+func (e *SGraphEngine) Execute(plan *build.SGraphPlan, ctx context.Context) *SGraphResult {
+	//检查入参
+	if plan == nil {
+		return nil
 	}
+	//组装Rundata和context
+	maxFieldId := plan.MaxFieldId()
 	rundata := NewRundata(plan.GetOriginalInputs(), maxFieldId)
-	ctx := context.TODO()
+	if ctx == nil {
+		ctx = context.TODO()
+	}
 	//组装Batches
-	if plan != nil {
-		batches := e.getBatchesFromCacheOrCreate(plan)
-		//遍历执行Batches，判断遇到中断则返回
-		for _, batch := range batches {
-			br := batch.Execute(rundata, ctx)
-			if br.IsInterrupt() {
-				break
-			}
+	batches := e.getBatchesFromCacheOrCreate(plan)
+	//遍历执行Batches，判断遇到中断则返回
+	for _, batch := range batches {
+		br := batch.Execute(rundata, ctx)
+		if br.IsInterrupt() {
+			break
 		}
 	}
 	//组装结果
@@ -78,15 +147,17 @@ func (e *SGraphEngine) Execute(plan *build.SGraphPlan) *SGraphResult {
 
 func (e *SGraphEngine) assembleGraphResult(plan *build.SGraphPlan, rundata *Rundata, ctx context.Context) *SGraphResult {
 	result := &SGraphResult{
-		response: make(map[string]any),
-		errors:   nil,
+		response:         make(map[string]any),
+		orderedResponses: nil,
+		errors:           nil,
 	}
 	if plan == nil {
 		return result
 	}
 
 	roots := plan.GetRoots()
-	responseMap := make(map[string]any, len(roots))
+	//responseMap := make(map[string]any, len(roots))
+	orderedResponsesMap := NewSGraphResponseOrderedMap(len(roots))
 
 	for _, root := range roots {
 		rootValueMeta := root.GetFieldValueMetaInfo()
@@ -94,44 +165,52 @@ func (e *SGraphEngine) assembleGraphResult(plan *build.SGraphPlan, rundata *Rund
 			rootResult := e.buildListValues(root, nil, rundata, ctx)
 			//null值传递
 			if rootValueMeta.NotNil && rootResult == nil {
-				responseMap = nil
+				//responseMap = nil
+				orderedResponsesMap = nil
 				break
 			} else {
-				responseMap[root.GetResponseName()] = rootResult
+				//responseMap[root.GetResponseName()] = rootResult
+				orderedResponsesMap.Set(root.GetResponseName(), rootResult)
 			}
 		} else {
 			if root.GetFieldType() == build.FieldValueTypeObject {
 				rootResult := e.buildObjectValue(root, nil, rundata, ctx)
 				//null值传递
 				if rootResult == nil && rootValueMeta.NotNil {
-					responseMap = nil
+					//responseMap = nil
+					orderedResponsesMap = nil
 					break
 				} else {
-					responseMap[root.GetResponseName()] = rootResult
+					//responseMap[root.GetResponseName()] = rootResult
+					orderedResponsesMap.Set(root.GetResponseName(), rootResult)
 				}
 			} else if root.GetFieldType() == build.FieldValueTypeScalar || root.GetFieldType() == build.FieldValueTypeEnum {
 				rootResult := e.buildScalarOrEnumValue(root, nil, rundata, ctx)
 				//null值传递
 				if rootResult == nil && rootValueMeta.NotNil {
-					responseMap = nil
+					//responseMap = nil
+					orderedResponsesMap = nil
 					break
 				} else {
-					responseMap[root.GetResponseName()] = rootResult
+					//responseMap[root.GetResponseName()] = rootResult
+					orderedResponsesMap.Set(root.GetResponseName(), rootResult)
 				}
 			}
 		}
 
 	}
-	result.response = responseMap
+	//result.response = responseMap
+	result.orderedResponses = orderedResponsesMap
 	result.errors = rundata.GetAllFieldErrors()
 	return result
 
 }
 
-func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, parentResponse map[string]any, rundata *Rundata, ctx context.Context) map[string]any {
+func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, parentResponse map[string]any, rundata *Rundata, ctx context.Context) *SGraphResponseOrderedMap {
 	if field != nil {
 		children := field.GetChildrenFields()
-		result := make(map[string]any, len(children))
+		//result := make(map[string]any, len(children))
+		result := NewSGraphResponseOrderedMap(len(children))
 
 		fieldResponse, extractErr := e.extractFieldResponse(field, parentResponse, rundata)
 		//如果当前字段的结果为空，不再遍历子字段
@@ -148,7 +227,8 @@ func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, parentResponse m
 				if childResult == nil && childValueMeta.NotNil {
 					return nil
 				}
-				result[child.GetResponseName()] = childResult
+				//result[child.GetResponseName()] = childResult
+				result.Set(child.GetResponseName(), childResult)
 			} else {
 				switch child.GetFieldType() {
 				case build.FieldValueTypeObject:
@@ -157,7 +237,8 @@ func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, parentResponse m
 					if childResult == nil && childValueMeta.NotNil {
 						return nil
 					}
-					result[child.GetResponseName()] = childResult
+					//result[child.GetResponseName()] = childResult
+					result.Set(child.GetResponseName(), childResult)
 				case build.FieldValueTypeScalar, build.FieldValueTypeEnum:
 					if fieldResMap, ok := fieldResponse.(map[string]any); ok {
 						childResult := e.buildScalarOrEnumValue(child, fieldResMap, rundata, ctx)
@@ -165,12 +246,14 @@ func (e *SGraphEngine) buildObjectValue(field *build.FieldPlan, parentResponse m
 						if childValueMeta.NotNil && childResult == nil {
 							return nil
 						}
-						result[child.GetResponseName()] = childResult
+						//result[child.GetResponseName()] = childResult
+						result.Set(child.GetResponseName(), childResult)
 					} else {
 						if fieldResponse == nil {
 							return nil
 						}
-						result[child.GetResponseName()] = nil
+						//result[child.GetResponseName()] = nil
+						result.Set(child.GetResponseName(), nil)
 					}
 				}
 			}
@@ -219,8 +302,9 @@ func (e *SGraphEngine) buildListValues(field *build.FieldPlan, parentResponse ma
 	return nil
 }
 
-func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFieldResponseMap map[string]any, rundata *Rundata, ctx context.Context) map[string]any {
-	var result map[string]any
+func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFieldResponseMap map[string]any, rundata *Rundata, ctx context.Context) *SGraphResponseOrderedMap {
+	//var result map[string]any
+	var result *SGraphResponseOrderedMap
 	//如果当前元素的response为空，则直接返回，不再遍历子字段
 	if currentFieldResponseMap == nil {
 		return result
@@ -229,7 +313,8 @@ func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFie
 	if field != nil {
 		fieldValueMeta := field.GetFieldValueMetaInfo()
 		children := field.GetChildrenFields()
-		result = make(map[string]any, len(children))
+		//result = make(map[string]any, len(children))
+		result = NewSGraphResponseOrderedMap(len(children))
 		for _, child := range children {
 			childValueMeta := child.GetFieldValueMetaInfo()
 			if childValueMeta.IsList {
@@ -238,40 +323,46 @@ func (e *SGraphEngine) buildObjectValueInList(field *build.FieldPlan, currentFie
 				if childResult == nil && childValueMeta.NotNil {
 					return nil
 				}
-				result[child.GetResponseName()] = childResult
+				//result[child.GetResponseName()] = childResult
+				result.Set(child.GetResponseName(), childResult)
 			} else {
 				switch child.GetFieldType() {
 				case build.FieldValueTypeObject:
 					childResult := e.buildObjectValueInListObject(child, currentFieldResponseMap, rundata, ctx)
 					//null值冒泡
-					if fieldValueMeta.NotNil && childResult == nil {
+					if childValueMeta.NotNil && childResult == nil {
 						return nil
 					}
-					result[child.GetResponseName()] = childResult
+					//result[child.GetResponseName()] = childResult
+					result.Set(child.GetResponseName(), childResult)
 				case build.FieldValueTypeScalar, build.FieldValueTypeEnum:
 					childResult := rundata.GetFieldResultByFieldId(child.GetFieldId())
 					if childResult != nil && childResult.HasParentResultBinding() {
 						compositeKey := build.GenerateCompositeKey([]string{child.GetParentKeyFieldName()}, currentFieldResponseMap)
 						if val, ok := childResult.LookupParentResult(compositeKey); ok {
-							result[child.GetResponseName()] = val
+							//result[child.GetResponseName()] = val
+							result.Set(child.GetResponseName(), val)
 						} else {
 							//null值传递
 							if childValueMeta.NotNil {
 								return nil
 							}
-							result[child.GetResponseName()] = nil
+							//result[child.GetResponseName()] = nil
+							result.Set(child.GetResponseName(), nil)
 						}
 					} else {
 						//TODO 这里考虑修改buildScalarOrEnumValue方法，直接从父节点数据中组装，不用再查询rundata本节点的数据
 						scalarOrEnumResult := e.buildScalarOrEnumValue(child, currentFieldResponseMap, rundata, ctx)
 						if scalarOrEnumResult != nil {
-							result[child.GetResponseName()] = scalarOrEnumResult
+							//result[child.GetResponseName()] = scalarOrEnumResult
+							result.Set(child.GetResponseName(), scalarOrEnumResult)
 						} else {
 							//null值传递
 							if fieldValueMeta.NotNil {
 								return nil
 							}
-							result[child.GetResponseName()] = nil
+							//result[child.GetResponseName()] = nil
+							result.Set(child.GetResponseName(), nil)
 						}
 					}
 				}
@@ -315,8 +406,9 @@ func (e *SGraphEngine) buildListValuesInListObject(field *build.FieldPlan, paren
 	return result
 }
 
-func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, parentResponse map[string]any, rundata *Rundata, ctx context.Context) map[string]any {
-	var result map[string]any
+func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, parentResponse map[string]any, rundata *Rundata, ctx context.Context) *SGraphResponseOrderedMap {
+	//var result map[string]any
+	var result *SGraphResponseOrderedMap
 	if field != nil {
 		fieldValueMetaInfo := field.GetFieldValueMetaInfo()
 
@@ -332,7 +424,8 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 
 		//根据子节点继续遍历生成map
 		children := field.GetChildrenFields()
-		result = make(map[string]any, len(children))
+		//result = make(map[string]any, len(children))
+		result = NewSGraphResponseOrderedMap(len(children))
 		for _, child := range children {
 			childValueMetaInfo := child.GetFieldValueMetaInfo()
 			if childValueMetaInfo.IsList {
@@ -343,9 +436,11 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 					if childResult == nil && childValueMetaInfo.NotNil {
 						return nil
 					}
-					result[child.GetResponseName()] = childResult
+					//result[child.GetResponseName()] = childResult
+					result.Set(child.GetResponseName(), childResult)
 				} else {
-					result[child.GetResponseName()] = nil
+					//result[child.GetResponseName()] = nil
+					result.Set(child.GetResponseName(), nil)
 				}
 			} else {
 				switch child.GetFieldType() {
@@ -356,9 +451,11 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 						if childResult == nil && childValueMetaInfo.NotNil {
 							return nil
 						}
-						result[child.GetResponseName()] = childResult
+						//result[child.GetResponseName()] = childResult
+						result.Set(child.GetResponseName(), childResult)
 					} else {
-						result[child.GetResponseName()] = nil
+						//result[child.GetResponseName()] = nil
+						result.Set(child.GetResponseName(), nil)
 					}
 				case build.FieldValueTypeScalar, build.FieldValueTypeEnum:
 					if fieldResMap, ok := fieldResponse.(map[string]any); ok {
@@ -367,9 +464,11 @@ func (e *SGraphEngine) buildObjectValueInListObject(field *build.FieldPlan, pare
 						if childResult == nil && childValueMetaInfo.NotNil {
 							return nil
 						}
-						result[child.GetResponseName()] = childResult
+						//result[child.GetResponseName()] = childResult
+						result.Set(child.GetResponseName(), childResult)
 					} else {
-						result[child.GetResponseName()] = nil
+						//result[child.GetResponseName()] = nil
+						result.Set(child.GetResponseName(), nil)
 					}
 				}
 			}

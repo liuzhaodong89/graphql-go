@@ -46,7 +46,7 @@ func GenerateTypeMetaResult(schema *graphql.Schema, t graphql.Type, children []*
 		return nil
 	}
 
-	var result map[string]any
+	result := make(map[string]any)
 	for _, child := range children {
 		switch child.GetFieldName() {
 		case "kind":
@@ -119,7 +119,7 @@ func GenerateInputFieldsMetaResult(schema *graphql.Schema, t graphql.Type, child
 }
 
 func GenerateInputValuesMetaResult(schema *graphql.Schema, args []*graphql.Argument, children []*FieldPlan, inputs map[string]any) []any {
-	result := make([]any, len(args))
+	result := make([]any, 0)
 	for _, arg := range args {
 		result = append(result, GenerateSingleInputValueMetaResult(schema, arg, children, inputs))
 	}
@@ -164,7 +164,7 @@ func GenerateFieldsMetaResult(schema *graphql.Schema, children []*FieldPlan, t g
 
 	sort.Strings(fieldNames)
 
-	result := make([]any, len(fieldNames))
+	result := make([]any, 0)
 	for _, name := range fieldNames {
 		result = append(result, GenerateSingleFieldMetaResult(schema, fields[name], children, inputs))
 	}

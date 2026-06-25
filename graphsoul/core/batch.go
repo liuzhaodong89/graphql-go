@@ -35,13 +35,13 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 		wg.Add(len(b.steps))
 
 		for _, step := range b.steps {
-			go func() {
+			go func(step Step) {
 				fieldErr := step.Execute(rundata, ctx)
 				if fieldErr != nil && fieldErr.errorType == FieldErrorTypeTree {
 					semaphore.Add(1)
 				}
 				wg.Done()
-			}()
+			}(step)
 		}
 
 		wg.Wait()
@@ -66,12 +66,17 @@ func BuildBatches(plan *build.SGraphPlan) []*Batch {
 	batches := make([]*Batch, 0)
 	//TODO step的类型不是按照当前field类型来的，而是按照执行场景来的。如果step的入参是切片或数组，返回值也是切片或数组，即循环遍历的场景就是IteratorStep，反之就是NormalStep
 	paramDepFieldIdBatchIdMap := make(map[uint32]*Batch)
+	producedAt := map[uint32]uint32{}
 	if plan != nil {
 		//第一个batch加入到batch切片里
+		concurrent := false
+		if plan.GetOperationType() == build.SGraphOperationTypeQuery {
+			concurrent = true
+		}
 		firstBatch := &Batch{
 			batchId:    0,
 			steps:      make([]Step, 0),
-			concurrent: true,
+			concurrent: concurrent,
 		}
 		batches = append(batches, firstBatch)
 
@@ -83,6 +88,8 @@ func BuildBatches(plan *build.SGraphPlan) []*Batch {
 			}
 			firstBatch.steps = append(firstBatch.steps, step)
 
+			producedAt[root.GetFieldId()] = 0
+
 			//增加根节点的参数依赖关系到map里，方便后续子节点查找
 			for _, paramPlan := range root.GetParamPlans() {
 				paramDepFieldIdBatchIdMap[paramPlan.GetDependentFieldId()] = firstBatch
@@ -91,21 +98,21 @@ func BuildBatches(plan *build.SGraphPlan) []*Batch {
 			//针对每个根节点递归遍历，为子节点创建step和对应的batch
 			children := root.GetChildrenFields()
 			for _, child := range children {
-				batches, paramDepFieldIdBatchIdMap = appendBatches(child, root, batches, paramDepFieldIdBatchIdMap)
+				batches, producedAt = appendBatches(child, root, 0, batches, producedAt, plan.GetOperationType())
 			}
 		}
 	}
 	return batches
 }
 
-func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, batches []*Batch, paramDepFieldIdBatchIdMap map[uint32]*Batch) ([]*Batch, map[uint32]*Batch) {
+func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, parentResultBatchId uint32, batches []*Batch, producedAt map[uint32]uint32, op build.SGraphPlanOperationType) ([]*Batch, map[uint32]uint32) {
 	if fp == nil {
-		return batches, paramDepFieldIdBatchIdMap
+		return batches, producedAt
 	}
 	//TODO 如果父节点非Array，当前节点有Resolver，则当前节点为Normal
 	var step Step
-	valueMetaInfo := parentFP.GetFieldValueMetaInfo()
-	if !valueMetaInfo.IsList {
+	parentValueMetaInfo := parentFP.GetFieldValueMetaInfo()
+	if !parentValueMetaInfo.IsList {
 		if fp.GetResolverFunc() != nil {
 			step = &NormalStep{
 				fieldPlan: fp,
@@ -125,50 +132,44 @@ func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, batches []*Ba
 	if fp.GetArrParamPlans() != nil {
 		argsPlans = append(argsPlans, fp.GetArrParamPlans()...)
 	}
+	childParentResultBatchId := parentResultBatchId
 
 	//TODO 根据参数查找最下层的batch，如果有参数没有找到batch则新建batch并加入到最下层
-	var latestBatch *Batch
 	var latestBatchId uint32 = 0
-	var newBatch *Batch
 	for _, argsPlan := range argsPlans {
 		// CONST 和 INPUT 不依赖任何 field 结果，不参与 batch 调度
-		if argsPlan.GetParamType() != build.ParamTypeFieldResult {
+		if argsPlan.GetParamType() != build.ParamTypeFieldResult && argsPlan.GetParamType() != build.ParamTypeFieldFullResult {
 			continue
 		}
-		depFieldId := argsPlan.GetDependentFieldId()
-		b := paramDepFieldIdBatchIdMap[depFieldId]
-		if b != nil {
-			if b.GetBatchId() > latestBatchId {
-				latestBatch = b
-				latestBatchId = b.GetBatchId()
+		if at, ok := producedAt[argsPlan.GetDependentFieldId()]; ok {
+			if parentResultBatchId >= at {
+				latestBatchId = parentResultBatchId
+			} else {
+				latestBatchId = at
 			}
-		} else {
-			//如果出现新建batch的场景，中断循环优先按照新建batch推进
-			newBatch = &Batch{
-				batchId: uint32(len(batches)),
-				steps:   make([]Step, 0),
-			}
-			if step != nil {
-				newBatch.steps = append(newBatch.steps, step)
-			}
-			batches = append(batches, newBatch)
-			paramDepFieldIdBatchIdMap[depFieldId] = newBatch
-			break
 		}
 	}
-	if newBatch == nil && latestBatch != nil {
-		if step != nil {
-			latestBatch.steps = append(latestBatch.steps, step)
-		}
-	} else if newBatch == nil && latestBatch == nil && step != nil {
-		//无参数依赖的节点，直接加入到第一个batch里
-		batches[0].steps = append(batches[0].steps, step)
-	}
+	target := latestBatchId + 1
+	batches = ensureBatch(batches, target, op)
+	batches[target].steps = append(batches[target].steps, step)
+	producedAt[fp.GetFieldId()] = target
+	childParentResultBatchId = target
 
 	// 递归处理子节点
 	for _, child := range fp.GetChildrenFields() {
-		batches, paramDepFieldIdBatchIdMap = appendBatches(child, fp, batches, paramDepFieldIdBatchIdMap)
+		batches, producedAt = appendBatches(child, fp, childParentResultBatchId, batches, producedAt, op)
 	}
 
-	return batches, paramDepFieldIdBatchIdMap
+	return batches, producedAt
+}
+
+func ensureBatch(batches []*Batch, targetId uint32, op build.SGraphPlanOperationType) []*Batch {
+	for {
+		if len(batches) <= int(targetId) {
+			batches = append(batches, &Batch{batchId: uint32(len(batches)), concurrent: op == build.SGraphOperationTypeQuery})
+		} else {
+			break
+		}
+	}
+	return batches
 }

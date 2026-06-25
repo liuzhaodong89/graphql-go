@@ -70,6 +70,7 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 					return fe
 				}
 				fieldResponse.responses = append(fieldResponse.responses, typeName)
+				rundata.SetFieldResult(s.fieldPlan.GetFieldId(), fieldResponse)
 				return nil
 			}
 		}
@@ -95,7 +96,7 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 		}
 
 		//执行AfterResolve指令
-		afterResolvedValue, afterResolvedValueErr := s.appleBeforeResolveDirectives(paramContext, rundata, ctx)
+		afterResolvedValue, afterResolvedValueErr := s.appleAfterResolveDirectives(paramContext, res, rundata, ctx)
 		if afterResolvedValueErr != nil {
 			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FieldErrorTypeField, afterResolvedValueErr, s.fieldPlan.GetPaths())
 			return fe
@@ -109,7 +110,7 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 			bubbledResult, bubbledErr := HandleResponseForNullBubbling(fieldValueMetaInfo, res)
 			//根据null值冒泡后的结果组装返回数据
 			if bubbledResult != nil {
-				fieldResponse.responses = append(fieldResponse.responses, bubbledResult)
+				fieldResponse.responses = append(fieldResponse.responses, bubbledResult...)
 				rundata.SetFieldResult(s.fieldPlan.GetFieldId(), fieldResponse)
 			}
 			//根据null值冒泡后的错误组装错误信息
@@ -122,7 +123,7 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 			//判断结果能否为空，若non-null但返回nil则报错
 			nullBubbledResult, nullBubbledErr := HandleResponseForNullBubbling(fieldValueMetaInfo, res)
 			if nullBubbledResult != nil {
-				fieldResponse.responses = append(fieldResponse.responses, nullBubbledResult)
+				fieldResponse.responses = append(fieldResponse.responses, nullBubbledResult...)
 				rundata.SetFieldResult(s.fieldPlan.GetFieldId(), fieldResponse)
 			}
 
@@ -236,7 +237,7 @@ func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldErro
 		if arrayResolverFunc := s.fieldPlan.GetArrayResolverFunc(); arrayResolverFunc != nil {
 			//获取批量模式参数
 			arrParamsContext, arrParamsErr := s.prepareArrayParams(s.fieldPlan, s.fieldPlan.GetArrParamPlans(), rundata, ctx)
-			if arrParamsErr == nil || arrParamsErr != nil {
+			if arrParamsContext == nil || arrParamsErr != nil {
 				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FieldErrorTypeField, arrParamsErr, s.fieldPlan.GetPaths())
 				return fe
 			}
@@ -587,5 +588,8 @@ func HandleResponseForNullBubbling(listMeta build.FieldValueMetaInfo, fieldRespo
 		//如果允许元素null，则直接返回原始元素
 		return listVal, nil
 	}
-	return nil, fmt.Errorf("list value is not a list")
+	if listMeta.NotNil && fieldResponse == nil {
+		return nil, fmt.Errorf("non-null list response is nil")
+	}
+	return []any{fieldResponse}, nil
 }
