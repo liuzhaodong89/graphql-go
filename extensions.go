@@ -191,36 +191,84 @@ func handleExtensionsExecutionDidStart(p *ExecuteParams) ([]gqlerrors.FormattedE
 	}
 }
 
+var sGraphExtensionsContextKey = &struct{}{}
+var resolveInfoContextKey = &struct{}{}
+
+func contextWithSGraphExtensions(ctx context.Context, extensions []Extension) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// 只有 public Execute 会写入 extensions；底层 SGraphEngine.Execute 不主动启用半套 extension 生命周期。
+	return context.WithValue(ctx, sGraphExtensionsContextKey, extensions)
+}
+
+func sGraphExtensionsFromContext(ctx context.Context) []Extension {
+	if ctx == nil {
+		return nil
+	}
+	// 没有从 public Execute 进入时返回 nil，GraphSoul 不会只触发 field hook 而跳过 execution hook。
+	extensions, _ := ctx.Value(sGraphExtensionsContextKey).([]Extension)
+	return extensions
+}
+
+func contextWithResolveInfo(ctx context.Context, info *ResolveInfo) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// GraphSoul 内部 ResolverFunc 签名不带 ResolveInfo；通过 ctx 传给 wrapResolverFunc 填充 ResolveParams.Info。
+	return context.WithValue(ctx, resolveInfoContextKey, info)
+}
+
+func resolveInfoFromContext(ctx context.Context) *ResolveInfo {
+	if ctx == nil {
+		return nil
+	}
+	info, _ := ctx.Value(resolveInfoContextKey).(*ResolveInfo)
+	return info
+}
+
 // handleResolveFieldDidStart handles the notification of the extensions about the start of a resolve function
 func handleExtensionsResolveFieldDidStart(exts []Extension, p *executionContext, i *ResolveInfo) ([]gqlerrors.FormattedError, resolveFieldFinishFuncHandler) {
+	errs, ctx, finish := handleExtensionsResolveFieldDidStartWithContext(exts, p.Context, i)
+	p.Context = ctx
+	return errs, finish
+}
+
+func handleExtensionsResolveFieldDidStartWithContext(exts []Extension, ctx context.Context, i *ResolveInfo) ([]gqlerrors.FormattedError, context.Context, resolveFieldFinishFuncHandler) {
 	fs := map[string]ResolveFieldFinishFunc{}
 	errs := gqlerrors.FormattedErrors{}
-	for _, ext := range p.Schema.extensions {
+	currentCtx := ctx
+	if currentCtx == nil {
+		currentCtx = context.Background()
+	}
+	for _, ext := range exts {
 		var (
-			ctx      context.Context
+			nextCtx  context.Context
 			finishFn ResolveFieldFinishFunc
 		)
 		// catch panic from an extension's resolveFieldDidStart function
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					errs = append(errs, gqlerrors.FormatError(fmt.Errorf("%s.ResolveFieldDidStart: %v", ext.Name(), r.(error))))
+					errs = append(errs, gqlerrors.FormatError(fmt.Errorf("%s.ResolveFieldDidStart: %v", ext.Name(), r)))
 				}
 			}()
-			ctx, finishFn = ext.ResolveFieldDidStart(p.Context, i)
-			// update context
-			p.Context = ctx
+			nextCtx, finishFn = ext.ResolveFieldDidStart(currentCtx, i)
+			if nextCtx != nil {
+				// extension 可以把 trace/span 等信息写回 ctx，后续 extension 和 resolver 都要看到最新 ctx。
+				currentCtx = nextCtx
+			}
 			fs[ext.Name()] = finishFn
 		}()
 	}
-	return errs, func(val interface{}, err error) []gqlerrors.FormattedError {
+	return errs, currentCtx, func(val interface{}, err error) []gqlerrors.FormattedError {
 		extErrs := gqlerrors.FormattedErrors{}
 		for name, finishFn := range fs {
 			func() {
 				// catch panic from a finishFn
 				defer func() {
 					if r := recover(); r != nil {
-						extErrs = append(extErrs, gqlerrors.FormatError(fmt.Errorf("%s.ResolveFieldFinishFunc: %v", name, r.(error))))
+						extErrs = append(extErrs, gqlerrors.FormatError(fmt.Errorf("%s.ResolveFieldFinishFunc: %v", name, r)))
 					}
 				}()
 				finishFn(val, err)
@@ -228,6 +276,78 @@ func handleExtensionsResolveFieldDidStart(exts []Extension, p *executionContext,
 		}
 		return extErrs
 	}
+}
+
+func startSGraphResolveFieldHook(rundata *Rundata, fieldPlan *FieldPlan, ctx context.Context, listIndex int) (context.Context, resolveFieldFinishFuncHandler) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if rundata == nil || fieldPlan == nil {
+		return ctx, nil
+	}
+
+	// ResolveInfo 需要同时包含 build 期字段元数据和请求期变量/root/fragments。
+	info := buildSGraphResolveInfo(rundata, fieldPlan, responsePathForFieldPlan(fieldPlan, listIndex))
+	fieldCtx := contextWithResolveInfo(ctx, &info)
+	if len(rundata.extensions) == 0 {
+		// 即使没有 extension，也要让 wrapResolverFunc 能从 ctx 取到 ResolveInfo。
+		return fieldCtx, nil
+	}
+
+	extErrs, extCtx, finish := handleExtensionsResolveFieldDidStartWithContext(rundata.extensions, fieldCtx, &info)
+	rundata.AddExtensionErrors(extErrs)
+	return contextWithResolveInfo(extCtx, &info), finish
+}
+
+func finishSGraphResolveFieldHook(rundata *Rundata, finish resolveFieldFinishFuncHandler, val interface{}, err error) {
+	if finish == nil {
+		return
+	}
+	// extension 自身错误只进入 Result.Errors，不作为字段错误参与 null bubbling。
+	extErrs := finish(val, err)
+	if rundata != nil {
+		rundata.AddExtensionErrors(extErrs)
+	}
+}
+
+func buildSGraphResolveInfo(rundata *Rundata, fieldPlan *FieldPlan, path *ResponsePath) ResolveInfo {
+	// plan 中只缓存 schema/AST 结构信息，请求相关的变量、root 和 extension 状态都来自 Rundata。
+	info := ResolveInfo{
+		FieldName:      fieldPlan.fieldName,
+		FieldASTs:      fieldPlan.fieldASTs,
+		Path:           path,
+		ReturnType:     fieldPlan.returnType,
+		ParentType:     fieldPlan.parentType,
+		Fragments:      rundata.fragments,
+		RootValue:      rundata.rootValue,
+		Operation:      rundata.operation,
+		VariableValues: rundata.originalParams,
+	}
+	if rundata.schema != nil {
+		info.Schema = *rundata.schema
+	}
+	if info.ReturnType == nil {
+		if returnType, ok := fieldPlan.fieldValueMetaInfo.OriginalType.(Output); ok {
+			info.ReturnType = returnType
+		}
+	}
+	return info
+}
+
+func responsePathForFieldPlan(fieldPlan *FieldPlan, listIndex int) *ResponsePath {
+	if fieldPlan == nil {
+		return nil
+	}
+	var path *ResponsePath
+	paths := fieldPlan.GetPaths()
+	for i, key := range paths {
+		if listIndex >= 0 && i == len(paths)-1 {
+			// list item 字段的 path 需要插入数组下标，例如 friends.0.name。
+			path = path.WithKey(listIndex)
+		}
+		path = path.WithKey(key)
+	}
+	return path
 }
 
 func addExtensionResults(p *ExecuteParams, result *Result) {

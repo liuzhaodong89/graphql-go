@@ -1,16 +1,23 @@
-package core
+package graphql
 
 import (
 	"context"
 	"sync"
 	"sync/atomic"
-
-	"github.com/graphql-go/graphql/graphsoul/build"
 )
 
 type BatchResult struct {
 	interrupt bool
 }
+
+// 小 batch 直接串行执行，避免 goroutine 调度成本超过并发收益。
+const sGraphConcurrentStepMin = 8
+
+var (
+	// BatchResult 是只读结果对象，复用静态实例减少每个 batch 的小对象分配。
+	batchResultContinue  = &BatchResult{interrupt: false}
+	batchResultInterrupt = &BatchResult{interrupt: true}
+)
 
 func (br *BatchResult) IsInterrupt() bool {
 	return br.interrupt
@@ -28,7 +35,7 @@ func (b *Batch) GetBatchId() uint32 {
 }
 
 func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
-	if b.concurrent && len(b.steps) > 1 {
+	if b.concurrent && len(b.steps) >= sGraphConcurrentStepMin {
 		//并发执行step
 		semaphore := atomic.Uint32{}
 		wg := sync.WaitGroup{}
@@ -36,6 +43,7 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 
 		for _, step := range b.steps {
 			go func(step Step) {
+				// step 作为参数传入 goroutine，避免闭包捕获循环变量导致执行错 step。
 				fieldErr := step.Execute(rundata, ctx)
 				if fieldErr != nil && fieldErr.errorType == FieldErrorTypeTree {
 					semaphore.Add(1)
@@ -47,7 +55,7 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 		wg.Wait()
 		//判断是否有需要中断整个流程的错误
 		if semaphore.Load() >= 1 {
-			return &BatchResult{interrupt: true}
+			return batchResultInterrupt
 		}
 	} else {
 		//串行执行step
@@ -55,22 +63,21 @@ func (b *Batch) Execute(rundata *Rundata, ctx context.Context) *BatchResult {
 			fieldErr := step.Execute(rundata, ctx)
 			if fieldErr != nil && fieldErr.errorType == FieldErrorTypeTree {
 				//判断是否有需要中断整个流程的错误
-				return &BatchResult{interrupt: true}
+				return batchResultInterrupt
 			}
 		}
 	}
-	return &BatchResult{interrupt: false}
+	return batchResultContinue
 }
 
-func BuildBatches(plan *build.SGraphPlan) []*Batch {
+func BuildBatches(plan *SGraphPlan) []*Batch {
 	batches := make([]*Batch, 0)
 	//TODO step的类型不是按照当前field类型来的，而是按照执行场景来的。如果step的入参是切片或数组，返回值也是切片或数组，即循环遍历的场景就是IteratorStep，反之就是NormalStep
-	paramDepFieldIdBatchIdMap := make(map[uint32]*Batch)
 	producedAt := map[uint32]uint32{}
 	if plan != nil {
 		//第一个batch加入到batch切片里
 		concurrent := false
-		if plan.GetOperationType() == build.SGraphOperationTypeQuery {
+		if plan.GetOperationType() == SGraphOperationTypeQuery {
 			concurrent = true
 		}
 		firstBatch := &Batch{
@@ -83,29 +90,25 @@ func BuildBatches(plan *build.SGraphPlan) []*Batch {
 		//根节点默认是普通调用
 		roots := plan.GetRoots()
 		for _, root := range roots {
-			step := &NormalStep{
-				fieldPlan: root,
-			}
-			firstBatch.steps = append(firstBatch.steps, step)
-
-			producedAt[root.GetFieldId()] = 0
-
-			//增加根节点的参数依赖关系到map里，方便后续子节点查找
-			for _, paramPlan := range root.GetParamPlans() {
-				paramDepFieldIdBatchIdMap[paramPlan.GetDependentFieldId()] = firstBatch
+			if root.GetResolverFunc() != nil {
+				step := &NormalStep{
+					fieldPlan: root,
+				}
+				firstBatch.steps = append(firstBatch.steps, step)
+				producedAt[root.GetFieldId()] = 0
 			}
 
 			//针对每个根节点递归遍历，为子节点创建step和对应的batch
 			children := root.GetChildrenFields()
 			for _, child := range children {
-				batches, producedAt = appendBatches(child, root, 0, batches, producedAt, plan.GetOperationType())
+				batches, producedAt = appendBatches(child, root, batches, producedAt, plan.GetOperationType())
 			}
 		}
 	}
 	return batches
 }
 
-func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, parentResultBatchId uint32, batches []*Batch, producedAt map[uint32]uint32, op build.SGraphPlanOperationType) ([]*Batch, map[uint32]uint32) {
+func appendBatches(fp *FieldPlan, parentFP *FieldPlan, batches []*Batch, producedAt map[uint32]uint32, op SGraphPlanOperationType) ([]*Batch, map[uint32]uint32) {
 	if fp == nil {
 		return batches, producedAt
 	}
@@ -127,46 +130,47 @@ func appendBatches(fp *build.FieldPlan, parentFP *build.FieldPlan, parentResultB
 		}
 	}
 
-	argsPlans := make([]*build.ParamPlan, 0)
+	argsPlans := make([]*ParamPlan, 0, len(fp.GetParamPlans())+len(fp.GetArrParamPlans())+len(fp.GetDirectiveParamPlans()))
 	argsPlans = append(argsPlans, fp.GetParamPlans()...)
-	if fp.GetArrParamPlans() != nil {
-		argsPlans = append(argsPlans, fp.GetArrParamPlans()...)
-	}
-	childParentResultBatchId := parentResultBatchId
+	argsPlans = append(argsPlans, fp.GetArrParamPlans()...)
+	argsPlans = append(argsPlans, fp.GetDirectiveParamPlans()...)
 
-	//TODO 根据参数查找最下层的batch，如果有参数没有找到batch则新建batch并加入到最下层
-	var latestBatchId uint32 = 0
+	// step 所在 batch 只由显式字段结果参数依赖决定；父子关系本身不参与调度分层。
+	target := uint32(0)
 	for _, argsPlan := range argsPlans {
+		if argsPlan == nil {
+			continue
+		}
 		// CONST 和 INPUT 不依赖任何 field 结果，不参与 batch 调度
-		if argsPlan.GetParamType() != build.ParamTypeFieldResult && argsPlan.GetParamType() != build.ParamTypeFieldFullResult {
+		if argsPlan.GetParamType() != ParamTypeFieldResult && argsPlan.GetParamType() != ParamTypeFieldFullResult {
 			continue
 		}
 		if at, ok := producedAt[argsPlan.GetDependentFieldId()]; ok {
-			if parentResultBatchId >= at {
-				latestBatchId = parentResultBatchId
-			} else {
-				latestBatchId = at
+			next := at + 1
+			if next > target {
+				target = next
 			}
 		}
 	}
-	target := latestBatchId + 1
-	batches = ensureBatch(batches, target, op)
-	batches[target].steps = append(batches[target].steps, step)
-	producedAt[fp.GetFieldId()] = target
-	childParentResultBatchId = target
+	if step != nil {
+		// 只有真实 resolver 才进入 batch；无 resolver 字段在组装阶段从父响应读取。
+		batches = ensureBatch(batches, target, op)
+		batches[target].steps = append(batches[target].steps, step)
+		producedAt[fp.GetFieldId()] = target
+	}
 
 	// 递归处理子节点
 	for _, child := range fp.GetChildrenFields() {
-		batches, producedAt = appendBatches(child, fp, childParentResultBatchId, batches, producedAt, op)
+		batches, producedAt = appendBatches(child, fp, batches, producedAt, op)
 	}
 
 	return batches, producedAt
 }
 
-func ensureBatch(batches []*Batch, targetId uint32, op build.SGraphPlanOperationType) []*Batch {
+func ensureBatch(batches []*Batch, targetId uint32, op SGraphPlanOperationType) []*Batch {
 	for {
 		if len(batches) <= int(targetId) {
-			batches = append(batches, &Batch{batchId: uint32(len(batches)), concurrent: op == build.SGraphOperationTypeQuery})
+			batches = append(batches, &Batch{batchId: uint32(len(batches)), concurrent: op == SGraphOperationTypeQuery})
 		} else {
 			break
 		}

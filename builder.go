@@ -1,4 +1,4 @@
-package build
+package graphql
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/language/ast"
 )
 
@@ -19,7 +18,7 @@ type DynamicTypeResolverFunction func(value any, context *context.Context) strin
 // 类型上下文结构体，在build阶段生成，在execute阶段运行，用于类型推断
 type TypeRuntimeScope struct {
 	declaredType        any
-	allowedDynamicTypes map[string]*graphql.Object
+	allowedDynamicTypes map[string]*Object
 	dynamicTypeResolver DynamicTypeResolverFunction
 	staticTypeName      string
 }
@@ -57,7 +56,7 @@ func (tr *TypeRuntimeScope) GetAllowedTypeNamesForField() map[string]bool {
 	return result
 }
 
-func (tr *TypeRuntimeScope) GetAllowedDynamicTypes() map[string]*graphql.Object {
+func (tr *TypeRuntimeScope) GetAllowedDynamicTypes() map[string]*Object {
 	return tr.allowedDynamicTypes
 }
 
@@ -74,7 +73,7 @@ func (tr *TypeRuntimeScope) GetDeclaredType() any {
 }
 
 type PlanBuilder struct {
-	schema            *graphql.Schema
+	schema            *Schema
 	fragments         map[string]*ast.FragmentDefinition
 	fieldIdCounter    atomic.Uint32
 	originalInputs    map[string]any
@@ -88,7 +87,7 @@ type FieldEntry struct {
 	dependencyParams []*ParamPlan
 }
 
-func BuildGraphPlan(document *ast.Document, schema *graphql.Schema, args map[string]any, operationName *string, registry *DirectiveRegistry) (*SGraphPlan, error) {
+func BuildGraphPlan(document *ast.Document, schema *Schema, operationName *string, registry *DirectiveRegistry) (*SGraphPlan, error) {
 	//参数检查
 	if document == nil {
 		return nil, errors.New("no document provided")
@@ -96,15 +95,12 @@ func BuildGraphPlan(document *ast.Document, schema *graphql.Schema, args map[str
 	if schema == nil {
 		return nil, errors.New("no schema provided")
 	}
-	if args == nil {
-		args = map[string]any{}
-	}
 	result := &SGraphPlan{}
 	planBuilder := &PlanBuilder{
 		schema:         schema,
 		fragments:      make(map[string]*ast.FragmentDefinition),
 		fieldIdCounter: atomic.Uint32{},
-		originalInputs: args,
+		originalInputs: nil,
 	}
 
 	//选择Operation和Fragments
@@ -131,19 +127,17 @@ func BuildGraphPlan(document *ast.Document, schema *graphql.Schema, args map[str
 	}
 	planBuilder.fragments = fragments
 
-	//组装original_params
 	if operationDefinition == nil {
 		return nil, errors.New("no operation definition provided")
 	}
-	inputs, inputsErr := planBuilder.parseOperationVariables(schema, operationDefinition.VariableDefinitions, args)
-	if inputsErr != nil {
-		return nil, inputsErr
+	result.operation = operationDefinition
+	result.fragments = make(map[string]ast.Definition, len(fragments))
+	for name, fragment := range fragments {
+		result.fragments[name] = fragment
 	}
-	planBuilder.originalInputs = inputs
-	result.originalInputs = inputs
 
 	//确定RootType
-	var rootNodeType *graphql.Object
+	var rootNodeType *Object
 	switch operationDefinition.Operation {
 	case ast.OperationTypeMutation:
 		rootNodeType = schema.MutationType()
@@ -183,6 +177,7 @@ func BuildGraphPlan(document *ast.Document, schema *graphql.Schema, args map[str
 	}
 	//生成SGraphPlan
 	result.roots = fieldPlans
+	result.maxFieldId = calculateMaxFieldId(fieldPlans)
 
 	return result, nil
 }
@@ -221,14 +216,17 @@ func (builder *PlanBuilder) buildSelectionSetWithFlattenEntries(current *ast.Sel
 		return nil, fieldEntriesErr
 	}
 
+	return builder.buildFieldPlansFromEntries(fieldEntries, parentFieldId, parentFieldIsList, parentPaths, isIntrospection)
+}
+
+func (builder *PlanBuilder) buildFieldPlansFromEntries(fieldEntries []FieldEntry, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, isIntrospection bool) ([]*FieldPlan, error) {
 	type groupKey struct {
 		responseName    string
 		allowedTypeHash string
 	}
 	type group struct {
-		fields           []ast.Field
+		entries          []FieldEntry
 		typeScope        *TypeRuntimeScope
-		directives       []*DirectivePlan
 		dependencyParams []*ParamPlan
 	}
 
@@ -243,13 +241,12 @@ func (builder *PlanBuilder) buildSelectionSetWithFlattenEntries(current *ast.Sel
 		if g, exists := groups[key]; !exists {
 			orderedKeys = append(orderedKeys, key)
 			groups[key] = &group{
-				fields:           []ast.Field{entry.field},
+				entries:          []FieldEntry{entry},
 				typeScope:        entry.typeScope,
-				directives:       entry.directives,
 				dependencyParams: entry.dependencyParams,
 			}
 		} else {
-			g.fields = append(g.fields, entry.field)
+			g.entries = append(g.entries, entry)
 			//dependencyParams 合并所有出现
 			g.dependencyParams = append(g.dependencyParams, entry.dependencyParams...)
 		}
@@ -259,22 +256,14 @@ func (builder *PlanBuilder) buildSelectionSetWithFlattenEntries(current *ast.Sel
 	for _, key := range orderedKeys {
 		g := groups[key]
 
-		rep := g.fields[0]
-		if len(g.fields) > 1 {
-			merged := &ast.SelectionSet{
-				Selections: []ast.Selection{},
-			}
-			for _, f := range g.fields {
-				if f.SelectionSet != nil {
-					merged.Selections = append(merged.Selections, f.SelectionSet.Selections...)
-				}
-			}
-			if len(merged.Selections) > 0 {
-				rep.SelectionSet = merged
-			} else {
-				rep.SelectionSet = nil
-			}
+		rep := g.entries[0].field
+		conditionalDirectiveGroups := make([][]*DirectivePlan, 0, len(g.entries))
+		for _, entry := range g.entries {
+			//每个重复字段 occurrence 都保留自己的 @skip/@include 条件，运行期按 OR 语义判断。
+			conditionalDirectives, _ := splitConditionalDirectives(entry.directives)
+			conditionalDirectiveGroups = append(conditionalDirectiveGroups, conditionalDirectives)
 		}
+		_, runtimeDirectives := splitConditionalDirectives(g.entries[0].directives)
 
 		fieldName := ""
 		if rep.Name != nil {
@@ -286,20 +275,20 @@ func (builder *PlanBuilder) buildSelectionSetWithFlattenEntries(current *ast.Sel
 
 		switch fieldName {
 		case IntrospectionFieldNameTypename:
-			fieldPlans, fieldErr = builder.parseIntrospectionTypenameField(rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, g.directives, g.dependencyParams)
+			fieldPlans, fieldErr = builder.parseIntrospectionTypenameField(rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, g.dependencyParams, conditionalDirectiveGroups)
 		case IntrospectionFieldNameMetaType:
-			fieldPlans, fieldErr = builder.parseIntrospectionMetaTypeField(rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, g.directives, g.dependencyParams)
+			fieldPlans, fieldErr = builder.parseIntrospectionMetaTypeField(rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, g.dependencyParams, conditionalDirectiveGroups, g.entries)
 		case IntrospectionFieldNameMetaSchema:
-			fieldPlans, fieldErr = builder.parseIntrospectionMetaSchemaField(rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, g.directives, g.dependencyParams)
+			fieldPlans, fieldErr = builder.parseIntrospectionMetaSchemaField(rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, g.dependencyParams, conditionalDirectiveGroups, g.entries)
 		default:
 			if isIntrospection {
 				var fieldPlan *FieldPlan
-				fieldPlan, fieldErr = builder.buildIntrospectionFieldPlan(&rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, g.directives, g.dependencyParams)
-				if fieldErr != nil {
+				fieldPlan, fieldErr = builder.buildIntrospectionFieldPlan(&rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, g.dependencyParams, conditionalDirectiveGroups, g.entries)
+				if fieldErr == nil {
 					fieldPlans = []*FieldPlan{fieldPlan}
 				}
 			} else {
-				fieldPlans, fieldErr = builder.parseField(rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, g.directives, g.dependencyParams)
+				fieldPlans, fieldErr = builder.parseField(rep, g.typeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, g.dependencyParams, conditionalDirectiveGroups, g.entries)
 			}
 		}
 		if fieldErr != nil {
@@ -330,7 +319,7 @@ func (builder *PlanBuilder) flattenOneSelection(selection ast.Selection, parentT
 	case *ast.Field:
 		compiled, err := builder.compileDirectives(
 			sel.Directives,
-			graphql.DirectiveLocationField,
+			DirectiveLocationField,
 			inheritedDirectives,
 		)
 		if err != nil {
@@ -346,7 +335,7 @@ func (builder *PlanBuilder) flattenOneSelection(selection ast.Selection, parentT
 			dependencyParams: compiled.DependencyParamPlans,
 		}}, nil
 	case *ast.FragmentSpread:
-		spreadCompiled, err := builder.compileDirectives(sel.Directives, graphql.DirectiveLocationFragmentSpread, inheritedDirectives)
+		spreadCompiled, err := builder.compileDirectives(sel.Directives, DirectiveLocationFragmentSpread, inheritedDirectives)
 		if err != nil {
 			return nil, err
 		}
@@ -366,13 +355,13 @@ func (builder *PlanBuilder) flattenOneSelection(selection ast.Selection, parentT
 		if scopeErr != nil {
 			return nil, scopeErr
 		}
-		fragmentCompiled, err := builder.compileDirectives(frag.Directives, graphql.DirectiveLocationFragmentDefinition, spreadCompiled.RuntimePlans)
+		fragmentCompiled, err := builder.compileDirectives(frag.Directives, DirectiveLocationFragmentDefinition, spreadCompiled.RuntimePlans)
 		if err != nil {
 			return nil, err
 		}
 		return builder.flattenSelections(frag.SelectionSet, croppedScope, fragmentCompiled.RuntimePlans)
 	case *ast.InlineFragment:
-		compiled, err := builder.compileDirectives(sel.Directives, graphql.DirectiveLocationInlineFragment, inheritedDirectives)
+		compiled, err := builder.compileDirectives(sel.Directives, DirectiveLocationInlineFragment, inheritedDirectives)
 		if err != nil {
 			return nil, err
 		}
@@ -389,6 +378,45 @@ func (builder *PlanBuilder) flattenOneSelection(selection ast.Selection, parentT
 	return nil, nil
 }
 
+func (builder *PlanBuilder) flattenChildEntriesForField(fieldEntries []FieldEntry, childTypeScope *TypeRuntimeScope) ([]FieldEntry, error) {
+	if len(fieldEntries) == 0 || childTypeScope == nil {
+		return nil, nil
+	}
+
+	var result []FieldEntry
+	for _, entry := range fieldEntries {
+		if entry.field.SelectionSet == nil {
+			continue
+		}
+		// 子选择必须继承自己所属字段 occurrence 的指令条件，避免重复 responseName 合并后条件串线。
+		children, err := builder.flattenSelections(entry.field.SelectionSet, childTypeScope, entry.directives)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, children...)
+	}
+	return result, nil
+}
+
+func splitConditionalDirectives(plans []*DirectivePlan) ([]*DirectivePlan, []*DirectivePlan) {
+	conditionalPlans := make([]*DirectivePlan, 0)
+	otherPlans := make([]*DirectivePlan, 0, len(plans))
+
+	for _, plan := range plans {
+		if plan == nil {
+			continue
+		}
+		// 只有标准 @skip/@include 参与 field collection 的 occurrence 条件语义。
+		if plan.Stage == DirectiveStageShouldExecute && (plan.Name == "skip" || plan.Name == "include") {
+			conditionalPlans = append(conditionalPlans, plan)
+			continue
+		}
+		otherPlans = append(otherPlans, plan)
+	}
+
+	return conditionalPlans, otherPlans
+}
+
 // 根据一个具体的selection来生成对应的fieldPlan
 func (builder *PlanBuilder) buildSelection(current ast.Selection, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, inheritedDirectives []*DirectivePlan) ([]*FieldPlan, error) {
 	//检查入参
@@ -401,16 +429,18 @@ func (builder *PlanBuilder) buildSelection(current ast.Selection, parentTypeScop
 	case *ast.Field:
 		compiled, err := builder.compileDirectives(
 			selectionType.Directives,
-			graphql.DirectiveLocationField,
+			DirectiveLocationField,
 			inheritedDirectives,
 		)
 		if err != nil {
 			return nil, err
 		}
+		conditionalDirectives, runtimeDirectives := splitConditionalDirectives(compiled.RuntimePlans)
+		conditionalDirectiveGroups := [][]*DirectivePlan{conditionalDirectives}
 
 		//__typename
 		if selectionType.Name != nil && selectionType.Name.Value == IntrospectionFieldNameTypename {
-			typenameFieldPlans, typenameFieldPlanErr := builder.parseIntrospectionTypenameField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, compiled.RuntimePlans, compiled.DependencyParamPlans)
+			typenameFieldPlans, typenameFieldPlanErr := builder.parseIntrospectionTypenameField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, compiled.DependencyParamPlans, conditionalDirectiveGroups)
 			if typenameFieldPlanErr != nil {
 				return nil, typenameFieldPlanErr
 			}
@@ -418,7 +448,7 @@ func (builder *PlanBuilder) buildSelection(current ast.Selection, parentTypeScop
 		}
 		//__type
 		if selectionType.Name != nil && selectionType.Name.Value == IntrospectionFieldNameMetaType {
-			typeFieldPlans, typeFieldPlansErr := builder.parseIntrospectionMetaTypeField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, compiled.RuntimePlans, compiled.DependencyParamPlans)
+			typeFieldPlans, typeFieldPlansErr := builder.parseIntrospectionMetaTypeField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, compiled.DependencyParamPlans, conditionalDirectiveGroups, nil)
 			if typeFieldPlansErr != nil {
 				return nil, typeFieldPlansErr
 			}
@@ -426,20 +456,20 @@ func (builder *PlanBuilder) buildSelection(current ast.Selection, parentTypeScop
 		}
 		//__schema
 		if selectionType.Name != nil && selectionType.Name.Value == IntrospectionFieldNameMetaSchema {
-			schemaFieldPlans, schemaFieldPlansErr := builder.parseIntrospectionMetaSchemaField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, compiled.RuntimePlans, compiled.DependencyParamPlans)
+			schemaFieldPlans, schemaFieldPlansErr := builder.parseIntrospectionMetaSchemaField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, compiled.DependencyParamPlans, conditionalDirectiveGroups, nil)
 			if schemaFieldPlansErr != nil {
 				return nil, schemaFieldPlansErr
 			}
 			return schemaFieldPlans, nil
 		}
 		//default
-		fieldPlans, fieldPlansErr := builder.parseField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, compiled.RuntimePlans, compiled.DependencyParamPlans)
+		fieldPlans, fieldPlansErr := builder.parseField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, compiled.DependencyParamPlans, conditionalDirectiveGroups, nil)
 		if fieldPlansErr != nil {
 			return nil, fieldPlansErr
 		}
 		return fieldPlans, nil
 	case *ast.FragmentSpread:
-		spreadCompiled, err := builder.compileDirectives(selectionType.Directives, graphql.DirectiveLocationFragmentSpread, inheritedDirectives)
+		spreadCompiled, err := builder.compileDirectives(selectionType.Directives, DirectiveLocationFragmentSpread, inheritedDirectives)
 		if err != nil {
 			return nil, err
 		}
@@ -459,13 +489,13 @@ func (builder *PlanBuilder) buildSelection(current ast.Selection, parentTypeScop
 		if scopeErr != nil {
 			return nil, scopeErr
 		}
-		fragmentCompiled, err := builder.compileDirectives(frag.Directives, graphql.DirectiveLocationFragmentDefinition, spreadCompiled.RuntimePlans)
+		fragmentCompiled, err := builder.compileDirectives(frag.Directives, DirectiveLocationFragmentDefinition, spreadCompiled.RuntimePlans)
 		if err != nil {
 			return nil, err
 		}
 		return builder.buildSelectionSet(frag.SelectionSet, croppedScope, parentFieldId, parentFieldIsList, parentPaths, fragmentCompiled.RuntimePlans)
 	case *ast.InlineFragment:
-		compiled, err := builder.compileDirectives(selectionType.Directives, graphql.DirectiveLocationInlineFragment, inheritedDirectives)
+		compiled, err := builder.compileDirectives(selectionType.Directives, DirectiveLocationInlineFragment, inheritedDirectives)
 		if err != nil {
 			return nil, err
 		}
@@ -507,13 +537,15 @@ func (builder *PlanBuilder) buildIntrospectionSelection(current ast.Selection, p
 		if selectionType.Name == nil {
 			return nil, errors.New("no type scope provided while building introspection selection set")
 		}
+		conditionalDirectives, runtimeDirectives := splitConditionalDirectives(inheritedDirectives)
+		conditionalDirectiveGroups := [][]*DirectivePlan{conditionalDirectives}
 		if selectionType.Name.Value == IntrospectionFieldNameTypename {
-			return builder.parseIntrospectionTypenameField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, inheritedDirectives, directiveDependencyParams)
+			return builder.parseIntrospectionTypenameField(*selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, directiveDependencyParams, conditionalDirectiveGroups)
 		}
 		if strings.HasPrefix(selectionType.Name.Value, "__") {
 			return nil, fmt.Errorf("introspection selection found for %s", selectionType.Name.Value)
 		}
-		fieldPlan, fieldPlanErr := builder.buildIntrospectionFieldPlan(selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, inheritedDirectives, directiveDependencyParams)
+		fieldPlan, fieldPlanErr := builder.buildIntrospectionFieldPlan(selectionType, parentTypeScope, parentFieldId, parentFieldIsList, parentPaths, runtimeDirectives, directiveDependencyParams, conditionalDirectiveGroups, nil)
 		if fieldPlanErr != nil {
 			return nil, fieldPlanErr
 		}
@@ -541,7 +573,7 @@ func (builder *PlanBuilder) buildIntrospectionSelection(current ast.Selection, p
 	return nil, nil
 }
 
-func (builder *PlanBuilder) buildIntrospectionFieldPlan(current *ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directives []*DirectivePlan, directiveDependencyParams []*ParamPlan) (*FieldPlan, error) {
+func (builder *PlanBuilder) buildIntrospectionFieldPlan(current *ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directives []*DirectivePlan, directiveDependencyParams []*ParamPlan, conditionalDirectiveGroups [][]*DirectivePlan, fieldEntries []FieldEntry) (*FieldPlan, error) {
 	//responseName
 	responseName := GetAstResponseName(current)
 	//paths
@@ -573,45 +605,59 @@ func (builder *PlanBuilder) buildIntrospectionFieldPlan(current *ast.Field, pare
 	var children []*FieldPlan
 	var childrenErr error
 	if current.SelectionSet != nil && currentScope != nil && currentScope.declaredType != nil {
-		children, childrenErr = builder.buildIntrospectionSelectionSet(current.GetSelectionSet(), currentScope, fieldId, fieldValueMetaInfo.IsList, paths, directives, directiveDependencyParams)
+		if len(fieldEntries) > 0 {
+			var childEntries []FieldEntry
+			childEntries, childrenErr = builder.flattenChildEntriesForField(fieldEntries, currentScope)
+			if childrenErr == nil {
+				children, childrenErr = builder.buildFieldPlansFromEntries(childEntries, fieldId, fieldValueMetaInfo.IsList, paths, true)
+			}
+		} else {
+			children, childrenErr = builder.buildIntrospectionSelectionSet(current.GetSelectionSet(), currentScope, fieldId, fieldValueMetaInfo.IsList, paths, directives, directiveDependencyParams)
+		}
 		if childrenErr != nil {
 			return nil, childrenErr
 		}
 	}
 
 	return &FieldPlan{
-		fieldId:                 fieldId,
-		parentFieldId:           parentFieldId,
-		fieldName:               current.Name.Value,
-		responseName:            responseName,
-		paths:                   paths,
-		fieldValueMetaInfo:      *fieldValueMetaInfo,
-		childrenFields:          children,
-		paramPlans:              paramPlans,
-		allowedRuntimeTypeNames: parentTypeScope.GetAllowedTypeNamesForField(),
-		runtimeTypeResolverFunc: parentTypeScope.GetDynamicTypeResolverFunction(),
-		compiledTypeName:        parentTypeScope.GetStaticTypeName(),
+		fieldId:                    fieldId,
+		parentFieldId:              parentFieldId,
+		fieldName:                  current.Name.Value,
+		responseName:               responseName,
+		paths:                      paths,
+		fieldValueMetaInfo:         *fieldValueMetaInfo,
+		fieldASTs:                  fieldASTsForPlan(*current, fieldEntries),
+		returnType:                 fieldDef.Type,
+		parentType:                 parentCompositeFromScope(parentTypeScope),
+		childrenFields:             children,
+		paramPlans:                 paramPlans,
+		allowedRuntimeTypeNames:    parentTypeScope.GetAllowedTypeNamesForField(),
+		runtimeTypeResolverFunc:    parentTypeScope.GetDynamicTypeResolverFunction(),
+		compiledTypeName:           parentTypeScope.GetStaticTypeName(),
+		directivePlans:             directives,
+		directiveParamPlans:        directiveDependencyParams,
+		conditionalDirectiveGroups: conditionalDirectiveGroups,
 	}, nil
 }
 
-func (builder *PlanBuilder) getFieldDefinition(parentType any, fieldName string) (*graphql.FieldDefinition, error) {
+func (builder *PlanBuilder) getFieldDefinition(parentType any, fieldName string) (*FieldDefinition, error) {
 	if parentType == nil {
 		return nil, errors.New("no type scope provided while building selection set")
 	}
 	switch t := parentType.(type) {
-	case *graphql.Object:
+	case *Object:
 		fieldDefinition := t.Fields()[fieldName]
 		if fieldDefinition == nil {
 			return nil, errors.New("no field definition found in Object for " + fieldName)
 		}
 		return fieldDefinition, nil
-	case *graphql.Interface:
+	case *Interface:
 		fieldDefinition := t.Fields()[fieldName]
 		if fieldDefinition == nil {
 			return nil, errors.New("no field definition found in Interface for " + fieldName)
 		}
 		return fieldDefinition, nil
-	case *graphql.Union:
+	case *Union:
 		return nil, fmt.Errorf("no type definition found in Union for %s", fieldName)
 	default:
 		return nil, fmt.Errorf("no type definition found for %s", fieldName)
@@ -621,24 +667,24 @@ func (builder *PlanBuilder) getFieldDefinition(parentType any, fieldName string)
 
 // 例子：[[scalar!]!]!返回scalar。获取一个字段的基础类型，返回值只能是Object/Scalar/Enum/Interface/Union这几个，封装类型NotNull/List不算
 // 返回值分别是:基础类型，是否为isList，是否为NotNull，错误
-func (builder *PlanBuilder) parseFieldValueMetaInfo(fd *graphql.FieldDefinition) (*FieldValueMetaInfo, error) {
+func (builder *PlanBuilder) parseFieldValueMetaInfo(fd *FieldDefinition) (*FieldValueMetaInfo, error) {
 	if fd == nil {
 		return nil, errors.New("no type definition provided while building selection set")
 	}
 	result := &FieldValueMetaInfo{}
-	var currentType graphql.Output
+	var currentType Output
 	currentType = fd.Type
 
 	currentValueMetaInfo := result
 
 	for {
 		switch t := currentType.(type) {
-		case *graphql.NonNull:
+		case *NonNull:
 			currentType = t.OfType
 
 			currentValueMetaInfo.NotNil = true
 			currentValueMetaInfo.OriginalType = t
-		case *graphql.List:
+		case *List:
 			currentType = t.OfType
 
 			currentValueMetaInfo.IsList = true
@@ -647,23 +693,23 @@ func (builder *PlanBuilder) parseFieldValueMetaInfo(fd *graphql.FieldDefinition)
 			elementType := &FieldValueMetaInfo{}
 			currentValueMetaInfo.ElementType = elementType
 			currentValueMetaInfo = elementType
-		case *graphql.Scalar:
+		case *Scalar:
 			currentValueMetaInfo.ValueType = FieldValueTypeScalar
 			currentValueMetaInfo.OriginalType = t
 			return result, nil
-		case *graphql.Object:
+		case *Object:
 			currentValueMetaInfo.ValueType = FieldValueTypeObject
 			currentValueMetaInfo.OriginalType = t
 			return result, nil
-		case *graphql.Enum:
+		case *Enum:
 			currentValueMetaInfo.ValueType = FieldValueTypeEnum
 			currentValueMetaInfo.OriginalType = t
 			return result, nil
-		case *graphql.Interface:
+		case *Interface:
 			currentValueMetaInfo.ValueType = FieldValueTypeObject
 			currentValueMetaInfo.OriginalType = t
 			return result, nil
-		case *graphql.Union:
+		case *Union:
 			currentValueMetaInfo.ValueType = FieldValueTypeObject
 			currentValueMetaInfo.OriginalType = t
 			return result, nil
@@ -674,14 +720,14 @@ func (builder *PlanBuilder) parseFieldValueMetaInfo(fd *graphql.FieldDefinition)
 }
 
 // 组装编译期就能确定类型的节点类型上下文
-func (builder *PlanBuilder) WrapStaticTypeScope(nodeType *graphql.Object) (*TypeRuntimeScope, error) {
+func (builder *PlanBuilder) WrapStaticTypeScope(nodeType *Object) (*TypeRuntimeScope, error) {
 	if nodeType == nil {
 		return nil, errors.New("no node provided")
 	}
 	//创建编译期判定类型的类型上下文
 	return &TypeRuntimeScope{
 		declaredType: nodeType,
-		allowedDynamicTypes: map[string]*graphql.Object{
+		allowedDynamicTypes: map[string]*Object{
 			nodeType.Name(): nodeType,
 		},
 		staticTypeName: nodeType.Name(),
@@ -691,9 +737,9 @@ func (builder *PlanBuilder) WrapStaticTypeScope(nodeType *graphql.Object) (*Type
 }
 
 // 组装运行时动态判定类型的节点类型上下文。uniontype和interface类型的节点都需要走这个方法
-func (builder *PlanBuilder) WrapDynamicTypeScope(nodeType graphql.Abstract) (*TypeRuntimeScope, error) {
+func (builder *PlanBuilder) WrapDynamicTypeScope(nodeType Abstract) (*TypeRuntimeScope, error) {
 	possibleTypes := builder.schema.PossibleTypes(nodeType)
-	result := make(map[string]*graphql.Object, len(possibleTypes))
+	result := make(map[string]*Object, len(possibleTypes))
 	for _, possibleType := range possibleTypes {
 		result[possibleType.Name()] = possibleType
 	}
@@ -705,22 +751,22 @@ func (builder *PlanBuilder) WrapDynamicTypeScope(nodeType graphql.Abstract) (*Ty
 	}, nil
 }
 
-func (builder *PlanBuilder) NewDynamicTypeResolverFunction(abs graphql.Abstract) DynamicTypeResolverFunction {
+func (builder *PlanBuilder) NewDynamicTypeResolverFunction(abs Abstract) DynamicTypeResolverFunction {
 	return func(value any, ctx *context.Context) string {
 		if value == nil {
 			return ""
 		}
 
 		switch t := abs.(type) {
-		case *graphql.Interface:
+		case *Interface:
 			if t.ResolveType != nil {
-				if obj := t.ResolveType(graphql.ResolveTypeParams{Value: value, Context: *ctx}); obj != nil {
+				if obj := t.ResolveType(ResolveTypeParams{Value: value, Context: *ctx}); obj != nil {
 					return obj.Name()
 				}
 			}
-		case *graphql.Union:
+		case *Union:
 			if t.ResolveType != nil {
-				if obj := t.ResolveType(graphql.ResolveTypeParams{Value: value, Context: *ctx}); obj != nil {
+				if obj := t.ResolveType(ResolveTypeParams{Value: value, Context: *ctx}); obj != nil {
 					return obj.Name()
 				}
 			}
@@ -730,7 +776,7 @@ func (builder *PlanBuilder) NewDynamicTypeResolverFunction(abs graphql.Abstract)
 			if possible.IsTypeOf == nil {
 				continue
 			}
-			if possible.IsTypeOf(graphql.IsTypeOfParams{Value: value, Context: *ctx}) {
+			if possible.IsTypeOf(IsTypeOfParams{Value: value, Context: *ctx}) {
 				return possible.Name()
 			}
 		}
@@ -749,13 +795,13 @@ func (builder *PlanBuilder) CropTypeRuntimeScope(parentScope *TypeRuntimeScope, 
 		return nil, fmt.Errorf("no type condition found for %s", typeCondition.Name.Value)
 	}
 	//TODO 如果是抽象类Type检索可能的所有实现类Type，否则直接使用Type
-	var possibleTypeMap map[string]*graphql.Object
+	var possibleTypeMap map[string]*Object
 	switch tt := t.(type) {
-	case *graphql.Object:
-		possibleTypeMap = map[string]*graphql.Object{t.Name(): tt}
-	case graphql.Abstract:
+	case *Object:
+		possibleTypeMap = map[string]*Object{t.Name(): tt}
+	case Abstract:
 		objects := builder.schema.PossibleTypes(tt)
-		possibleTypeMap = map[string]*graphql.Object{}
+		possibleTypeMap = map[string]*Object{}
 		for _, obj := range objects {
 			possibleTypeMap[obj.Name()] = obj
 		}
@@ -764,7 +810,7 @@ func (builder *PlanBuilder) CropTypeRuntimeScope(parentScope *TypeRuntimeScope, 
 	}
 
 	//TODO 将scope里allowedRuntimeType和检索的实现类Type做一个交集，解决内敛嵌套问题
-	croppedTypeMap := make(map[string]*graphql.Object)
+	croppedTypeMap := make(map[string]*Object)
 	for name, obj := range parentScope.allowedDynamicTypes {
 		if _, ok := possibleTypeMap[name]; ok {
 			croppedTypeMap[name] = obj
@@ -787,7 +833,7 @@ func (builder *PlanBuilder) generateFieldId() uint32 {
 	return uint32(fid)
 }
 
-func (builder *PlanBuilder) wrapResolverFunc(fieldResolveFn graphql.FieldResolveFn) ResolverFunc {
+func (builder *PlanBuilder) wrapResolverFunc(fieldResolveFn FieldResolveFn) ResolverFunc {
 	if fieldResolveFn == nil {
 		return nil
 	}
@@ -797,11 +843,18 @@ func (builder *PlanBuilder) wrapResolverFunc(fieldResolveFn graphql.FieldResolve
 	return func(source any, params map[string]any, ctx context.Context) (any, error) {
 		actualSource := source
 		if wrappedSource, ok := source.(firstResponseGetter); ok {
+			// 兼容内部 FieldResponse 包装值；GraphSoul 的业务 resolver source 仍由调用点决定。
 			actualSource = wrappedSource.GetFirstResponse()
 		}
-		return fieldResolveFn(graphql.ResolveParams{
+		info := ResolveInfo{}
+		if currentInfo := resolveInfoFromContext(ctx); currentInfo != nil {
+			// GraphSoul ResolverFunc 签名没有 ResolveInfo，执行前通过 ctx 注入，再还原成 graphql-go 的 ResolveParams。
+			info = *currentInfo
+		}
+		return fieldResolveFn(ResolveParams{
 			Source:  actualSource,
 			Args:    params,
+			Info:    info,
 			Context: ctx,
 		})
 	}
@@ -823,32 +876,32 @@ func (builder *PlanBuilder) checkAndParseParentKeyFieldNames(parentFieldIsList b
 		if te != nil || t == nil {
 			return ""
 		}
-		if scalarType, ok := t.(*graphql.Scalar); ok && scalarType == graphql.ID {
+		if scalarType, ok := t.(*Scalar); ok && scalarType == ID {
 			return ParentKeyFieldNameAsID
 		}
 	}
 	//如果不存在id字段，则遍历全部字段寻找ID类型的字段
 	switch t := parentTypeScope.declaredType.(type) {
-	case *graphql.Object:
+	case *Object:
 		if len(t.Fields()) > 0 {
 			for _, field := range t.Fields() {
 				fieldValueType, fieldValueTypeErr := builder.parseBaseType(field.Type)
 				if fieldValueTypeErr != nil || fieldValueType == nil {
 					continue
 				}
-				if scalarType, ok := fieldValueType.(*graphql.Scalar); ok && scalarType == graphql.ID {
+				if scalarType, ok := fieldValueType.(*Scalar); ok && scalarType == ID {
 					return field.Name
 				}
 			}
 		}
-	case *graphql.Interface:
+	case *Interface:
 		if len(t.Fields()) > 0 {
 			for _, field := range t.Fields() {
 				fieldValueType, fieldValueTypeErr := builder.parseBaseType(field.Type)
 				if fieldValueTypeErr != nil || fieldValueType == nil {
 					continue
 				}
-				if scalarType, ok := fieldValueType.(*graphql.Scalar); ok && scalarType == graphql.ID {
+				if scalarType, ok := fieldValueType.(*Scalar); ok && scalarType == ID {
 					return field.Name
 				}
 			}
@@ -860,12 +913,12 @@ func (builder *PlanBuilder) checkAndParseParentKeyFieldNames(parentFieldIsList b
 	return ""
 }
 
-func (builder *PlanBuilder) parseBaseType(t graphql.Type) (graphql.Type, error) {
+func (builder *PlanBuilder) parseBaseType(t Type) (Type, error) {
 	for {
 		switch tt := t.(type) {
-		case *graphql.List:
+		case *List:
 			t = tt.OfType
-		case *graphql.NonNull:
+		case *NonNull:
 			t = tt.OfType
 		default:
 			return tt, nil
@@ -873,8 +926,8 @@ func (builder *PlanBuilder) parseBaseType(t graphql.Type) (graphql.Type, error) 
 	}
 }
 
-func (builder *PlanBuilder) parseParamPlansByArgDefs(argDefs []*graphql.Argument, argASTs []*ast.Argument) ([]*ParamPlan, error) {
-	defMap := map[string]*graphql.Argument{}
+func (builder *PlanBuilder) parseParamPlansByArgDefs(argDefs []*Argument, argASTs []*ast.Argument) ([]*ParamPlan, error) {
+	defMap := map[string]*Argument{}
 	for _, argDef := range argDefs {
 		defMap[argDef.PrivateName] = argDef
 	}
@@ -898,22 +951,42 @@ func (builder *PlanBuilder) parseParamPlansByArgDefs(argDefs []*graphql.Argument
 	for _, argDef := range argDefs {
 		argAST, provided := astMap[argDef.PrivateName]
 
-		var value any
-		var valueErr error
-		if provided {
-			value, valueErr = ValueFromAST(argAST.Value, argDef.Type, builder.originalInputs)
-			if valueErr != nil {
-				return nil, valueErr
+		//未提供：默认值烤常量；必填缺失报错；可选跳过（保持原行为）
+		if !provided {
+			if argDef.DefaultValue != nil {
+				parsedDefault, parsedDefaultErr := builder.parseInputValue(argDef.Type, argDef.DefaultValue)
+				if parsedDefaultErr != nil {
+					return nil, parsedDefaultErr
+				}
+				result = append(result, NewConstParamPlan(argDef.PrivateName, parsedDefault))
+				continue
 			}
-		} else if argDef.DefaultValue != nil {
-			value = argDef.DefaultValue
-		} else {
 			if IsNonNullInput(argDef.Type) {
 				return nil, fmt.Errorf("required argument %s is missing", argDef.Name())
 			}
 			continue
 		}
 
+		//1) 裸变量 $var → 运行期取（值已在 parseOperationVariables 协变），不烤、缓存安全
+		if variable, ok := argAST.Value.(*ast.Variable); ok {
+			if variable.Name == nil {
+				return nil, fmt.Errorf("invalid variable name")
+			}
+			result = append(result, NewInputParamPlan(argDef.PrivateName, variable.Name.Value))
+			continue
+		}
+
+		//2) 含嵌套变量的复合字面量 → 模板，运行期物化、缓存安全
+		if astContainsVariable(argAST.Value) {
+			result = append(result, NewVariableTemplateParamPlan(argDef.PrivateName, argAST.Value, argDef.Type))
+			continue
+		}
+
+		//3) 纯字面量 → 编译期烤常量（原行为不变）
+		value, valueErr := ValueFromAST(argAST.Value, argDef.Type, builder.originalInputs)
+		if valueErr != nil {
+			return nil, valueErr
+		}
 		parsedValue, parsedValueErr := builder.parseInputValue(argDef.Type, value)
 		if parsedValueErr != nil {
 			return nil, parsedValueErr
@@ -921,6 +994,47 @@ func (builder *PlanBuilder) parseParamPlansByArgDefs(argDefs []*graphql.Argument
 		result = append(result, NewConstParamPlan(argDef.PrivateName, parsedValue))
 	}
 	return result, nil
+}
+
+// astContainsVariable 递归判断实参 AST 内是否出现变量引用。
+func astContainsVariable(v ast.Value) bool {
+	switch node := v.(type) {
+	case *ast.Variable:
+		return true
+	case *ast.ListValue:
+		for _, item := range node.Values {
+			if astContainsVariable(item) {
+				return true
+			}
+		}
+	case *ast.ObjectValue:
+		for _, f := range node.Fields {
+			if f != nil && astContainsVariable(f.Value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type inputsContextKeyType struct{}
+
+var inputsContextKey = inputsContextKeyType{}
+
+// ContextWithInputs 把本请求（已协变）变量放进 ctx，供内省 resolver 运行期读取。
+func ContextWithInputs(ctx context.Context, inputs map[string]any) context.Context {
+	return context.WithValue(ctx, inputsContextKey, inputs)
+}
+
+// InputsFromContext 取出本请求变量；不存在返回 nil（按未提供处理）。
+func InputsFromContext(ctx context.Context) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	if v, ok := ctx.Value(inputsContextKey).(map[string]any); ok {
+		return v
+	}
+	return nil
 }
 
 func (builder *PlanBuilder) parseParamPlans(args []*ast.Argument) ([]*ParamPlan, error) {
@@ -998,7 +1112,7 @@ const IntrospectionFieldNameTypename string = "__typename"
 const IntrospectionFieldNameMetaType string = "__type"
 const IntrospectionFieldNameMetaSchema string = "__schema"
 
-func (builder *PlanBuilder) parseIntrospectionTypenameField(current ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directivePlans []*DirectivePlan, directiveDependencyParams []*ParamPlan) ([]*FieldPlan, error) {
+func (builder *PlanBuilder) parseIntrospectionTypenameField(current ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directivePlans []*DirectivePlan, directiveDependencyParams []*ParamPlan, conditionalDirectiveGroups [][]*DirectivePlan) ([]*FieldPlan, error) {
 	var fieldId uint32
 	responseName := IntrospectionFieldNameTypename
 	if current.Alias != nil && current.Alias.Value != "" {
@@ -1013,7 +1127,7 @@ func (builder *PlanBuilder) parseIntrospectionTypenameField(current ast.Field, p
 		IsList:       false,
 		NotNil:       true,
 		ValueType:    FieldValueTypeScalar,
-		OriginalType: graphql.String,
+		OriginalType: String,
 		ElementType:  nil,
 	}
 	//childrenFields
@@ -1042,31 +1156,39 @@ func (builder *PlanBuilder) parseIntrospectionTypenameField(current ast.Field, p
 	}
 	//parentKeyFieldName
 	parentKeyFieldName := builder.checkAndParseParentKeyFieldNames(parentFieldIsList, parentTypeScope)
+	returnType := Output(String)
+	if TypeNameMetaFieldDef != nil && TypeNameMetaFieldDef.Type != nil {
+		returnType = TypeNameMetaFieldDef.Type
+	}
 
 	fieldPlan := &FieldPlan{
-		fieldId:                 fieldId,
-		parentFieldId:           parentFieldId,
-		fieldName:               IntrospectionFieldNameTypename,
-		responseName:            responseName,
-		paths:                   paths,
-		fieldValueMetaInfo:      fieldValueMetaInfo,
-		resultParentKeyName:     "",
-		parentKeyFieldName:      parentKeyFieldName,
-		childrenFields:          childrenFields,
-		paramPlans:              paramPlans,
-		resolverFunc:            TypeNameResolverFunc,
-		arrParamPlans:           nil,
-		arrayResolverFunc:       nil,
-		allowedRuntimeTypeNames: parentTypeScope.GetAllowedTypeNamesForField(),
-		runtimeTypeResolverFunc: parentTypeScope.GetDynamicTypeResolverFunction(),
-		compiledTypeName:        parentTypeScope.GetStaticTypeName(),
-		directivePlans:          directivePlans,
-		directiveParamPlans:     directiveDependencyParams,
+		fieldId:                    fieldId,
+		parentFieldId:              parentFieldId,
+		fieldName:                  IntrospectionFieldNameTypename,
+		responseName:               responseName,
+		paths:                      paths,
+		fieldValueMetaInfo:         fieldValueMetaInfo,
+		fieldASTs:                  fieldASTsForPlan(current, nil),
+		returnType:                 returnType,
+		parentType:                 parentCompositeFromScope(parentTypeScope),
+		resultParentKeyName:        "",
+		parentKeyFieldName:         parentKeyFieldName,
+		childrenFields:             childrenFields,
+		paramPlans:                 paramPlans,
+		resolverFunc:               TypeNameResolverFunc,
+		arrParamPlans:              nil,
+		arrayResolverFunc:          nil,
+		allowedRuntimeTypeNames:    parentTypeScope.GetAllowedTypeNamesForField(),
+		runtimeTypeResolverFunc:    parentTypeScope.GetDynamicTypeResolverFunction(),
+		compiledTypeName:           parentTypeScope.GetStaticTypeName(),
+		directivePlans:             directivePlans,
+		directiveParamPlans:        directiveDependencyParams,
+		conditionalDirectiveGroups: conditionalDirectiveGroups,
 	}
 	return []*FieldPlan{fieldPlan}, nil
 }
 
-func (builder *PlanBuilder) parseIntrospectionMetaTypeField(current ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directivePlans []*DirectivePlan, directiveDependencyPlans []*ParamPlan) ([]*FieldPlan, error) {
+func (builder *PlanBuilder) parseIntrospectionMetaTypeField(current ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directivePlans []*DirectivePlan, directiveDependencyPlans []*ParamPlan, conditionalDirectiveGroups [][]*DirectivePlan, fieldEntries []FieldEntry) ([]*FieldPlan, error) {
 	//检查参数
 	if parentFieldId != 0 || parentTypeScope == nil || parentTypeScope.declaredType != builder.schema.QueryType() {
 		return nil, fmt.Errorf("invalid __type field")
@@ -1080,9 +1202,9 @@ func (builder *PlanBuilder) parseIntrospectionMetaTypeField(current ast.Field, p
 	fieldId := builder.generateFieldId()
 	//path
 	paths := append(parentPaths, responseName)
-	fieldDef, fdErr := builder.getFieldDefinition(parentTypeScope.declaredType, current.Name.Value)
-	if fdErr != nil {
-		return nil, fdErr
+	fieldDef := TypeMetaFieldDef
+	if fieldDef == nil {
+		return nil, fmt.Errorf("__type meta field definition is nil")
 	}
 	//fieldValueMetaInfo
 	fieldValueMetaInfo, fieldValueMetaInfoErr := builder.parseFieldValueMetaInfo(fieldDef)
@@ -1092,13 +1214,29 @@ func (builder *PlanBuilder) parseIntrospectionMetaTypeField(current ast.Field, p
 	if fieldValueMetaInfo == nil {
 		return nil, fmt.Errorf("parse field value meta info error")
 	}
+	// __type 是根内省字段，不存在于用户 Query Object 中；
+	// 参数定义必须来自 TypeMetaFieldDef，保证 name: String! 能进入运行期 params。
+	paramPlans, paramPlansErr := builder.parseParamPlansByArgDefs(fieldDef.Args, current.Arguments)
+	if paramPlansErr != nil {
+		return nil, paramPlansErr
+	}
 	//typeRuntimeScope
-	currentTypeRuntimeScope, currentTypeRuntimeScopeErr := builder.WrapStaticTypeScope(graphql.TypeType)
+	currentTypeRuntimeScope, currentTypeRuntimeScopeErr := builder.WrapStaticTypeScope(TypeType)
 	if currentTypeRuntimeScopeErr != nil {
 		return nil, currentTypeRuntimeScopeErr
 	}
 	//childrenFields
-	childrenFields, childrenFieldsErr := builder.buildIntrospectionSelectionSet(current.GetSelectionSet(), currentTypeRuntimeScope, fieldId, fieldValueMetaInfo.IsList, paths, directivePlans, directiveDependencyPlans)
+	var childrenFields []*FieldPlan
+	var childrenFieldsErr error
+	if len(fieldEntries) > 0 {
+		var childEntries []FieldEntry
+		childEntries, childrenFieldsErr = builder.flattenChildEntriesForField(fieldEntries, currentTypeRuntimeScope)
+		if childrenFieldsErr == nil {
+			childrenFields, childrenFieldsErr = builder.buildFieldPlansFromEntries(childEntries, fieldId, fieldValueMetaInfo.IsList, paths, true)
+		}
+	} else {
+		childrenFields, childrenFieldsErr = builder.buildIntrospectionSelectionSet(current.GetSelectionSet(), currentTypeRuntimeScope, fieldId, fieldValueMetaInfo.IsList, paths, directivePlans, directiveDependencyPlans)
+	}
 	if childrenFieldsErr != nil {
 		return nil, childrenFieldsErr
 	}
@@ -1112,29 +1250,34 @@ func (builder *PlanBuilder) parseIntrospectionMetaTypeField(current ast.Field, p
 		if t == nil {
 			return nil, nil
 		}
-		return GenerateTypeMetaResult(builder.schema, t, childrenFields, builder.originalInputs), nil
+		return GenerateTypeMetaResult(builder.schema, t, childrenFields, InputsFromContext(ctx)), nil
 	}
 	fieldPlan := &FieldPlan{
-		fieldId:                 fieldId,
-		parentFieldId:           0,
-		fieldName:               IntrospectionFieldNameMetaType,
-		responseName:            responseName,
-		paths:                   paths,
-		fieldValueMetaInfo:      *fieldValueMetaInfo,
-		childrenFields:          childrenFields,
-		resolverFunc:            resolverFunc,
-		allowedRuntimeTypeNames: parentTypeScope.GetAllowedTypeNamesForField(),
-		runtimeTypeResolverFunc: parentTypeScope.GetDynamicTypeResolverFunction(),
-		compiledTypeName:        parentTypeScope.GetStaticTypeName(),
-		directivePlans:          directivePlans,
-		directiveParamPlans:     directiveDependencyPlans,
+		fieldId:                    fieldId,
+		parentFieldId:              0,
+		fieldName:                  IntrospectionFieldNameMetaType,
+		responseName:               responseName,
+		paths:                      paths,
+		fieldValueMetaInfo:         *fieldValueMetaInfo,
+		fieldASTs:                  fieldASTsForPlan(current, fieldEntries),
+		returnType:                 fieldDef.Type,
+		parentType:                 parentCompositeFromScope(parentTypeScope),
+		childrenFields:             childrenFields,
+		paramPlans:                 paramPlans,
+		resolverFunc:               resolverFunc,
+		allowedRuntimeTypeNames:    parentTypeScope.GetAllowedTypeNamesForField(),
+		runtimeTypeResolverFunc:    parentTypeScope.GetDynamicTypeResolverFunction(),
+		compiledTypeName:           parentTypeScope.GetStaticTypeName(),
+		directivePlans:             directivePlans,
+		directiveParamPlans:        directiveDependencyPlans,
+		conditionalDirectiveGroups: conditionalDirectiveGroups,
 	}
 	return []*FieldPlan{
 		fieldPlan,
 	}, nil
 }
 
-func (builder *PlanBuilder) parseIntrospectionMetaSchemaField(current ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directives []*DirectivePlan, directiveDependencyParams []*ParamPlan) ([]*FieldPlan, error) {
+func (builder *PlanBuilder) parseIntrospectionMetaSchemaField(current ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directives []*DirectivePlan, directiveDependencyParams []*ParamPlan, conditionalDirectiveGroups [][]*DirectivePlan, fieldEntries []FieldEntry) ([]*FieldPlan, error) {
 	//检查入参
 	if parentFieldId != 0 || parentTypeScope == nil || parentTypeScope.declaredType != builder.schema.QueryType() {
 		return nil, fmt.Errorf("invalid schema field")
@@ -1147,9 +1290,9 @@ func (builder *PlanBuilder) parseIntrospectionMetaSchemaField(current ast.Field,
 	fieldId := builder.generateFieldId()
 	//paths
 	paths := append(parentPaths, responseName)
-	fieldDefinition, fdErr := builder.getFieldDefinition(parentTypeScope.declaredType, current.Name.Value)
-	if fdErr != nil {
-		return nil, fdErr
+	fieldDefinition := SchemaMetaFieldDef
+	if fieldDefinition == nil {
+		return nil, fmt.Errorf("__schema meta field definition is nil")
 	}
 	//fieldValueMetaInfo
 	fieldValueMetaInfo, fieldValueMetaInfoErr := builder.parseFieldValueMetaInfo(fieldDefinition)
@@ -1159,40 +1302,61 @@ func (builder *PlanBuilder) parseIntrospectionMetaSchemaField(current ast.Field,
 	if fieldValueMetaInfo == nil {
 		return nil, fmt.Errorf("parse field value meta info error")
 	}
+	// __schema 是根内省字段，不存在于用户 Query Object 中；
+	// 仍按 SchemaMetaFieldDef 解析参数，用来拒绝非法实参并保持构建逻辑一致。
+	paramPlans, paramPlansErr := builder.parseParamPlansByArgDefs(fieldDefinition.Args, current.Arguments)
+	if paramPlansErr != nil {
+		return nil, paramPlansErr
+	}
 	//typeRuntimeScope
-	currentTypeRuntimeScope, currentTypeRuntimeScopeErr := builder.WrapStaticTypeScope(graphql.SchemaType)
+	currentTypeRuntimeScope, currentTypeRuntimeScopeErr := builder.WrapStaticTypeScope(SchemaType)
 	if currentTypeRuntimeScopeErr != nil {
 		return nil, currentTypeRuntimeScopeErr
 	}
 	//childrenFields
-	childrenFields, childrenFieldsErr := builder.buildIntrospectionSelectionSet(current.GetSelectionSet(), currentTypeRuntimeScope, fieldId, fieldValueMetaInfo.IsList, paths, directives, directiveDependencyParams)
+	var childrenFields []*FieldPlan
+	var childrenFieldsErr error
+	if len(fieldEntries) > 0 {
+		var childEntries []FieldEntry
+		childEntries, childrenFieldsErr = builder.flattenChildEntriesForField(fieldEntries, currentTypeRuntimeScope)
+		if childrenFieldsErr == nil {
+			childrenFields, childrenFieldsErr = builder.buildFieldPlansFromEntries(childEntries, fieldId, fieldValueMetaInfo.IsList, paths, true)
+		}
+	} else {
+		childrenFields, childrenFieldsErr = builder.buildIntrospectionSelectionSet(current.GetSelectionSet(), currentTypeRuntimeScope, fieldId, fieldValueMetaInfo.IsList, paths, directives, directiveDependencyParams)
+	}
 	if childrenFieldsErr != nil {
 		return nil, childrenFieldsErr
 	}
 	//resolverFunc
 	resolverFunc := func(source any, params map[string]any, ctx context.Context) (any, error) {
-		return GenerateSchemaMetaResult(builder.schema, childrenFields, builder.originalInputs), nil
+		return GenerateSchemaMetaResult(builder.schema, childrenFields, InputsFromContext(ctx)), nil
 	}
 
 	fieldPlan := &FieldPlan{
-		fieldId:                 fieldId,
-		parentFieldId:           0,
-		fieldName:               IntrospectionFieldNameMetaSchema,
-		responseName:            responseName,
-		paths:                   paths,
-		fieldValueMetaInfo:      *fieldValueMetaInfo,
-		childrenFields:          childrenFields,
-		resolverFunc:            resolverFunc,
-		allowedRuntimeTypeNames: parentTypeScope.GetAllowedTypeNamesForField(),
-		runtimeTypeResolverFunc: parentTypeScope.GetDynamicTypeResolverFunction(),
-		compiledTypeName:        parentTypeScope.GetStaticTypeName(),
-		directivePlans:          directives,
-		directiveParamPlans:     directiveDependencyParams,
+		fieldId:                    fieldId,
+		parentFieldId:              0,
+		fieldName:                  IntrospectionFieldNameMetaSchema,
+		responseName:               responseName,
+		paths:                      paths,
+		fieldValueMetaInfo:         *fieldValueMetaInfo,
+		fieldASTs:                  fieldASTsForPlan(current, fieldEntries),
+		returnType:                 fieldDefinition.Type,
+		parentType:                 parentCompositeFromScope(parentTypeScope),
+		childrenFields:             childrenFields,
+		paramPlans:                 paramPlans,
+		resolverFunc:               resolverFunc,
+		allowedRuntimeTypeNames:    parentTypeScope.GetAllowedTypeNamesForField(),
+		runtimeTypeResolverFunc:    parentTypeScope.GetDynamicTypeResolverFunction(),
+		compiledTypeName:           parentTypeScope.GetStaticTypeName(),
+		directivePlans:             directives,
+		directiveParamPlans:        directiveDependencyParams,
+		conditionalDirectiveGroups: conditionalDirectiveGroups,
 	}
 	return []*FieldPlan{fieldPlan}, nil
 }
 
-func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directivePlans []*DirectivePlan, directiveDependencyParams []*ParamPlan) ([]*FieldPlan, error) {
+func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeRuntimeScope, parentFieldId uint32, parentFieldIsList bool, parentPaths []string, directivePlans []*DirectivePlan, directiveDependencyParams []*ParamPlan, conditionalDirectiveGroups [][]*DirectivePlan, fieldEntries []FieldEntry) ([]*FieldPlan, error) {
 	var fieldId uint32
 	var responseName string
 	var paths []string
@@ -1220,11 +1384,11 @@ func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeR
 	}
 	//paths
 	paths = append(parentPaths, responseName)
-	//parentKeyFieldNames
+	// parentKeyFieldName 只用于父 list 下 resolver 结果回填；无 resolver 字段直接从父 item 取值。
 	parentKeyFieldName = builder.checkAndParseParentKeyFieldNames(parentFieldIsList, parentTypeScope)
-	//父节点是List，当前节点的parentKeyFieldName不能为空
-	if parentFieldIsList && parentKeyFieldName == "" {
-		return nil, fmt.Errorf("parent key field names for result binding is empty")
+	fieldHasResolver := fieldDefinition.Resolve != nil || fieldDefinition.BatchResolve != nil
+	if parentFieldIsList && fieldHasResolver && parentKeyFieldName == "" {
+		return nil, fmt.Errorf("parent key field name for resolver result binding is empty")
 	}
 
 	//paramPlans
@@ -1251,9 +1415,9 @@ func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeR
 	var typeRuntimeScopeErr error
 	originalType := fieldValueMetaInfo.GetBaseElementOriginalType()
 	switch fieldType := originalType.(type) {
-	case *graphql.Object:
+	case *Object:
 		fieldTypeRuntimeScope, typeRuntimeScopeErr = builder.WrapStaticTypeScope(fieldType)
-	case graphql.Abstract:
+	case Abstract:
 		fieldTypeRuntimeScope, typeRuntimeScopeErr = builder.WrapDynamicTypeScope(fieldType)
 	default:
 		fieldTypeRuntimeScope = &TypeRuntimeScope{}
@@ -1261,76 +1425,67 @@ func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeR
 	if typeRuntimeScopeErr != nil {
 		return nil, typeRuntimeScopeErr
 	}
-	needParentFieldFullResult := false
-	//如果是抽象类型字段，需要动态类型判定，默认添加对父节点全部数据的依赖
-	if fieldTypeRuntimeScope.dynamicTypeResolver != nil {
-		needParentFieldFullResult = true
-	}
-	//当父字段是List，默认当前参数列表中增加对父节点结果默认当前参数列表中增加对父节点结果的依赖的依赖
-	if !needParentFieldFullResult && parentFieldIsList {
-		needParentFieldFullResult = true
-	}
+	usesNormalResolver := fieldDefinition.Resolve != nil && (!parentFieldIsList || fieldDefinition.BatchResolve == nil)
+	needParentFieldFullResult := parentFieldId > 0 &&
+		usesNormalResolver &&
+		(parentFieldIsList || (parentTypeScope != nil && parentTypeScope.GetDynamicTypeResolverFunction() != nil))
 	if needParentFieldFullResult {
-		if len(paramPlans) > 0 {
-			hasFullResultParam := false
-			for _, paramPlan := range paramPlans {
-				if paramPlan.paramType == ParamTypeFieldFullResult {
-					hasFullResultParam = true
-					break
-				}
-			}
-			if !hasFullResultParam {
-				fullResultParam := &ParamPlan{
-					paramType:        ParamTypeFieldFullResult,
-					dependentFieldId: parentFieldId,
-				}
-				paramPlans = append(paramPlans, fullResultParam)
+		hasFullResultParam := false
+		for _, paramPlan := range paramPlans {
+			if paramPlan != nil &&
+				paramPlan.paramType == ParamTypeFieldFullResult &&
+				paramPlan.dependentFieldId == parentFieldId {
+				hasFullResultParam = true
+				break
 			}
 		}
-		if len(arrayParamPlans) > 0 {
-			hasFullResultParam := false
-			for _, arrParamPlan := range arrayParamPlans {
-				if arrParamPlan.paramType == ParamTypeFieldFullResult {
-					hasFullResultParam = true
-					break
-				}
-			}
-			if !hasFullResultParam {
-				fullResultParam := &ParamPlan{
-					paramType:        ParamTypeFieldFullResult,
-					dependentFieldId: parentFieldId,
-				}
-				arrayParamPlans = append(arrayParamPlans, fullResultParam)
-			}
+		if !hasFullResultParam {
+			// 普通 resolver 在 list 父节点下要遍历父结果；在 interface/union 父节点下要用父结果判断运行时类型。
+			// 这里把真实父结果消费显式建模为参数依赖，batch 调度不再通过父子层级兜底。
+			paramPlans = append(paramPlans, builder.newFieldFullResultParamPlan(parentFieldId))
 		}
 	}
 	//fieldId
 	fieldId = builder.generateFieldId()
 	//childrenFields
-	childrenFields, childrenFieldErr := builder.buildSelectionSetWithFlattenEntries(current.GetSelectionSet(), fieldTypeRuntimeScope, fieldId, fieldValueMetaInfo.IsList, paths, directivePlans, false)
+	var childrenFields []*FieldPlan
+	var childrenFieldErr error
+	if len(fieldEntries) > 0 {
+		var childEntries []FieldEntry
+		childEntries, childrenFieldErr = builder.flattenChildEntriesForField(fieldEntries, fieldTypeRuntimeScope)
+		if childrenFieldErr == nil {
+			childrenFields, childrenFieldErr = builder.buildFieldPlansFromEntries(childEntries, fieldId, fieldValueMetaInfo.IsList, paths, false)
+		}
+	} else {
+		childrenFields, childrenFieldErr = builder.buildSelectionSetWithFlattenEntries(current.GetSelectionSet(), fieldTypeRuntimeScope, fieldId, fieldValueMetaInfo.IsList, paths, directivePlans, false)
+	}
 	if childrenFieldErr != nil {
 		return nil, childrenFieldErr
 	}
 
 	fieldPlan := &FieldPlan{
-		fieldId:                 fieldId,
-		fieldName:               current.Name.Value,
-		responseName:            responseName,
-		paths:                   paths,
-		fieldValueMetaInfo:      *fieldValueMetaInfo,
-		parentFieldId:           parentFieldId,
-		resultParentKeyName:     resultParentKeyName,
-		parentKeyFieldName:      parentKeyFieldName,
-		childrenFields:          childrenFields,
-		paramPlans:              paramPlans,
-		resolverFunc:            builder.wrapResolverFunc(fieldDefinition.Resolve),
-		arrParamPlans:           arrayParamPlans,
-		arrayResolverFunc:       builder.wrapResolverFunc(fieldDefinition.BatchResolve),
-		allowedRuntimeTypeNames: parentTypeScope.GetAllowedTypeNamesForField(),
-		runtimeTypeResolverFunc: parentTypeScope.GetDynamicTypeResolverFunction(),
-		compiledTypeName:        parentTypeScope.GetStaticTypeName(),
-		directivePlans:          directivePlans,
-		directiveParamPlans:     directiveDependencyParams,
+		fieldId:                    fieldId,
+		fieldName:                  current.Name.Value,
+		responseName:               responseName,
+		paths:                      paths,
+		fieldValueMetaInfo:         *fieldValueMetaInfo,
+		fieldASTs:                  fieldASTsForPlan(current, fieldEntries),
+		returnType:                 fieldDefinition.Type,
+		parentType:                 parentCompositeFromScope(parentTypeScope),
+		parentFieldId:              parentFieldId,
+		resultParentKeyName:        resultParentKeyName,
+		parentKeyFieldName:         parentKeyFieldName,
+		childrenFields:             childrenFields,
+		paramPlans:                 paramPlans,
+		resolverFunc:               builder.wrapResolverFunc(fieldDefinition.Resolve),
+		arrParamPlans:              arrayParamPlans,
+		arrayResolverFunc:          builder.wrapResolverFunc(fieldDefinition.BatchResolve),
+		allowedRuntimeTypeNames:    parentTypeScope.GetAllowedTypeNamesForField(),
+		runtimeTypeResolverFunc:    parentTypeScope.GetDynamicTypeResolverFunction(),
+		compiledTypeName:           parentTypeScope.GetStaticTypeName(),
+		directivePlans:             directivePlans,
+		directiveParamPlans:        directiveDependencyParams,
+		conditionalDirectiveGroups: conditionalDirectiveGroups,
 	}
 
 	return []*FieldPlan{fieldPlan}, nil
@@ -1368,16 +1523,16 @@ func (builder *PlanBuilder) newFieldFullResultParamPlan(dependentFieldId uint32)
 	}
 }
 
-func (builder *PlanBuilder) WrapFieldType2Scope(fieldType graphql.Type) (*TypeRuntimeScope, error) {
+func (builder *PlanBuilder) WrapFieldType2Scope(fieldType Type) (*TypeRuntimeScope, error) {
 	if fieldType == nil {
 		return &TypeRuntimeScope{}, nil
 	}
 	switch typedField := fieldType.(type) {
-	case *graphql.Object:
+	case *Object:
 		return builder.WrapStaticTypeScope(typedField)
-	case *graphql.Interface:
+	case *Interface:
 		return builder.WrapDynamicTypeScope(typedField)
-	case *graphql.Union:
+	case *Union:
 		return builder.WrapDynamicTypeScope(typedField)
 	default:
 		return &TypeRuntimeScope{}, nil
@@ -1394,7 +1549,65 @@ func GetAstResponseName(field *ast.Field) string {
 	return ""
 }
 
-func (builder *PlanBuilder) parseOperationVariables(schema *graphql.Schema, defs []*ast.VariableDefinition, originalInputs map[string]any) (map[string]any, error) {
+func fieldASTsForPlan(current ast.Field, fieldEntries []FieldEntry) []*ast.Field {
+	if len(fieldEntries) == 0 {
+		return []*ast.Field{&current}
+	}
+	// 同一 responseName 可能由多个 occurrence 合并，ResolveInfo.FieldASTs 必须保留全部 occurrence。
+	result := make([]*ast.Field, 0, len(fieldEntries))
+	for i := range fieldEntries {
+		result = append(result, &fieldEntries[i].field)
+	}
+	return result
+}
+
+func parentCompositeFromScope(scope *TypeRuntimeScope) Composite {
+	if scope == nil {
+		return nil
+	}
+	parentType, _ := scope.declaredType.(Composite)
+	return parentType
+}
+
+func CoerceOperationVariables(document *ast.Document, schema *Schema, args map[string]any, operationName *string) (map[string]any, error) {
+	if document == nil {
+		return nil, errors.New("no document provided")
+	}
+	if schema == nil {
+		return nil, errors.New("no schema provided")
+	}
+	if args == nil {
+		args = map[string]any{}
+	}
+
+	var operationDefinition *ast.OperationDefinition
+	for _, def := range document.Definitions {
+		op, ok := def.(*ast.OperationDefinition)
+		if !ok {
+			continue
+		}
+		if operationName != nil {
+			if op.Name != nil && op.Name.Value == *operationName {
+				operationDefinition = op
+				break
+			}
+			continue
+		}
+		if operationDefinition != nil {
+			return nil, errors.New("operation definition already exists")
+		}
+		operationDefinition = op
+	}
+
+	if operationDefinition == nil {
+		return nil, errors.New("no operation definition provided")
+	}
+
+	builder := &PlanBuilder{schema: schema}
+	return builder.parseOperationVariables(schema, operationDefinition.VariableDefinitions, args)
+}
+
+func (builder *PlanBuilder) parseOperationVariables(schema *Schema, defs []*ast.VariableDefinition, originalInputs map[string]any) (map[string]any, error) {
 	if originalInputs == nil {
 		originalInputs = make(map[string]any)
 	}
@@ -1444,13 +1657,13 @@ func (builder *PlanBuilder) parseOperationVariables(schema *graphql.Schema, defs
 	return result, nil
 }
 
-func (builder *PlanBuilder) parseInputValue(inputType graphql.Input, source any) (any, error) {
-	if nonNullType, ok := inputType.(*graphql.NonNull); ok {
+func (builder *PlanBuilder) parseInputValue(inputType Input, source any) (any, error) {
+	if nonNullType, ok := inputType.(*NonNull); ok {
 		if source == nil {
 			return nil, fmt.Errorf("non null input value is required")
 		}
 
-		inner, innerOk := nonNullType.OfType.(graphql.Input)
+		inner, innerOk := nonNullType.OfType.(Input)
 		if !innerOk {
 			return nil, fmt.Errorf("non null input value is required")
 		}
@@ -1463,8 +1676,8 @@ func (builder *PlanBuilder) parseInputValue(inputType graphql.Input, source any)
 	}
 
 	switch t := inputType.(type) {
-	case *graphql.List:
-		inner := t.OfType.(graphql.Input)
+	case *List:
+		inner := t.OfType.(Input)
 
 		if IsSlice(source) {
 			sourceItems := toAnySlice(source)
@@ -1488,7 +1701,7 @@ func (builder *PlanBuilder) parseInputValue(inputType graphql.Input, source any)
 
 		return []any{single}, nil
 
-	case *graphql.InputObject:
+	case *InputObject:
 		sourceMap, ok := source.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("input value is required")
@@ -1525,13 +1738,13 @@ func (builder *PlanBuilder) parseInputValue(inputType graphql.Input, source any)
 			result[fieldName] = parsedFieldValue
 		}
 		return result, nil
-	case *graphql.Scalar:
+	case *Scalar:
 		parsed := t.ParseValue(source)
 		if parsed == nil {
 			return nil, fmt.Errorf("scalar is required")
 		}
 		return parsed, nil
-	case *graphql.Enum:
+	case *Enum:
 		parsed := t.ParseValue(source)
 		if parsed == nil {
 			return nil, fmt.Errorf("enum is required")
@@ -1542,7 +1755,7 @@ func (builder *PlanBuilder) parseInputValue(inputType graphql.Input, source any)
 	}
 }
 
-func (builder *PlanBuilder) directiveLocationAllowed(def *graphql.Directive, location string) bool {
+func (builder *PlanBuilder) directiveLocationAllowed(def *Directive, location string) bool {
 	for _, allowed := range def.Locations {
 		if allowed == location {
 			return true
@@ -1588,18 +1801,61 @@ func (builder *PlanBuilder) compileDirectives(directiveASTs []*ast.Directive, lo
 		name := directiveAST.Name.Value
 		def := builder.schema.Directive(name)
 
+		argPlans, argPlansErr := builder.parseParamPlansByArgDefs(def.Args, directiveAST.Arguments)
+		if argPlansErr != nil {
+			return nil, argPlansErr
+		}
+
+		compiler := builder.directiveRegistry.Compiler(name)
+
+		if paramPlansContainRuntimeInput(argPlans) {
+			if name == "skip" || name == "include" {
+				handler := builder.directiveRegistry.RuntimeHandler(name)
+				if handler == nil {
+					return nil, fmt.Errorf("directive runtime handler not defined for %s", name)
+				}
+				// 变量版 @skip/@include 必须运行期判断，不能在 build 阶段裁剪字段树。
+				result.RuntimePlans = append(result.RuntimePlans, &DirectivePlan{
+					Name:           name,
+					Location:       location,
+					argPlans:       argPlans,
+					Stage:          DirectiveStageShouldExecute,
+					RuntimeHandler: handler,
+				})
+				continue
+			}
+
+			runtimeCompiler, ok := compiler.(RuntimeDirectivePlanCompiler)
+			if !ok {
+				return nil, fmt.Errorf("directive %s contains variables but does not support runtime plan compilation", name)
+			}
+
+			compiled, compiledErr := runtimeCompiler.CompileRuntime(name, location, argPlans, builder.schema)
+			if compiledErr != nil {
+				return nil, compiledErr
+			}
+			for _, rp := range compiled.RuntimePlans {
+				if rp != nil && rp.argPlans == nil {
+					rp.argPlans = argPlans
+				}
+			}
+			builder.bindRuntimeHandlers(compiled)
+			builder.mergeDirectiveCompileResult(result, compiled)
+			continue
+		}
+
+		// 不含变量的指令参数可以在 build 阶段物化，literal/default 属于 plan 结构的一部分。
 		args, err := builder.buildDirectiveArgs(def.Args, directiveAST.Arguments)
 		if err != nil {
 			return nil, err
 		}
-
-		compiler := builder.directiveRegistry.Compiler(name)
 
 		if compiler == nil {
 			if builder.directiveRegistry.MetadataOnly(name) {
 				result.RuntimePlans = append(result.RuntimePlans, &DirectivePlan{
 					Name:           name,
 					Args:           args,
+					argPlans:       argPlans,
 					Location:       location,
 					Stage:          DirectiveStageMetadataOnly,
 					RuntimeHandler: DefaultEmptyDirectiveRuntimeHandler{},
@@ -1614,14 +1870,31 @@ func (builder *PlanBuilder) compileDirectives(directiveASTs []*ast.Directive, lo
 			return nil, compiledErr
 		}
 
+		//给本指令产出的每个运行期计划附加 argPlans（供运行期物化）
+		for _, rp := range compiled.RuntimePlans {
+			if rp != nil && rp.argPlans == nil {
+				rp.argPlans = argPlans
+			}
+		}
+
 		builder.bindRuntimeHandlers(compiled)
 		builder.mergeDirectiveCompileResult(result, compiled)
 	}
 	return result, nil
 }
 
-func (builder *PlanBuilder) buildDirectiveArgs(argDefs []*graphql.Argument, argASTs []*ast.Argument) (map[string]any, error) {
-	defMap := map[string]*graphql.Argument{}
+func paramPlansContainRuntimeInput(plans []*ParamPlan) bool {
+	for _, plan := range plans {
+		switch plan.GetParamType() {
+		case ParamTypeInput, ParamTypeVariableTemplate:
+			return true
+		}
+	}
+	return false
+}
+
+func (builder *PlanBuilder) buildDirectiveArgs(argDefs []*Argument, argASTs []*ast.Argument) (map[string]any, error) {
+	defMap := map[string]*Argument{}
 	for _, argDef := range argDefs {
 		defMap[argDef.PrivateName] = argDef
 	}
@@ -1702,7 +1975,7 @@ func (builder *PlanBuilder) mergeDirectiveCompileResult(dst *DirectiveCompileRes
 	dst.DependencyParamPlans = append(dst.DependencyParamPlans, src.DependencyParamPlans...)
 }
 
-func InputTypeFromAST(schema *graphql.Schema, typeAST ast.Type) (graphql.Input, error) {
+func InputTypeFromAST(schema *Schema, typeAST ast.Type) (Input, error) {
 	if schema == nil {
 		return nil, fmt.Errorf("schema is nil")
 	}
@@ -1721,7 +1994,7 @@ func InputTypeFromAST(schema *graphql.Schema, typeAST ast.Type) (graphql.Input, 
 			return nil, fmt.Errorf("type is nil")
 		}
 
-		inputType, ok := typeFound.(graphql.Input)
+		inputType, ok := typeFound.(Input)
 		if !ok {
 			return nil, fmt.Errorf("type is not an input type")
 		}
@@ -1731,7 +2004,7 @@ func InputTypeFromAST(schema *graphql.Schema, typeAST ast.Type) (graphql.Input, 
 		if err != nil {
 			return nil, err
 		}
-		return graphql.NewList(inner), nil
+		return NewList(inner), nil
 	case *ast.NonNull:
 		inner, err := InputTypeFromAST(schema, tt.Type)
 		if err != nil {
@@ -1739,24 +2012,39 @@ func InputTypeFromAST(schema *graphql.Schema, typeAST ast.Type) (graphql.Input, 
 		}
 
 		//object!!这种没意义的要过滤掉
-		_, ok := inner.(graphql.Nullable)
+		_, ok := inner.(Nullable)
 		if !ok {
 			return nil, fmt.Errorf("non-nullable type's element type is not an non-nullable type")
 		}
-		return graphql.NewNonNull(inner), nil
+		return NewNonNull(inner), nil
 	default:
 		return nil, fmt.Errorf("unknown type %T", typeAST)
 	}
 }
 
-func ValueFromAST(valueAST ast.Value, inputType graphql.Input, originalInputs map[string]any) (any, error) {
+func ValueFromAST(valueAST ast.Value, inputType Input, originalInputs map[string]any) (any, error) {
 	if valueAST == nil {
 		return nil, fmt.Errorf("value is nil")
 	}
 
+	//变量引用：值已在 parseOperationVariables 按声明类型协变，直接取用，不烤、缓存安全
+	if variable, ok := valueAST.(*ast.Variable); ok {
+		if variable.Name == nil {
+			return nil, fmt.Errorf("variable name is nil")
+		}
+		val, provided := originalInputs[variable.Name.Value]
+		if !provided || val == nil {
+			if _, isNonNull := inputType.(*NonNull); isNonNull {
+				return nil, fmt.Errorf("variable %q is required for a non-null input", variable.Name.Value)
+			}
+			return nil, nil
+		}
+		return val, nil
+	}
+
 	switch t := inputType.(type) {
-	case *graphql.NonNull:
-		value, err := ValueFromAST(valueAST, t.OfType.(graphql.Input), originalInputs)
+	case *NonNull:
+		value, err := ValueFromAST(valueAST, t.OfType.(Input), originalInputs)
 		if err != nil {
 			return nil, err
 		}
@@ -1764,7 +2052,7 @@ func ValueFromAST(valueAST ast.Value, inputType graphql.Input, originalInputs ma
 			return nil, fmt.Errorf("value is nil")
 		}
 		return value, nil
-	case *graphql.List:
+	case *List:
 		if listAST, ok := valueAST.(*ast.ListValue); ok {
 			values := make([]any, 0)
 
@@ -1778,13 +2066,13 @@ func ValueFromAST(valueAST ast.Value, inputType graphql.Input, originalInputs ma
 			return values, nil
 		}
 
-		single, err := ValueFromAST(valueAST, t.OfType.(graphql.Input), originalInputs)
+		single, err := ValueFromAST(valueAST, t.OfType.(Input), originalInputs)
 		if err != nil {
 			return nil, err
 		}
 
 		return []any{single}, nil
-	case *graphql.InputObject:
+	case *InputObject:
 		objectAST, ok := valueAST.(*ast.ObjectValue)
 		if !ok {
 			return nil, fmt.Errorf("value is not an object")
@@ -1820,20 +2108,21 @@ func ValueFromAST(valueAST ast.Value, inputType graphql.Input, originalInputs ma
 				continue
 			}
 
-			fieldValue, fieldValueErr := ValueFromAST(fieldAST, fieldDef.Type, originalInputs)
+			//修正：原先误传 fieldAST(*ast.ObjectField)，应传其内部值 fieldAST.Value
+			fieldValue, fieldValueErr := ValueFromAST(fieldAST.Value, fieldDef.Type, originalInputs)
 			if fieldValueErr != nil {
 				return nil, fieldValueErr
 			}
 			result[fieldName] = fieldValue
 		}
 		return result, nil
-	case *graphql.Scalar:
+	case *Scalar:
 		parsed := t.ParseLiteral(valueAST)
 		if parsed == nil {
 			return nil, fmt.Errorf("value is nil")
 		}
 		return parsed, nil
-	case *graphql.Enum:
+	case *Enum:
 		parsed := t.ParseLiteral(valueAST)
 		if parsed == nil {
 			return nil, fmt.Errorf("value is nil")
@@ -1844,8 +2133,8 @@ func ValueFromAST(valueAST ast.Value, inputType graphql.Input, originalInputs ma
 	}
 }
 
-func IsNonNullInput(t graphql.Input) bool {
-	_, ok := t.(*graphql.NonNull)
+func IsNonNullInput(t Input) bool {
+	_, ok := t.(*NonNull)
 	return ok
 }
 
@@ -1877,11 +2166,11 @@ func toAnySlice(v any) []any {
 func operationDirectiveLocation(operation string) string {
 	switch operation {
 	case ast.OperationTypeMutation:
-		return graphql.DirectiveLocationMutation
+		return DirectiveLocationMutation
 	case ast.OperationTypeSubscription:
-		return graphql.DirectiveLocationSubscription
+		return DirectiveLocationSubscription
 	default:
-		return graphql.DirectiveLocationQuery
+		return DirectiveLocationQuery
 	}
 }
 
@@ -1909,13 +2198,37 @@ func NewDirectiveRegistry() *DirectiveRegistry {
 		handlers:     make(map[string]DirectiveRuntimeHandler),
 		metadataOnly: make(map[string]bool),
 	}
-	//注册默认的skip和include两个directive
-	result.Register("skip", SkipDirectiveCompiler{}, nil)
-	result.Register("include", IncludeDirectiveCompiler{}, nil)
+	// 注册默认的 skip/include：literal 参数可 build 阶段裁剪，变量参数走运行期判断。
+	result.Register("skip", SkipDirectiveCompiler{}, SkipDirectiveRuntimeHandler{})
+	result.Register("include", IncludeDirectiveCompiler{}, IncludeDirectiveRuntimeHandler{})
 	return result
 }
 
-func (r *DirectiveRegistry) Register(name string, compiler DirectiveCompiler, handler DirectiveRuntimeHandler) error {
+func (r *DirectiveRegistry) Clone() *DirectiveRegistry {
+	if r == nil {
+		return NewDirectiveRegistry()
+	}
+
+	result := &DirectiveRegistry{
+		compilers:    make(map[string]DirectiveCompiler, len(r.compilers)),
+		handlers:     make(map[string]DirectiveRuntimeHandler, len(r.handlers)),
+		metadataOnly: make(map[string]bool, len(r.metadataOnly)),
+	}
+
+	for name, compiler := range r.compilers {
+		result.compilers[name] = compiler
+	}
+	for name, handler := range r.handlers {
+		result.handlers[name] = handler
+	}
+	for name, metadataOnly := range r.metadataOnly {
+		result.metadataOnly[name] = metadataOnly
+	}
+
+	return result
+}
+
+func (r *DirectiveRegistry) Register(name string, compiler DirectiveCompiler, handler any) error {
 	if name == "" {
 		return fmt.Errorf("name is empty")
 	}
@@ -1923,8 +2236,15 @@ func (r *DirectiveRegistry) Register(name string, compiler DirectiveCompiler, ha
 	if compiler != nil {
 		r.compilers[name] = compiler
 	}
-	if handler != nil {
-		r.handlers[name] = handler
+	switch h := handler.(type) {
+	case nil:
+	case DirectiveRuntimeHandler:
+		r.handlers[name] = h
+	case LegacyDirectiveRuntimeHandler:
+		// 兼容旧版自定义指令 handler：旧签名没有 directiveArgs，注册时包装成新版运行接口。
+		r.handlers[name] = legacyDirectiveRuntimeHandlerAdapter{handler: h}
+	default:
+		return fmt.Errorf("unsupported directive runtime handler for %s", name)
 	}
 
 	return nil

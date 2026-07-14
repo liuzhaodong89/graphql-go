@@ -1,14 +1,13 @@
-package build
+package graphql
 
 import (
 	"fmt"
 	"sort"
 	"strconv"
-
-	"github.com/graphql-go/graphql"
 )
 
-func GenerateSchemaMetaResult(schema *graphql.Schema, children []*FieldPlan, inputs map[string]any) map[string]any {
+// 内省结果生成规则：用 fieldName 判断标准内省字段语义，用 responseName 写结果，保证 alias 不丢失。
+func GenerateSchemaMetaResult(schema *Schema, children []*FieldPlan, inputs map[string]any) map[string]any {
 	if schema == nil {
 		return nil
 	}
@@ -31,17 +30,17 @@ func GenerateSchemaMetaResult(schema *graphql.Schema, children []*FieldPlan, inp
 		case "directives":
 			var directives []any
 			for _, d := range schema.Directives() {
-				directives = append(directives, GenerateDirectiveMetaResult(schema, d, child.childrenFields))
+				directives = append(directives, GenerateDirectiveMetaResult(schema, d, child.GetChildrenFields(), inputs))
 			}
 			result[child.GetResponseName()] = directives
 		case "__typename":
-			result[child.GetResponseName()] = graphql.SchemaType.Name()
+			result[child.GetResponseName()] = SchemaType.Name()
 		}
 	}
 	return result
 }
 
-func GenerateTypeMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, inputs map[string]any) map[string]any {
+func GenerateTypeMetaResult(schema *Schema, t Type, children []*FieldPlan, inputs map[string]any) map[string]any {
 	if t == nil {
 		return nil
 	}
@@ -70,13 +69,13 @@ func GenerateTypeMetaResult(schema *graphql.Schema, t graphql.Type, children []*
 		case "ofType":
 			result[child.GetResponseName()] = GenerateTypeMetaResult(schema, insideWrappedType(t), child.GetChildrenFields(), inputs)
 		case "__typename":
-			result[child.GetResponseName()] = graphql.TypeType.Name()
+			result[child.GetResponseName()] = TypeType.Name()
 		}
 	}
 	return result
 }
 
-func GenerateDirectiveMetaResult(schema *graphql.Schema, d *graphql.Directive, children []*FieldPlan) map[string]any {
+func GenerateDirectiveMetaResult(schema *Schema, d *Directive, children []*FieldPlan, inputs map[string]any) map[string]any {
 	if d == nil {
 		return nil
 	}
@@ -91,14 +90,15 @@ func GenerateDirectiveMetaResult(schema *graphql.Schema, d *graphql.Directive, c
 		case "locations":
 			result[child.GetResponseName()] = d.Locations
 		case "args":
-			result[child.GetResponseName()] = d.Args
+			// __Directive.args 的元素类型是 __InputValue，必须生成 map 结构供后续嵌套字段组装。
+			result[child.GetResponseName()] = GenerateInputValuesMetaResult(schema, d.Args, child.GetChildrenFields(), inputs)
 		}
 	}
 	return result
 }
 
-func GenerateInputFieldsMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, inputs map[string]any) any {
-	inputObj, ok := t.(*graphql.InputObject)
+func GenerateInputFieldsMetaResult(schema *Schema, t Type, children []*FieldPlan, inputs map[string]any) any {
+	inputObj, ok := t.(*InputObject)
 	if !ok || inputObj == nil {
 		return nil
 	}
@@ -118,7 +118,7 @@ func GenerateInputFieldsMetaResult(schema *graphql.Schema, t graphql.Type, child
 	return result
 }
 
-func GenerateInputValuesMetaResult(schema *graphql.Schema, args []*graphql.Argument, children []*FieldPlan, inputs map[string]any) []any {
+func GenerateInputValuesMetaResult(schema *Schema, args []*Argument, children []*FieldPlan, inputs map[string]any) []any {
 	result := make([]any, 0)
 	for _, arg := range args {
 		result = append(result, GenerateSingleInputValueMetaResult(schema, arg, children, inputs))
@@ -126,7 +126,7 @@ func GenerateInputValuesMetaResult(schema *graphql.Schema, args []*graphql.Argum
 	return result
 }
 
-func GenerateSingleInputValueMetaResult(schema *graphql.Schema, v any, children []*FieldPlan, inputs map[string]any) map[string]any {
+func GenerateSingleInputValueMetaResult(schema *Schema, v any, children []*FieldPlan, inputs map[string]any) map[string]any {
 	result := make(map[string]any)
 	for _, child := range children {
 		switch child.GetFieldName() {
@@ -143,12 +143,12 @@ func GenerateSingleInputValueMetaResult(schema *graphql.Schema, v any, children 
 	return result
 }
 
-func GenerateFieldsMetaResult(schema *graphql.Schema, children []*FieldPlan, t graphql.Type, includeDeprecated bool, inputs map[string]any) any {
-	var fields graphql.FieldDefinitionMap
+func GenerateFieldsMetaResult(schema *Schema, children []*FieldPlan, t Type, includeDeprecated bool, inputs map[string]any) any {
+	var fields FieldDefinitionMap
 	switch tt := t.(type) {
-	case *graphql.Object:
+	case *Object:
 		fields = tt.Fields()
-	case *graphql.Interface:
+	case *Interface:
 		fields = tt.Fields()
 	default:
 		return nil
@@ -171,7 +171,7 @@ func GenerateFieldsMetaResult(schema *graphql.Schema, children []*FieldPlan, t g
 	return result
 }
 
-func GenerateSingleFieldMetaResult(schema *graphql.Schema, fd *graphql.FieldDefinition, children []*FieldPlan, inputs map[string]any) map[string]any {
+func GenerateSingleFieldMetaResult(schema *Schema, fd *FieldDefinition, children []*FieldPlan, inputs map[string]any) map[string]any {
 	result := map[string]any{}
 
 	for _, child := range children {
@@ -201,13 +201,13 @@ func GenerateSingleFieldMetaResult(schema *graphql.Schema, fd *graphql.FieldDefi
 	return result
 }
 
-func GeneratePossibleTypesMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, inputs map[string]any) any {
-	var abs graphql.Abstract
+func GeneratePossibleTypesMetaResult(schema *Schema, t Type, children []*FieldPlan, inputs map[string]any) any {
+	var abs Abstract
 
 	switch tt := t.(type) {
-	case *graphql.Interface:
+	case *Interface:
 		abs = tt
-	case *graphql.Union:
+	case *Union:
 		abs = tt
 	default:
 		return nil
@@ -221,8 +221,8 @@ func GeneratePossibleTypesMetaResult(schema *graphql.Schema, t graphql.Type, chi
 	return result
 }
 
-func GenerateInterfacesMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, inputs map[string]any) any {
-	obj, ok := t.(*graphql.Object)
+func GenerateInterfacesMetaResult(schema *Schema, t Type, children []*FieldPlan, inputs map[string]any) any {
+	obj, ok := t.(*Object)
 	if !ok || obj == nil {
 		return nil
 	}
@@ -235,8 +235,8 @@ func GenerateInterfacesMetaResult(schema *graphql.Schema, t graphql.Type, childr
 	return result
 }
 
-func GenerateEnumValuesMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, includeDeprecated bool, inputs map[string]any) any {
-	enumType, ok := t.(*graphql.Enum)
+func GenerateEnumValuesMetaResult(schema *Schema, t Type, children []*FieldPlan, includeDeprecated bool, inputs map[string]any) any {
+	enumType, ok := t.(*Enum)
 	if !ok || enumType == nil {
 		return nil
 	}
@@ -252,7 +252,7 @@ func GenerateEnumValuesMetaResult(schema *graphql.Schema, t graphql.Type, childr
 	return result
 }
 
-func GenerateSingleEnumValueMetaResult(vd *graphql.EnumValueDefinition, t graphql.Type, children []*FieldPlan, includeDeprecated bool, inputs map[string]any) any {
+func GenerateSingleEnumValueMetaResult(vd *EnumValueDefinition, t Type, children []*FieldPlan, includeDeprecated bool, inputs map[string]any) any {
 	if vd == nil {
 		return nil
 	}
@@ -278,40 +278,40 @@ func GenerateSingleEnumValueMetaResult(vd *graphql.EnumValueDefinition, t graphq
 				result[child.GetResponseName()] = vd.DeprecationReason
 			}
 		case "__typename":
-			result[child.GetFieldName()] = graphql.EnumValueType.Name()
+			result[child.GetResponseName()] = EnumValueType.Name()
 		}
 	}
 	return result
 }
 
-func introspectionKind(t graphql.Type) string {
+func introspectionKind(t Type) string {
 	switch t.(type) {
-	case *graphql.Scalar:
-		return graphql.TypeKindScalar
-	case *graphql.Object:
-		return graphql.TypeKindObject
-	case *graphql.Enum:
-		return graphql.TypeKindEnum
-	case *graphql.List:
-		return graphql.TypeKindList
-	case *graphql.NonNull:
-		return graphql.TypeKindNonNull
-	case *graphql.Interface:
-		return graphql.TypeKindInterface
-	case *graphql.Union:
-		return graphql.TypeKindUnion
-	case *graphql.InputObject:
-		return graphql.TypeKindInputObject
+	case *Scalar:
+		return TypeKindScalar
+	case *Object:
+		return TypeKindObject
+	case *Enum:
+		return TypeKindEnum
+	case *List:
+		return TypeKindList
+	case *NonNull:
+		return TypeKindNonNull
+	case *Interface:
+		return TypeKindInterface
+	case *Union:
+		return TypeKindUnion
+	case *InputObject:
+		return TypeKindInputObject
 	default:
 		return ""
 	}
 }
 
-func typeNameOrNil(t graphql.Type) any {
+func typeNameOrNil(t Type) any {
 	switch tt := t.(type) {
-	case *graphql.List:
+	case *List:
 		return nil
-	case *graphql.NonNull:
+	case *NonNull:
 		return nil
 	default:
 		if tt == nil {
@@ -321,11 +321,11 @@ func typeNameOrNil(t graphql.Type) any {
 	}
 }
 
-func typeDescriptionOrNil(t graphql.Type) any {
+func typeDescriptionOrNil(t Type) any {
 	switch tt := t.(type) {
-	case *graphql.List:
+	case *List:
 		return nil
-	case *graphql.NonNull:
+	case *NonNull:
 		return nil
 	default:
 		if tt == nil {
@@ -341,9 +341,9 @@ func typeDescriptionOrNil(t graphql.Type) any {
 
 func inputValueName(v any) string {
 	switch tt := v.(type) {
-	case *graphql.Argument:
+	case *Argument:
 		return tt.Name()
-	case *graphql.InputObjectField:
+	case *InputObjectField:
 		return tt.Name()
 	default:
 		return ""
@@ -352,12 +352,12 @@ func inputValueName(v any) string {
 
 func inputValueDescription(v any) any {
 	switch tt := v.(type) {
-	case *graphql.Argument:
+	case *Argument:
 		if tt.Description() == "" {
 			return nil
 		}
 		return tt.Description()
-	case *graphql.InputObjectField:
+	case *InputObjectField:
 		if tt.Description() == "" {
 			return nil
 		}
@@ -367,11 +367,11 @@ func inputValueDescription(v any) any {
 	}
 }
 
-func inputValueType(v any) graphql.Type {
+func inputValueType(v any) Type {
 	switch tt := v.(type) {
-	case *graphql.Argument:
+	case *Argument:
 		return tt.Type
-	case *graphql.InputObjectField:
+	case *InputObjectField:
 		return tt.Type
 	default:
 		return nil
@@ -380,13 +380,13 @@ func inputValueType(v any) graphql.Type {
 
 func inputValueDefaultValue(v any) any {
 	var defaultValue any
-	var valueType graphql.Type
+	var valueType Type
 
 	switch tt := v.(type) {
-	case *graphql.Argument:
+	case *Argument:
 		valueType = tt.Type
 		defaultValue = tt.DefaultValue
-	case *graphql.InputObjectField:
+	case *InputObjectField:
 		valueType = tt.Type
 		defaultValue = tt.DefaultValue
 	default:
@@ -400,7 +400,7 @@ func inputValueDefaultValue(v any) any {
 }
 
 // TODO要补list,input object,enum,null
-func defaultValueLiteral(value any, t graphql.Type) any {
+func defaultValueLiteral(value any, t Type) any {
 	if value == nil {
 		return nil
 	}
@@ -438,23 +438,18 @@ func argValue(field *FieldPlan, name string, inputs map[string]any) any {
 		if p.paramKey != name {
 			continue
 		}
-
-		switch p.paramType {
-		case ParamTypeConst:
-			return p.constValue
-		case ParamTypeInput:
-			return inputs[p.inputName]
-		}
-
+		// 内省参数可能来自变量；ParamPlan 必须在请求期用 inputs 物化，不能在 plan 里缓存参数值。
+		v, _, _ := p.ResolveFromInputs(inputs)
+		return v
 	}
 	return nil
 }
 
-func insideWrappedType(t graphql.Type) graphql.Type {
+func insideWrappedType(t Type) Type {
 	switch tt := t.(type) {
-	case *graphql.List:
+	case *List:
 		return tt.OfType
-	case *graphql.NonNull:
+	case *NonNull:
 		return tt.OfType
 	default:
 		return nil
