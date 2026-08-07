@@ -17,7 +17,7 @@ const ParamTypeFieldResult ParamType = 2
 const ParamTypeFieldFullResult ParamType = 3
 const ParamTypeVariableTemplate ParamType = 4
 
-type ResolverFunc func(source any, params map[string]any, ctx context.Context) (any, error)
+type ResolverFunc func(source any, params map[string]any, info ResolveInfo, ctx context.Context) (any, error)
 
 type ParamPlan struct {
 	paramKey         string
@@ -28,6 +28,8 @@ type ParamPlan struct {
 	fieldResultPaths []string
 	templateAST      ast.Value //含变量的复合实参的 AST 模板（只存结构，不存请求值）
 	templateType     Input     //该实参的输入类型，物化时协变/校验用
+
+	inputDefaultValue any // Schema 参数定义上的默认值，仅在本次请求未提供对应变量时使用
 }
 
 func (pp *ParamPlan) GetParamKey() string {
@@ -73,13 +75,22 @@ func (pp *ParamPlan) MaterializeTemplate(originalInputs map[string]any) (any, er
 }
 
 // ResolveFromInputs 解析"仅依赖变量/常量"的参数（Const/Input/VariableTemplate）。
-// FieldResult/FieldFullResult 返回 handled=false，交调用方按 step 形态处理。
+// handled=false 表示本次请求不应写入该参数，或该参数需交调用方按 step 形态处理。
 func (pp *ParamPlan) ResolveFromInputs(originalInputs map[string]any) (value any, handled bool, err error) {
 	switch pp.paramType {
 	case ParamTypeConst:
 		return pp.constValue, true, nil
 	case ParamTypeInput:
-		return originalInputs[pp.inputName], true, nil
+		value, provided := originalInputs[pp.inputName]
+		if provided {
+			// key 存在但值为 nil 表示客户端显式传入 null，不能回退到参数默认值。
+			return value, true, nil
+		}
+		if pp.inputDefaultValue != nil {
+			return pp.inputDefaultValue, true, nil
+		}
+		// 变量未提供且参数没有默认值时，不向 resolver 参数 map 写入该参数。
+		return nil, false, nil
 	case ParamTypeVariableTemplate:
 		v, e := pp.MaterializeTemplate(originalInputs)
 		return v, true, e
@@ -216,7 +227,6 @@ type DirectivePlan struct {
 	Args           map[string]any
 	argPlans       []*ParamPlan //指令实参的延迟计划（Const/Input/Template），运行期物化
 	Stage          DirectiveStage
-	Metadata       map[string]any
 	RuntimeHandler DirectiveRuntimeHandler
 }
 

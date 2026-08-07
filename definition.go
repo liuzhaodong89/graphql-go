@@ -7,6 +7,7 @@ import (
 	"regexp"
 
 	"github.com/graphql-go/graphql/language/ast"
+	"github.com/graphql-go/graphql/sgraph"
 )
 
 // Type interface for all of the possible kinds of GraphQL types
@@ -228,7 +229,7 @@ type ScalarConfig struct {
 // NewScalar creates a new GraphQLScalar
 func NewScalar(config ScalarConfig) *Scalar {
 	st := &Scalar{}
-	err := invariant(config.Name != "", "Type must be named.")
+	err := sgraph.invariant(config.Name != "", "Type must be named.")
 	if err != nil {
 		st.err = err
 		return st
@@ -243,7 +244,7 @@ func NewScalar(config ScalarConfig) *Scalar {
 	st.PrivateName = config.Name
 	st.PrivateDescription = config.Description
 
-	err = invariantf(
+	err = sgraph.invariantf(
 		config.Serialize != nil,
 		`%v must provide "serialize" function. If this custom Scalar is `+
 			`also used as an input type, ensure "parseValue" and "parseLiteral" `+
@@ -254,7 +255,7 @@ func NewScalar(config ScalarConfig) *Scalar {
 		return st
 	}
 	if config.ParseValue != nil || config.ParseLiteral != nil {
-		err = invariantf(
+		err = sgraph.invariantf(
 			config.ParseValue != nil && config.ParseLiteral != nil,
 			`%v must provide both "parseValue" and "parseLiteral" functions.`, st,
 		)
@@ -380,7 +381,7 @@ type FieldsThunk func() Fields
 func NewObject(config ObjectConfig) *Object {
 	objectType := &Object{}
 
-	err := invariant(config.Name != "", "Type must be named.")
+	err := sgraph.invariant(config.Name != "", "Type must be named.")
 	if err != nil {
 		objectType.err = err
 		return objectType
@@ -475,7 +476,7 @@ func defineInterfaces(ttype *Object, interfaces []*Interface) ([]*Interface, err
 		return ifaces, nil
 	}
 	for _, iface := range interfaces {
-		err := invariantf(
+		err := sgraph.invariantf(
 			iface != nil,
 			`%v may only implement Interface types, it cannot implement: %v.`, ttype, iface,
 		)
@@ -483,7 +484,7 @@ func defineInterfaces(ttype *Object, interfaces []*Interface) ([]*Interface, err
 			return ifaces, err
 		}
 		if iface.ResolveType != nil {
-			err = invariantf(
+			err = sgraph.invariantf(
 				iface.ResolveType != nil,
 				`Interface Type %v does not provide a "resolveType" function `+
 					`and implementing Type %v does not provide a "isTypeOf" `+
@@ -503,7 +504,7 @@ func defineInterfaces(ttype *Object, interfaces []*Interface) ([]*Interface, err
 func defineFieldMap(ttype Named, fieldMap Fields) (FieldDefinitionMap, error) {
 	resultFieldMap := FieldDefinitionMap{}
 
-	err := invariantf(
+	err := sgraph.invariantf(
 		len(fieldMap) > 0,
 		`%v fields must be an object with field names as keys or a function which return such an object.`, ttype,
 	)
@@ -515,7 +516,7 @@ func defineFieldMap(ttype Named, fieldMap Fields) (FieldDefinitionMap, error) {
 		if field == nil {
 			continue
 		}
-		err = invariantf(
+		err = sgraph.invariantf(
 			field.Type != nil,
 			`%v.%v field type must be Output Type but got: %v.`, ttype, fieldName, field.Type,
 		)
@@ -542,13 +543,13 @@ func defineFieldMap(ttype Named, fieldMap Fields) (FieldDefinitionMap, error) {
 			if err = assertValidName(argName); err != nil {
 				return resultFieldMap, err
 			}
-			if err = invariantf(
+			if err = sgraph.invariantf(
 				arg != nil,
 				`%v.%v args must be an object with argument names as keys.`, ttype, fieldName,
 			); err != nil {
 				return resultFieldMap, err
 			}
-			if err = invariantf(
+			if err = sgraph.invariantf(
 				arg.Type != nil,
 				`%v.%v(%v:) argument type must be Input Type but got: %v.`, ttype, fieldName, argName, arg.Type,
 			); err != nil {
@@ -621,16 +622,16 @@ type ArgumentConfig struct {
 
 type FieldDefinitionMap map[string]*FieldDefinition
 type FieldDefinition struct {
-	Name                       string         `json:"name"`
-	Description                string         `json:"description"`
-	Type                       Output         `json:"type"`
-	Args                       []*Argument    `json:"args"`
-	BatchArgs                  []*Argument    `json:"batchArgs"`
-	Resolve                    FieldResolveFn `json:"-"`
-	Subscribe                  FieldResolveFn `json:"-"`
-	BatchResolve               FieldResolveFn `json:"-"`
-	DeprecationReason          string         `json:"deprecationReason"`
-	BatchResultMappedFieldName string         `json:"batchResultMappedFieldName"`
+	Name                      string         `json:"name"`
+	Description               string         `json:"description"`
+	Type                      Output         `json:"type"`
+	Args                      []*Argument    `json:"args"`
+	BulkArgs                  []*Argument    `json:"bulkArgs"`
+	Resolve                   FieldResolveFn `json:"-"`
+	Subscribe                 FieldResolveFn `json:"-"`
+	BulkResolve               FieldResolveFn `json:"-"`
+	DeprecationReason         string         `json:"deprecationReason"`
+	BulkResultMappedFieldName string         `json:"bulkResultMappedFieldName"`
 }
 
 type FieldArgument struct {
@@ -713,7 +714,7 @@ type ResolveTypeFn func(p ResolveTypeParams) *Object
 func NewInterface(config InterfaceConfig) *Interface {
 	it := &Interface{}
 
-	if it.err = invariant(config.Name != "", "Type must be named."); it.err != nil {
+	if it.err = sgraph.invariant(config.Name != "", "Type must be named."); it.err != nil {
 		return it
 	}
 	if it.err = assertValidName(config.Name); it.err != nil {
@@ -816,7 +817,7 @@ type UnionConfig struct {
 func NewUnion(config UnionConfig) *Union {
 	objectType := &Union{}
 
-	if objectType.err = invariant(config.Name != "", "Type must be named."); objectType.err != nil {
+	if objectType.err = sgraph.invariant(config.Name != "", "Type must be named."); objectType.err != nil {
 		return objectType
 	}
 	if objectType.err = assertValidName(config.Name); objectType.err != nil {
@@ -857,7 +858,7 @@ func (ut *Union) Types() []*Object {
 func defineUnionTypes(objectType *Union, unionTypes []*Object) ([]*Object, error) {
 	definedUnionTypes := []*Object{}
 
-	if err := invariantf(
+	if err := sgraph.invariantf(
 		len(unionTypes) > 0,
 		`Must provide Array of types for Union %v.`, objectType.Name(),
 	); err != nil {
@@ -865,14 +866,14 @@ func defineUnionTypes(objectType *Union, unionTypes []*Object) ([]*Object, error
 	}
 
 	for _, ttype := range unionTypes {
-		if err := invariantf(
+		if err := sgraph.invariantf(
 			ttype != nil,
 			`%v may only contain Object types, it cannot contain: %v.`, objectType, ttype,
 		); err != nil {
 			return definedUnionTypes, err
 		}
 		if objectType.ResolveType == nil {
-			if err := invariantf(
+			if err := sgraph.invariantf(
 				ttype.IsTypeOf != nil,
 				`Union Type %v does not provide a "resolveType" function `+
 					`and possible Type %v does not provide a "isTypeOf" `+
@@ -973,7 +974,7 @@ func (gt *Enum) defineEnumValues(valueMap EnumValueConfigMap) ([]*EnumValueDefin
 	var err error
 	values := []*EnumValueDefinition{}
 
-	if err = invariantf(
+	if err = sgraph.invariantf(
 		len(valueMap) > 0,
 		`%v values must be an object with value names as keys.`, gt,
 	); err != nil {
@@ -981,7 +982,7 @@ func (gt *Enum) defineEnumValues(valueMap EnumValueConfigMap) ([]*EnumValueDefin
 	}
 
 	for valueName, valueConfig := range valueMap {
-		if err = invariantf(
+		if err = sgraph.invariantf(
 			valueConfig != nil,
 			`%v.%v must refer to an object with a "value" key `+
 				`representing an internal value but got: %v.`, gt, valueName, valueConfig,
@@ -1142,7 +1143,7 @@ type InputObjectConfig struct {
 
 func NewInputObject(config InputObjectConfig) *InputObject {
 	gt := &InputObject{}
-	if gt.err = invariant(config.Name != "", "Type must be named."); gt.err != nil {
+	if gt.err = sgraph.invariant(config.Name != "", "Type must be named."); gt.err != nil {
 		return gt
 	}
 
@@ -1165,7 +1166,7 @@ func (gt *InputObject) defineFieldMap() InputObjectFieldMap {
 	}
 	resultFieldMap := InputObjectFieldMap{}
 
-	if gt.err = invariantf(
+	if gt.err = sgraph.invariantf(
 		len(fieldMap) > 0,
 		`%v fields must be an object with field names as keys or a function which return such an object.`, gt,
 	); gt.err != nil {
@@ -1179,7 +1180,7 @@ func (gt *InputObject) defineFieldMap() InputObjectFieldMap {
 		if err = assertValidName(fieldName); err != nil {
 			continue
 		}
-		if gt.err = invariantf(
+		if gt.err = sgraph.invariantf(
 			fieldConfig.Type != nil,
 			`%v.%v field type must be Input Type but got: %v.`, gt, fieldName, fieldConfig.Type,
 		); gt.err != nil {
@@ -1201,7 +1202,7 @@ func (gt *InputObject) AddFieldConfig(fieldName string, fieldConfig *InputObject
 		return
 	}
 	fieldMap, ok := gt.typeConfig.Fields.(InputObjectConfigFieldMap)
-	if gt.err = invariant(ok, "Cannot add field to a thunk"); gt.err != nil {
+	if gt.err = sgraph.invariant(ok, "Cannot add field to a thunk"); gt.err != nil {
 		return
 	}
 	fieldMap[fieldName] = fieldConfig
@@ -1251,7 +1252,7 @@ type List struct {
 func NewList(ofType Type) *List {
 	gl := &List{}
 
-	gl.err = invariantf(ofType != nil, `Can only create List of a Type but got: %v.`, ofType)
+	gl.err = sgraph.invariantf(ofType != nil, `Can only create List of a Type but got: %v.`, ofType)
 	if gl.err != nil {
 		return gl
 	}
@@ -1303,7 +1304,7 @@ func NewNonNull(ofType Type) *NonNull {
 	gl := &NonNull{}
 
 	_, isOfTypeNonNull := ofType.(*NonNull)
-	gl.err = invariantf(ofType != nil && !isOfTypeNonNull, `Can only create NonNull of a Nullable Type but got: %v.`, ofType)
+	gl.err = sgraph.invariantf(ofType != nil && !isOfTypeNonNull, `Can only create NonNull of a Nullable Type but got: %v.`, ofType)
 	if gl.err != nil {
 		return gl
 	}
@@ -1329,7 +1330,7 @@ func (gl *NonNull) Error() error {
 var NameRegExp = regexp.MustCompile("^[_a-zA-Z][_a-zA-Z0-9]*$")
 
 func assertValidName(name string) error {
-	return invariantf(
+	return sgraph.invariantf(
 		NameRegExp.MatchString(name),
 		`Names must match /^[_a-zA-Z][_a-zA-Z0-9]*$/ but "%v" does not.`, name)
 

@@ -6,6 +6,7 @@ import (
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
+	"github.com/graphql-go/graphql/sgraph"
 )
 
 type Rundata struct {
@@ -14,7 +15,7 @@ type Rundata struct {
 	rootValue        any                       //请求级 ResolveInfo.RootValue，只用于默认 resolver / extension 信息透传
 	operation        ast.Definition            //当前请求选择的 operation，供 ResolveInfo.Operation 使用
 	fragments        map[string]ast.Definition //当前 document 的 fragment 定义，供 ResolveInfo.Fragments 使用
-	extensions       []Extension               //public Execute 透传进来的 extensions，底层 engine 直接调用时保持为空
+	extensions       []sgraph.Extension        //public Execute 透传进来的 extensions，底层 engine 直接调用时保持为空
 	fieldResultSlice []atomic.Pointer[FieldResponse]
 	fieldErrorSlice  []atomic.Pointer[FieldError]
 	fieldErrorCount  atomic.Int32

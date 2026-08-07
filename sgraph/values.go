@@ -1,4 +1,4 @@
-package graphql
+package sgraph
 
 import (
 	"encoding/json"
@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
 	"github.com/graphql-go/graphql/language/kinds"
@@ -18,7 +19,7 @@ import (
 // provided variable definitions and arbitrary input. If the input cannot be
 // parsed to match the variable definitions, a GraphQLError will be returned.
 func getVariableValues(
-	schema Schema,
+	schema graphql.Schema,
 	definitionASTs []*ast.VariableDefinition,
 	inputs map[string]interface{}) (map[string]interface{}, error) {
 	values := map[string]interface{}{}
@@ -39,7 +40,7 @@ func getVariableValues(
 // Prepares an object map of argument values given a list of argument
 // definitions and list of argument AST nodes.
 func getArgumentValues(
-	argDefs []*Argument, argASTs []*ast.Argument,
+	argDefs []*graphql.Argument, argASTs []*ast.Argument,
 	variableValues map[string]interface{}) map[string]interface{} {
 
 	argASTMap := map[string]*ast.Argument{}
@@ -69,14 +70,14 @@ func getArgumentValues(
 
 // Given a variable definition, and any value of input, return a value which
 // adheres to the variable definition, or throw an error.
-func getVariableValue(schema Schema, definitionAST *ast.VariableDefinition, input interface{}) (interface{}, error) {
+func getVariableValue(schema graphql.Schema, definitionAST *ast.VariableDefinition, input interface{}) (interface{}, error) {
 	ttype, err := typeFromAST(schema, definitionAST.Type)
 	if err != nil {
 		return nil, err
 	}
 	variable := definitionAST.Variable
 
-	if ttype == nil || !IsInputType(ttype) {
+	if ttype == nil || !graphql.IsInputType(ttype) {
 		return "", gqlerrors.NewError(
 			fmt.Sprintf(`Variable "$%v" expected value of type `+
 				`"%v" which cannot be used as an input type.`, variable.Name.Value, printer.Print(definitionAST.Type)),
@@ -130,14 +131,14 @@ func getVariableValue(schema Schema, definitionAST *ast.VariableDefinition, inpu
 }
 
 // Given a type and any value, return a runtime value coerced to match the type.
-func coerceValue(ttype Input, value interface{}) interface{} {
+func coerceValue(ttype graphql.Input, value interface{}) interface{} {
 	if isNullish(value) {
 		return nil
 	}
 	switch ttype := ttype.(type) {
-	case *NonNull:
+	case *graphql.NonNull:
 		return coerceValue(ttype.OfType, value)
-	case *List:
+	case *graphql.List:
 		var values = []interface{}{}
 		valType := reflect.ValueOf(value)
 		if valType.Kind() == reflect.Slice {
@@ -148,7 +149,7 @@ func coerceValue(ttype Input, value interface{}) interface{} {
 			return values
 		}
 		return append(values, coerceValue(ttype.OfType, value))
-	case *InputObject:
+	case *graphql.InputObject:
 		var obj = map[string]interface{}{}
 		valueMap, _ := value.(map[string]interface{})
 		if valueMap == nil {
@@ -165,11 +166,11 @@ func coerceValue(ttype Input, value interface{}) interface{} {
 			}
 		}
 		return obj
-	case *Scalar:
+	case *graphql.Scalar:
 		if parsed := ttype.ParseValue(value); !isNullish(parsed) {
 			return parsed
 		}
-	case *Enum:
+	case *graphql.Enum:
 		if parsed := ttype.ParseValue(value); !isNullish(parsed) {
 			return parsed
 		}
@@ -181,20 +182,20 @@ func coerceValue(ttype Input, value interface{}) interface{} {
 // graphql-js/src/utilities.js`
 // TODO: figure out where to organize utils
 // TODO: change to *Schema
-func typeFromAST(schema Schema, inputTypeAST ast.Type) (Type, error) {
+func typeFromAST(schema graphql.Schema, inputTypeAST ast.Type) (graphql.Type, error) {
 	switch inputTypeAST := inputTypeAST.(type) {
 	case *ast.List:
 		innerType, err := typeFromAST(schema, inputTypeAST.Type)
 		if err != nil {
 			return nil, err
 		}
-		return NewList(innerType), nil
+		return graphql.NewList(innerType), nil
 	case *ast.NonNull:
 		innerType, err := typeFromAST(schema, inputTypeAST.Type)
 		if err != nil {
 			return nil, err
 		}
-		return NewNonNull(innerType), nil
+		return graphql.NewNonNull(innerType), nil
 	case *ast.Named:
 		nameValue := ""
 		if inputTypeAST.Name != nil {
@@ -211,9 +212,9 @@ func typeFromAST(schema Schema, inputTypeAST ast.Type) (Type, error) {
 // Given a value and a GraphQL type, determine if the value will be
 // accepted for that type. This is primarily useful for validating the
 // runtime values of query variables.
-func isValidInputValue(value interface{}, ttype Input) (bool, []string) {
+func isValidInputValue(value interface{}, ttype graphql.Input) (bool, []string) {
 	if isNullish(value) {
-		if ttype, ok := ttype.(*NonNull); ok {
+		if ttype, ok := ttype.(*graphql.NonNull); ok {
 			if ttype.OfType.Name() != "" {
 				return false, []string{fmt.Sprintf(`Expected "%v!", found null.`, ttype.OfType.Name())}
 			}
@@ -222,9 +223,9 @@ func isValidInputValue(value interface{}, ttype Input) (bool, []string) {
 		return true, nil
 	}
 	switch ttype := ttype.(type) {
-	case *NonNull:
+	case *graphql.NonNull:
 		return isValidInputValue(value, ttype.OfType)
-	case *List:
+	case *graphql.List:
 		valType := reflect.ValueOf(value)
 		if valType.Kind() == reflect.Ptr {
 			valType = valType.Elem()
@@ -242,7 +243,7 @@ func isValidInputValue(value interface{}, ttype Input) (bool, []string) {
 		}
 		return isValidInputValue(value, ttype.OfType)
 
-	case *InputObject:
+	case *graphql.InputObject:
 		messagesReduce := []string{}
 
 		valueMap, ok := value.(map[string]interface{})
@@ -282,11 +283,11 @@ func isValidInputValue(value interface{}, ttype Input) (bool, []string) {
 			}
 		}
 		return (len(messagesReduce) == 0), messagesReduce
-	case *Scalar:
+	case *graphql.Scalar:
 		if parsedVal := ttype.ParseValue(value); isNullish(parsedVal) {
 			return false, []string{fmt.Sprintf(`Expected type "%v", found "%v".`, ttype.Name(), value)}
 		}
-	case *Enum:
+	case *graphql.Enum:
 		if parsedVal := ttype.ParseValue(value); isNullish(parsedVal) {
 			return false, []string{fmt.Sprintf(`Expected type "%v", found "%v".`, ttype.Name(), value)}
 		}
@@ -348,7 +349,7 @@ func isIterable(src interface{}) bool {
  * | Int / Float          | Number        |
  *
  */
-func valueFromAST(valueAST ast.Value, ttype Input, variables map[string]interface{}) interface{} {
+func valueFromAST(valueAST ast.Value, ttype graphql.Input, variables map[string]interface{}) interface{} {
 	if valueAST == nil {
 		return nil
 	}
@@ -363,9 +364,9 @@ func valueFromAST(valueAST ast.Value, ttype Input, variables map[string]interfac
 		return variables[valueAST.Name.Value]
 	}
 	switch ttype := ttype.(type) {
-	case *NonNull:
+	case *graphql.NonNull:
 		return valueFromAST(valueAST, ttype.OfType, variables)
-	case *List:
+	case *graphql.List:
 		values := []interface{}{}
 		if valueAST, ok := valueAST.(*ast.ListValue); ok {
 			for _, itemAST := range valueAST.Values {
@@ -374,7 +375,7 @@ func valueFromAST(valueAST ast.Value, ttype Input, variables map[string]interfac
 			return values
 		}
 		return append(values, valueFromAST(valueAST, ttype.OfType, variables))
-	case *InputObject:
+	case *graphql.InputObject:
 		var (
 			ok bool
 			ov *ast.ObjectValue
@@ -403,9 +404,9 @@ func valueFromAST(valueAST ast.Value, ttype Input, variables map[string]interfac
 			}
 		}
 		return obj
-	case *Scalar:
+	case *graphql.Scalar:
 		return ttype.ParseLiteral(valueAST)
-	case *Enum:
+	case *graphql.Enum:
 		return ttype.ParseLiteral(valueAST)
 	}
 

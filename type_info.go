@@ -3,6 +3,7 @@ package graphql
 import (
 	"github.com/graphql-go/graphql/language/ast"
 	"github.com/graphql-go/graphql/language/kinds"
+	"github.com/graphql-go/graphql/sgraph"
 )
 
 // TODO: can move TypeInfo to a utils package if there ever is one
@@ -121,7 +122,7 @@ func (ti *TypeInfo) Enter(node ast.Node) {
 	case *ast.InlineFragment:
 		typeConditionAST := node.TypeCondition
 		if typeConditionAST != nil {
-			ttype, _ = typeFromAST(*schema, node.TypeCondition)
+			ttype, _ = sgraph.typeFromAST(*schema, node.TypeCondition)
 			ti.typeStack = append(ti.typeStack, ttype)
 		} else {
 			ti.typeStack = append(ti.typeStack, ti.Type())
@@ -129,13 +130,13 @@ func (ti *TypeInfo) Enter(node ast.Node) {
 	case *ast.FragmentDefinition:
 		typeConditionAST := node.TypeCondition
 		if typeConditionAST != nil {
-			ttype, _ = typeFromAST(*schema, typeConditionAST)
+			ttype, _ = sgraph.typeFromAST(*schema, typeConditionAST)
 			ti.typeStack = append(ti.typeStack, ttype)
 		} else {
 			ti.typeStack = append(ti.typeStack, ti.Type())
 		}
 	case *ast.VariableDefinition:
-		ttype, _ = typeFromAST(*schema, node.Type)
+		ttype, _ = sgraph.typeFromAST(*schema, node.Type)
 		ti.inputTypeStack = append(ti.inputTypeStack, ttype)
 	case *ast.Argument:
 		nameVal := ""

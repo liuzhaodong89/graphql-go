@@ -13,6 +13,7 @@ import (
 	"github.com/graphql-go/graphql/language/ast"
 	"github.com/graphql-go/graphql/language/parser"
 	"github.com/graphql-go/graphql/language/source"
+	"github.com/graphql-go/graphql/sgraph"
 )
 
 func TestGraphQLGoSpec_FieldCollectionFragmentsDirectivesAndAliases(t *testing.T) {
@@ -74,6 +75,61 @@ func TestGraphQLGoSpec_VariableAndInputCoercion(t *testing.T) {
 		"echo":      "hi!",
 		"echoInput": "ping|blue/green|7|A",
 	})
+}
+
+func TestSGraphSpec_ArgumentDefaultForMissingVariable(t *testing.T) {
+	queryType := NewObject(ObjectConfig{
+		Name: "Query",
+		Fields: Fields{
+			"inspectArgs": &Field{
+				Type: String,
+				Args: FieldConfigArgument{
+					"defaulted": &ArgumentConfig{Type: String, DefaultValue: "fallback"},
+					"optional":  &ArgumentConfig{Type: String},
+				},
+				Resolve: func(p ResolveParams) (any, error) {
+					defaulted, defaultedProvided := p.Args["defaulted"]
+					optional, optionalProvided := p.Args["optional"]
+					return fmt.Sprintf("%t:%v|%t:%v", defaultedProvided, defaulted, optionalProvided, optional), nil
+				},
+			},
+		},
+	})
+	schema, err := NewSchema(SchemaConfig{Query: queryType})
+	if err != nil {
+		t.Fatalf("NewSchema failed: %v", err)
+	}
+
+	document := parseGraphQLSpecQuery(t, `
+		query InspectArgs($value: String) {
+			inspectArgs(defaulted: $value, optional: $value)
+		}
+	`)
+	validationResult := ValidateDocument(&schema, document, nil)
+	if !validationResult.IsValid {
+		t.Fatalf("validation failed: %#v", validationResult.Errors)
+	}
+
+	operationName := "InspectArgs"
+	engine := NewSGraphEngine(schema)
+	testCases := []struct {
+		name      string
+		variables map[string]any
+		expected  string
+	}{
+		{name: "missing variable uses argument default", variables: nil, expected: "true:fallback|false:<nil>"},
+		{name: "explicit null does not use argument default", variables: map[string]any{"value": nil}, expected: "true:<nil>|true:<nil>"},
+		{name: "provided value overrides argument default", variables: map[string]any{"value": "request"}, expected: "true:request|true:request"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			// 同一个 engine 和 document 连续执行，覆盖 plan cache 命中后的请求隔离。
+			result := normalizeGraphQLSpecResult(engine.Execute(document, testCase.variables, &operationName, nil, context.Background()).ToGraphQLResult())
+			assertNoGraphQLErrors(t, result)
+			assertGraphQLData(t, result.Data, map[string]any{"inspectArgs": testCase.expected})
+		})
+	}
 }
 
 func TestGraphQLGoSpec_NullBubblingAndErrorPath(t *testing.T) {
@@ -915,7 +971,7 @@ func TestGraphQLGoSpec_ExtensionExecutionAndFieldHooks(t *testing.T) {
 	})
 	schema, err := NewSchema(SchemaConfig{
 		Query:      queryType,
-		Extensions: []Extension{ext},
+		Extensions: []sgraph.Extension{ext},
 	})
 	if err != nil {
 		t.Fatalf("NewSchema failed: %v", err)
@@ -1383,22 +1439,22 @@ func (e *specTrackingExtension) Name() string {
 	return "specTracking"
 }
 
-func (e *specTrackingExtension) ParseDidStart(ctx context.Context) (context.Context, ParseFinishFunc) {
+func (e *specTrackingExtension) ParseDidStart(ctx context.Context) (context.Context, sgraph.ParseFinishFunc) {
 	return ctx, func(error) {}
 }
 
-func (e *specTrackingExtension) ValidationDidStart(ctx context.Context) (context.Context, ValidationFinishFunc) {
+func (e *specTrackingExtension) ValidationDidStart(ctx context.Context) (context.Context, sgraph.ValidationFinishFunc) {
 	return ctx, func([]gqlerrors.FormattedError) {}
 }
 
-func (e *specTrackingExtension) ExecutionDidStart(ctx context.Context) (context.Context, ExecutionFinishFunc) {
+func (e *specTrackingExtension) ExecutionDidStart(ctx context.Context) (context.Context, sgraph.ExecutionFinishFunc) {
 	e.executionStarts++
 	return ctx, func(*Result) {
 		e.executionFinishes++
 	}
 }
 
-func (e *specTrackingExtension) ResolveFieldDidStart(ctx context.Context, info *ResolveInfo) (context.Context, ResolveFieldFinishFunc) {
+func (e *specTrackingExtension) ResolveFieldDidStart(ctx context.Context, info *ResolveInfo) (context.Context, sgraph.ResolveFieldFinishFunc) {
 	e.fieldStarts++
 	return ctx, func(interface{}, error) {
 		e.fieldFinishes++

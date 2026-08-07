@@ -12,6 +12,7 @@ import (
 	"github.com/graphql-go/graphql/language/kinds"
 	"github.com/graphql-go/graphql/language/printer"
 	"github.com/graphql-go/graphql/language/visitor"
+	"github.com/graphql-go/graphql/sgraph"
 )
 
 // SpecifiedRules set includes all validation rules defined by the GraphQL spec.
@@ -1140,7 +1141,7 @@ func getFragmentType(context *ValidationContext, name string) Type {
 	if frag == nil {
 		return nil
 	}
-	ttype, _ := typeFromAST(*context.Schema(), frag.TypeCondition)
+	ttype, _ := sgraph.typeFromAST(*context.Schema(), frag.TypeCondition)
 	return ttype
 }
 
@@ -1619,7 +1620,7 @@ func VariablesAreInputTypesRule(context *ValidationContext) *ValidationRuleInsta
 			kinds.VariableDefinition: {
 				Kind: func(p visitor.VisitFuncParams) (string, interface{}) {
 					if node, ok := p.Node.(*ast.VariableDefinition); ok && node != nil {
-						ttype, _ := typeFromAST(*context.Schema(), node.Type)
+						ttype, _ := sgraph.typeFromAST(*context.Schema(), node.Type)
 
 						// If the variable type is not an input type, return an error.
 						if ttype != nil && !IsInputType(ttype) {
@@ -1679,7 +1680,7 @@ func VariablesInAllowedPositionRule(context *ValidationContext) *ValidationRuleI
 							}
 							varDef, _ := varDefMap[varName]
 							if varDef != nil && usage.Type != nil {
-								varType, err := typeFromAST(*context.Schema(), varDef.Type)
+								varType, err := sgraph.typeFromAST(*context.Schema(), varDef.Type)
 								if err != nil {
 									varType = nil
 								}
@@ -1797,11 +1798,11 @@ func isValidLiteralValue(ttype Input, valueAST ast.Value) (bool, []string) {
 		}
 		return (len(messagesReduce) == 0), messagesReduce
 	case *Scalar:
-		if isNullish(ttype.ParseLiteral(valueAST)) {
+		if sgraph.isNullish(ttype.ParseLiteral(valueAST)) {
 			return false, []string{fmt.Sprintf(`Expected type "%v", found %v.`, ttype.Name(), printer.Print(valueAST))}
 		}
 	case *Enum:
-		if isNullish(ttype.ParseLiteral(valueAST)) {
+		if sgraph.isNullish(ttype.ParseLiteral(valueAST)) {
 			return false, []string{fmt.Sprintf(`Expected type "%v", found %v.`, ttype.Name(), printer.Print(valueAST))}
 		}
 	}

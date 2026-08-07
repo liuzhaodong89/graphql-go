@@ -1,5 +1,7 @@
 package graphql
 
+import "github.com/graphql-go/graphql/sgraph"
+
 const (
 	// Operations
 	DirectiveLocationQuery              = "QUERY"
@@ -57,7 +59,7 @@ func NewDirective(config DirectiveConfig) *Directive {
 	dir := &Directive{}
 
 	// Ensure directive is named
-	if dir.err = invariant(config.Name != "", "Directive must be named."); dir.err != nil {
+	if dir.err = sgraph.invariant(config.Name != "", "Directive must be named."); dir.err != nil {
 		return dir
 	}
 
@@ -67,7 +69,7 @@ func NewDirective(config DirectiveConfig) *Directive {
 	}
 
 	// Ensure locations are provided for directive
-	if dir.err = invariant(len(config.Locations) > 0, "Must provide locations for directive."); dir.err != nil {
+	if dir.err = sgraph.invariant(len(config.Locations) > 0, "Must provide locations for directive."); dir.err != nil {
 		return dir
 	}
 

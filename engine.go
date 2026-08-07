@@ -15,6 +15,7 @@ import (
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
 	"github.com/graphql-go/graphql/language/printer"
+	"github.com/graphql-go/graphql/sgraph"
 	Lmap "github.com/liuzhaodong89/lockfree-collection/map"
 )
 
@@ -373,9 +374,9 @@ func fieldMapPlanIdentity(fields FieldDefinitionMap) string {
 		raw.WriteString(":resolve=")
 		raw.WriteString(funcIdentity(field.Resolve))
 		raw.WriteString(":batch=")
-		raw.WriteString(funcIdentity(field.BatchResolve))
+		raw.WriteString(funcIdentity(field.BulkResolve))
 		raw.WriteString(":batchKey=")
-		raw.WriteString(field.BatchResultMappedFieldName)
+		raw.WriteString(field.BulkResultMappedFieldName)
 		raw.WriteByte(';')
 	}
 	return raw.String()
@@ -526,6 +527,11 @@ func (e *SGraphEngine) getBatchesFromCacheOrCreate(cacheKey string, plan *SGraph
 }
 
 func (e *SGraphEngine) Execute(document *ast.Document, args map[string]any, operationName *string, root map[string]any, ctx context.Context) *SGraphResult {
+	// 直接调用底层 engine 时不启用半套 extension 生命周期；public Execute 会显式传入 extensions。
+	return e.executeWithExtensions(document, args, operationName, root, ctx, nil)
+}
+
+func (e *SGraphEngine) executeWithExtensions(document *ast.Document, args map[string]any, operationName *string, root map[string]any, ctx context.Context, extensions []sgraph.Extension) *SGraphResult {
 	if e == nil {
 		return NewSGraphErrorResult(errors.New("sgraph engine is nil"))
 	}
@@ -561,7 +567,7 @@ func (e *SGraphEngine) Execute(document *ast.Document, args map[string]any, oper
 		return NewSGraphErrorResult(inputErr)
 	}
 
-	return e.executePlan(plan, cacheKey, inputs, root, ctx)
+	return e.executePlan(plan, cacheKey, inputs, root, ctx, extensions)
 }
 
 func buildPlanCacheKey(document *ast.Document, operationName *string) string {
@@ -594,23 +600,21 @@ func NewSGraphErrorResult(err error) *SGraphResult {
 	return result
 }
 
-func (e *SGraphEngine) executePlan(plan *SGraphPlan, cacheKey string, inputs map[string]any, root map[string]any, ctx context.Context) *SGraphResult {
-	//组装Rundata和context
+func (e *SGraphEngine) executePlan(plan *SGraphPlan, cacheKey string, inputs map[string]any, root map[string]any, ctx context.Context, extensions []sgraph.Extension) *SGraphResult {
+	// 组装本次请求独占的 Rundata；请求数据不能写入可缓存的 plan。
 	maxFieldId := plan.MaxFieldId()
 	rundata := NewRundata(inputs, maxFieldId)
-	// 以下字段是本次请求的 ResolveInfo / extension 上下文，不能写入可缓存的 plan。
+	// ResolveInfo 和 extension 所需的请求状态统一由 Rundata 持有，并通过函数参数显式向下传递。
 	rundata.schema = &e.schema
 	rundata.rootValue = root
 	rundata.operation = plan.operation
 	rundata.fragments = plan.fragments
-	rundata.extensions = sGraphExtensionsFromContext(ctx)
+	rundata.extensions = extensions
 	// Rundata 是请求级对象；必须等 batch 执行和结果组装完成后再释放，避免并发读写和结果污染。
 	defer ReleaseRundata(rundata)
 	if ctx == nil {
 		ctx = context.TODO()
 	}
-	//把本请求变量放进 ctx，供内省 resolver 运行期取（不再捕获 build 期 inputs）
-	ctx = ContextWithInputs(ctx, rundata.originalParams)
 	//组装Batches
 	batches := e.getBatchesFromCacheOrCreate(cacheKey, plan)
 	//遍历执行Batches，判断遇到中断则返回
@@ -1210,22 +1214,18 @@ func (e *SGraphEngine) extractFieldResponse(fieldPlan *FieldPlan, parentResponse
 				return property, nil
 			}
 			// 有 extension 时仍完整触发字段 hook，保持 extension 的可观测行为不变。
-			_, finishHook := startSGraphResolveFieldHook(rundata, fieldPlan, ctx, -1)
-			finishSGraphResolveFieldHook(rundata, finishHook, property, nil)
+			_, _, finishHook := sgraph.startSGraphResolveFieldHook(rundata, fieldPlan, ctx, -1)
+			sgraph.finishSGraphResolveFieldHook(rundata, finishHook, property, nil)
 			return property, nil
 		}
 		// struct/tag/FieldResolver 仍通过原有默认 resolver，并保留 ResolveInfo。
-		fieldCtx, finishHook := startSGraphResolveFieldHook(rundata, fieldPlan, ctx, -1)
-		info := ResolveInfo{}
-		if currentInfo := resolveInfoFromContext(fieldCtx); currentInfo != nil {
-			info = *currentInfo
-		}
+		fieldCtx, info, finishHook := sgraph.startSGraphResolveFieldHook(rundata, fieldPlan, ctx, -1)
 		result, err := DefaultResolveFn(ResolveParams{
 			Source:  parentResponse,
 			Info:    info,
 			Context: fieldCtx,
 		})
-		finishSGraphResolveFieldHook(rundata, finishHook, result, err)
+		sgraph.finishSGraphResolveFieldHook(rundata, finishHook, result, err)
 		return result, err
 	}
 	return nil, nil

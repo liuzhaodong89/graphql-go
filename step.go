@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+
+	"github.com/graphql-go/graphql/sgraph"
 )
 
 type Step interface {
@@ -72,16 +74,16 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 		if s.fieldPlan.IsIntrospectionTypeNameField() {
 			if s.fieldPlan.GetRuntimeTypeResolverFunc() != nil {
 				// __typename 也是一次字段解析，动态类型 resolver 前后同样触发 field extension hook。
-				fieldCtx, finishHook := startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, -1)
+				fieldCtx, _, finishHook := sgraph.startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, -1)
 				typeName := s.fieldPlan.GetRuntimeTypeResolverFunc()(paramContext.parentResponse, &fieldCtx)
 				if typeName == "" {
 					err := errors.New("__typename resolved failed, value is empty")
-					finishSGraphResolveFieldHook(rundata, finishHook, nil, err)
+					sgraph.finishSGraphResolveFieldHook(rundata, finishHook, nil, err)
 					fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FieldErrorTypeField, err, s.fieldPlan.GetPaths())
 					ReleaseFieldResponse(fieldResponse)
 					return fe
 				}
-				finishSGraphResolveFieldHook(rundata, finishHook, typeName, nil)
+				sgraph.finishSGraphResolveFieldHook(rundata, finishHook, typeName, nil)
 				fieldResponse.responses = append(fieldResponse.responses, typeName)
 				rundata.SetFieldResult(s.fieldPlan.GetFieldId(), fieldResponse)
 				return nil
@@ -104,10 +106,10 @@ func (s *NormalStep) Execute(rundata *Rundata, ctx context.Context) *FieldError 
 			ReleaseFieldResponse(fieldResponse)
 			return fe
 		}
-		// 显式 resolver 的 source 保持 nil，执行关系仍由参数依赖决定；ctx 只负责透传 ResolveInfo/extension 信息。
-		fieldCtx, finishHook := startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, -1)
-		res, err := resolverFunc(nil, paramContext.params, fieldCtx)
-		finishSGraphResolveFieldHook(rundata, finishHook, res, err)
+		// 显式 resolver 的 source 保持 nil，执行关系仍由参数依赖决定；ResolveInfo 不再通过 context 隐式传递。
+		fieldCtx, info, finishHook := sgraph.startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, -1)
+		res, err := resolverFunc(nil, paramContext.params, info, fieldCtx)
+		sgraph.finishSGraphResolveFieldHook(rundata, finishHook, res, err)
 		if err != nil {
 			fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FieldErrorTypeField, err, s.fieldPlan.GetPaths())
 			ReleaseFieldResponse(fieldResponse)
@@ -284,6 +286,10 @@ func materializeDirectiveArgs(dp *DirectivePlan, rundata *Rundata) (map[string]a
 			return nil, err
 		}
 		if !handled {
+			if pp.GetParamType() == ParamTypeInput {
+				// 可选指令参数对应的变量未提供时，参数应保持省略，而不是写入 nil。
+				continue
+			}
 			return nil, fmt.Errorf("directive arg %q has unsupported dependency type", pp.GetParamKey())
 		}
 		out[pp.GetParamKey()] = v
@@ -373,9 +379,9 @@ func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldErro
 			}
 
 			// BatchResolve 对应 GraphQL 语义上的一次字段解析，hook 包住整次批量调用。
-			fieldCtx, finishHook := startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, -1)
-			res, err := arrayResolverFunc(nil, arrParamsContext.params, fieldCtx)
-			finishSGraphResolveFieldHook(rundata, finishHook, res, err)
+			fieldCtx, info, finishHook := sgraph.startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, -1)
+			res, err := arrayResolverFunc(nil, arrParamsContext.params, info, fieldCtx)
+			sgraph.finishSGraphResolveFieldHook(rundata, finishHook, res, err)
 			if err != nil {
 				fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FieldErrorTypeField, err, s.fieldPlan.GetPaths())
 				ReleaseFieldResponse(fieldResponse)
@@ -493,16 +499,16 @@ func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldErro
 				if s.fieldPlan.IsIntrospectionTypeNameField() {
 					if s.fieldPlan.GetRuntimeTypeResolverFunc() != nil {
 						// list item 下的 __typename 需要带上 item.index，extension path 才能定位到具体元素。
-						fieldCtx, finishHook := startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, item.index)
+						fieldCtx, _, finishHook := sgraph.startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, item.index)
 						typeName := s.fieldPlan.GetRuntimeTypeResolverFunc()(item.parentResponse, &fieldCtx)
 						if typeName == "" {
 							err := errors.New("__typename resolved failed, value is empty")
-							finishSGraphResolveFieldHook(rundata, finishHook, nil, err)
+							sgraph.finishSGraphResolveFieldHook(rundata, finishHook, nil, err)
 							fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FieldErrorTypeField, err, s.fieldPlan.GetPaths())
 							ReleaseFieldResponse(fieldResponse)
 							return fe
 						}
-						finishSGraphResolveFieldHook(rundata, finishHook, typeName, nil)
+						sgraph.finishSGraphResolveFieldHook(rundata, finishHook, typeName, nil)
 						fieldResponse.responses = append(fieldResponse.responses, typeName)
 						// list 父节点下的 __typename 也要按 parent composite key 回填，避免组装阶段误用空 binding 导致 non-null 冒泡。
 						compositeKey := ""
@@ -524,9 +530,9 @@ func (s *IteratorStep) Execute(rundata *Rundata, ctx context.Context) *FieldErro
 				item.params = beforeResolvedParams
 
 				// 遍历模式下每个父元素都是一次字段解析，hook path 使用当前 item.index。
-				fieldCtx, finishHook := startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, item.index)
-				res, err := resolverFunc(nil, item.params, fieldCtx)
-				finishSGraphResolveFieldHook(rundata, finishHook, res, err)
+				fieldCtx, info, finishHook := sgraph.startSGraphResolveFieldHook(rundata, s.fieldPlan, ctx, item.index)
+				res, err := resolverFunc(nil, item.params, info, fieldCtx)
+				sgraph.finishSGraphResolveFieldHook(rundata, finishHook, res, err)
 				if err != nil {
 					fe := rundata.AddFieldError(s.fieldPlan.GetFieldId(), FieldErrorTypeField, err, s.fieldPlan.GetPaths())
 					ReleaseFieldResponse(fieldResponse)

@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	cmap "github.com/orcaman/concurrent-map/v2"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/graphql-go/graphql/sgraph"
+	cmap "github.com/orcaman/concurrent-map/v2"
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
@@ -44,7 +46,7 @@ func Execute(p ExecuteParams) (result *Result) {
 		ctx = context.Background()
 	}
 	// run executionDidStart functions from extensions
-	extErrs, executionFinishFn := handleExtensionsExecutionDidStart(&p)
+	extErrs, executionFinishFn := sgraph.handleExtensionsExecutionDidStart(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
@@ -57,7 +59,7 @@ func Execute(p ExecuteParams) (result *Result) {
 			result.Errors = append(result.Errors, extErrs...)
 		}
 
-		addExtensionResults(&p, result)
+		sgraph.addExtensionResults(&p, result)
 	}()
 
 	resultChannel := make(chan *Result, 2)
@@ -88,11 +90,8 @@ func Execute(p ExecuteParams) (result *Result) {
 		if engineCtx == nil {
 			engineCtx = ctx
 		}
-		if len(p.Schema.extensions) > 0 {
-			// execution hook 已在 public Execute 中触发；这里仅把 extensions 传给 GraphSoul 的 field hook。
-			engineCtx = contextWithSGraphExtensions(engineCtx, p.Schema.extensions)
-		}
-		result = engine.Execute(p.AST, p.Args, operationName, root, engineCtx).ToGraphQLResult()
+		// execution hook 已在 public Execute 中触发；extensions 显式传给 GraphSoul 的 field hook。
+		result = engine.executeWithExtensions(p.AST, p.Args, operationName, root, engineCtx, p.Schema.extensions).ToGraphQLResult()
 		resultChannel <- result
 	}()
 
@@ -114,7 +113,7 @@ func ExecuteGraphQLGo(p ExecuteParams) (result *Result) {
 		ctx = context.Background()
 	}
 	// run executionDidStart functions from extensions
-	extErrs, executionFinishFn := handleExtensionsExecutionDidStart(&p)
+	extErrs, executionFinishFn := sgraph.handleExtensionsExecutionDidStart(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
@@ -127,7 +126,7 @@ func ExecuteGraphQLGo(p ExecuteParams) (result *Result) {
 			result.Errors = append(result.Errors, extErrs...)
 		}
 
-		addExtensionResults(&p, result)
+		sgraph.addExtensionResults(&p, result)
 	}()
 
 	resultChannel := make(chan *Result, 2)
@@ -227,7 +226,7 @@ func buildExecutionContext(p buildExecutionCtxParams) (*executionContext, error)
 		return nil, fmt.Errorf(`Must provide an operation.`)
 	}
 
-	variableValues, err := getVariableValues(p.Schema, operation.GetVariableDefinitions(), p.Args)
+	variableValues, err := sgraph.getVariableValues(p.Schema, operation.GetVariableDefinitions(), p.Args)
 	if err != nil {
 		return nil, err
 	}
@@ -602,13 +601,13 @@ func shouldIncludeNode(eCtx *executionContext, directives []*ast.Directive) bool
 	}
 	// precedence: skipAST > includeAST
 	if skipAST != nil {
-		argValues = getArgumentValues(SkipDirective.Args, skipAST.Arguments, eCtx.VariableValues)
+		argValues = sgraph.getArgumentValues(SkipDirective.Args, skipAST.Arguments, eCtx.VariableValues)
 		if skipIf, ok := argValues["if"].(bool); ok && skipIf {
 			return false // excluded selectionSet's fields
 		}
 	}
 	if includeAST != nil {
-		argValues = getArgumentValues(IncludeDirective.Args, includeAST.Arguments, eCtx.VariableValues)
+		argValues = sgraph.getArgumentValues(IncludeDirective.Args, includeAST.Arguments, eCtx.VariableValues)
 		if includeIf, ok := argValues["if"].(bool); ok && !includeIf {
 			return false // excluded selectionSet's fields
 		}
@@ -625,7 +624,7 @@ func doesFragmentConditionMatch(eCtx *executionContext, fragment ast.Node, ttype
 		if typeConditionAST == nil {
 			return true
 		}
-		conditionalType, err := typeFromAST(eCtx.Schema, typeConditionAST)
+		conditionalType, err := sgraph.typeFromAST(eCtx.Schema, typeConditionAST)
 		if err != nil {
 			return false
 		}
@@ -646,7 +645,7 @@ func doesFragmentConditionMatch(eCtx *executionContext, fragment ast.Node, ttype
 		if typeConditionAST == nil {
 			return true
 		}
-		conditionalType, err := typeFromAST(eCtx.Schema, typeConditionAST)
+		conditionalType, err := sgraph.typeFromAST(eCtx.Schema, typeConditionAST)
 		if err != nil {
 			return false
 		}
@@ -728,7 +727,7 @@ func resolveField(eCtx *executionContext, parentType *Object, source interface{}
 	// Build a map of arguments from the field.arguments AST, using the
 	// variables scope to fulfill any variable references.
 	// TODO: find a way to memoize, in case this field is within a List type.
-	args := getArgumentValues(fieldDef.Args, fieldAST.Arguments, eCtx.VariableValues)
+	args := sgraph.getArgumentValues(fieldDef.Args, fieldAST.Arguments, eCtx.VariableValues)
 
 	info := ResolveInfo{
 		FieldName:      fieldName,
@@ -745,7 +744,7 @@ func resolveField(eCtx *executionContext, parentType *Object, source interface{}
 
 	var resolveFnError error
 
-	extErrs, resolveFieldFinishFn := handleExtensionsResolveFieldDidStart(eCtx.Schema.extensions, eCtx, &info)
+	extErrs, resolveFieldFinishFn := sgraph.handleExtensionsResolveFieldDidStart(eCtx.Schema.extensions, eCtx, &info)
 	if len(extErrs) != 0 {
 		eCtx.Errors = append(eCtx.Errors, extErrs...)
 	}
@@ -813,7 +812,7 @@ func completeValue(eCtx *executionContext, returnType Type, fieldASTs []*ast.Fie
 	}
 
 	// If result value is null-ish (null, undefined, or NaN) then return null.
-	if isNullish(result) {
+	if sgraph.isNullish(result) {
 		return nil
 	}
 
@@ -846,7 +845,7 @@ func completeValue(eCtx *executionContext, returnType Type, fieldASTs []*ast.Fie
 	}
 
 	// Not reachable. All possible output types have been considered.
-	err := invariantf(false,
+	err := sgraph.invariantf(false,
 		`Cannot complete value of unexpected type "%v."`, returnType)
 
 	if err != nil {
@@ -904,7 +903,7 @@ func completeAbstractValue(eCtx *executionContext, returnType Abstract, fieldAST
 		runtimeType = defaultResolveTypeFn(resolveTypeParams, returnType)
 	}
 
-	err := invariantf(runtimeType != nil, `Abstract type %v must resolve to an Object type at runtime `+
+	err := sgraph.invariantf(runtimeType != nil, `Abstract type %v must resolve to an Object type at runtime `+
 		`for field %v.%v with value "%v", received "%v".`, returnType, info.ParentType, info.FieldName, result, runtimeType,
 	)
 	if err != nil {
@@ -972,7 +971,7 @@ func completeObjectValue(eCtx *executionContext, returnType *Object, fieldASTs [
 // completeLeafValue complete a leaf value (Scalar / Enum) by serializing to a valid value, returning nil if serialization is not possible.
 func completeLeafValue(returnType Leaf, result interface{}) interface{} {
 	serializedResult := returnType.Serialize(result)
-	if isNullish(serializedResult) {
+	if sgraph.isNullish(serializedResult) {
 		return nil
 	}
 	return serializedResult
@@ -988,8 +987,8 @@ func completeListValue(eCtx *executionContext, returnType *List, fieldASTs []*as
 	if info.ParentType != nil {
 		parentTypeName = info.ParentType.Name()
 	}
-	err := invariantf(
-		resultVal.IsValid() && isIterable(result),
+	err := sgraph.invariantf(
+		resultVal.IsValid() && sgraph.isIterable(result),
 		"User Error: expected iterable, but did not find one "+
 			"for field %v.%v.", parentTypeName, info.FieldName)
 

@@ -1,9 +1,10 @@
-package graphql
+package sgraph
 
 import (
 	"context"
 	"fmt"
 
+	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/gqlerrors"
 )
 
@@ -19,9 +20,9 @@ type (
 	validationFinishFuncHandler func([]gqlerrors.FormattedError) []gqlerrors.FormattedError
 
 	// ExecutionFinishFunc is called when the execution is done
-	ExecutionFinishFunc func(*Result)
+	ExecutionFinishFunc func(*graphql.Result)
 	// executionFinishFuncHandler calls all the ExecutionFinishFuncs from each extension
-	executionFinishFuncHandler func(*Result) []gqlerrors.FormattedError
+	executionFinishFuncHandler func(*graphql.Result) []gqlerrors.FormattedError
 
 	// ResolveFieldFinishFunc is called with the result of the ResolveFn and the error it returned
 	ResolveFieldFinishFunc func(interface{}, error)
@@ -32,7 +33,7 @@ type (
 // Extension is an interface for extensions in graphql
 type Extension interface {
 	// Init is used to help you initialize the extension
-	Init(context.Context, *Params) context.Context
+	Init(context.Context, *graphql.Params) context.Context
 
 	// Name returns the name of the extension (make sure it's custom)
 	Name() string
@@ -47,7 +48,7 @@ type Extension interface {
 	ExecutionDidStart(context.Context) (context.Context, ExecutionFinishFunc)
 
 	// ResolveFieldDidStart notifies about the start of the resolving of a field
-	ResolveFieldDidStart(context.Context, *ResolveInfo) (context.Context, ResolveFieldFinishFunc)
+	ResolveFieldDidStart(context.Context, *graphql.ResolveInfo) (context.Context, ResolveFieldFinishFunc)
 
 	// HasResult returns if the extension wants to add data to the result
 	HasResult() bool
@@ -57,7 +58,7 @@ type Extension interface {
 }
 
 // handleExtensionsInits handles all the init functions for all the extensions in the schema
-func handleExtensionsInits(p *Params) gqlerrors.FormattedErrors {
+func handleExtensionsInits(p *graphql.Params) gqlerrors.FormattedErrors {
 	errs := gqlerrors.FormattedErrors{}
 	for _, ext := range p.Schema.extensions {
 		func() {
@@ -75,7 +76,7 @@ func handleExtensionsInits(p *Params) gqlerrors.FormattedErrors {
 }
 
 // handleExtensionsParseDidStart runs the ParseDidStart functions for each extension
-func handleExtensionsParseDidStart(p *Params) ([]gqlerrors.FormattedError, parseFinishFuncHandler) {
+func handleExtensionsParseDidStart(p *graphql.Params) ([]gqlerrors.FormattedError, parseFinishFuncHandler) {
 	fs := map[string]ParseFinishFunc{}
 	errs := gqlerrors.FormattedErrors{}
 	for _, ext := range p.Schema.extensions {
@@ -114,7 +115,7 @@ func handleExtensionsParseDidStart(p *Params) ([]gqlerrors.FormattedError, parse
 }
 
 // handleExtensionsValidationDidStart notifies the extensions about the start of the validation process
-func handleExtensionsValidationDidStart(p *Params) ([]gqlerrors.FormattedError, validationFinishFuncHandler) {
+func handleExtensionsValidationDidStart(p *graphql.Params) ([]gqlerrors.FormattedError, validationFinishFuncHandler) {
 	fs := map[string]ValidationFinishFunc{}
 	errs := gqlerrors.FormattedErrors{}
 	for _, ext := range p.Schema.extensions {
@@ -153,7 +154,7 @@ func handleExtensionsValidationDidStart(p *Params) ([]gqlerrors.FormattedError, 
 }
 
 // handleExecutionDidStart handles the ExecutionDidStart functions
-func handleExtensionsExecutionDidStart(p *ExecuteParams) ([]gqlerrors.FormattedError, executionFinishFuncHandler) {
+func handleExtensionsExecutionDidStart(p *graphql.ExecuteParams) ([]gqlerrors.FormattedError, executionFinishFuncHandler) {
 	fs := map[string]ExecutionFinishFunc{}
 	errs := gqlerrors.FormattedErrors{}
 	for _, ext := range p.Schema.extensions {
@@ -174,7 +175,7 @@ func handleExtensionsExecutionDidStart(p *ExecuteParams) ([]gqlerrors.FormattedE
 			fs[ext.Name()] = finishFn
 		}()
 	}
-	return errs, func(result *Result) []gqlerrors.FormattedError {
+	return errs, func(result *graphql.Result) []gqlerrors.FormattedError {
 		extErrs := gqlerrors.FormattedErrors{}
 		for name, finishFn := range fs {
 			func() {
@@ -191,50 +192,14 @@ func handleExtensionsExecutionDidStart(p *ExecuteParams) ([]gqlerrors.FormattedE
 	}
 }
 
-var sGraphExtensionsContextKey = &struct{}{}
-var resolveInfoContextKey = &struct{}{}
-
-func contextWithSGraphExtensions(ctx context.Context, extensions []Extension) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	// 只有 public Execute 会写入 extensions；底层 SGraphEngine.Execute 不主动启用半套 extension 生命周期。
-	return context.WithValue(ctx, sGraphExtensionsContextKey, extensions)
-}
-
-func sGraphExtensionsFromContext(ctx context.Context) []Extension {
-	if ctx == nil {
-		return nil
-	}
-	// 没有从 public Execute 进入时返回 nil，GraphSoul 不会只触发 field hook 而跳过 execution hook。
-	extensions, _ := ctx.Value(sGraphExtensionsContextKey).([]Extension)
-	return extensions
-}
-
-func contextWithResolveInfo(ctx context.Context, info *ResolveInfo) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	// GraphSoul 内部 ResolverFunc 签名不带 ResolveInfo；通过 ctx 传给 wrapResolverFunc 填充 ResolveParams.Info。
-	return context.WithValue(ctx, resolveInfoContextKey, info)
-}
-
-func resolveInfoFromContext(ctx context.Context) *ResolveInfo {
-	if ctx == nil {
-		return nil
-	}
-	info, _ := ctx.Value(resolveInfoContextKey).(*ResolveInfo)
-	return info
-}
-
 // handleResolveFieldDidStart handles the notification of the extensions about the start of a resolve function
-func handleExtensionsResolveFieldDidStart(exts []Extension, p *executionContext, i *ResolveInfo) ([]gqlerrors.FormattedError, resolveFieldFinishFuncHandler) {
+func handleExtensionsResolveFieldDidStart(exts []Extension, p *graphql.executionContext, i *graphql.ResolveInfo) ([]gqlerrors.FormattedError, resolveFieldFinishFuncHandler) {
 	errs, ctx, finish := handleExtensionsResolveFieldDidStartWithContext(exts, p.Context, i)
 	p.Context = ctx
 	return errs, finish
 }
 
-func handleExtensionsResolveFieldDidStartWithContext(exts []Extension, ctx context.Context, i *ResolveInfo) ([]gqlerrors.FormattedError, context.Context, resolveFieldFinishFuncHandler) {
+func handleExtensionsResolveFieldDidStartWithContext(exts []Extension, ctx context.Context, i *graphql.ResolveInfo) ([]gqlerrors.FormattedError, context.Context, resolveFieldFinishFuncHandler) {
 	fs := map[string]ResolveFieldFinishFunc{}
 	errs := gqlerrors.FormattedErrors{}
 	currentCtx := ctx
@@ -278,28 +243,27 @@ func handleExtensionsResolveFieldDidStartWithContext(exts []Extension, ctx conte
 	}
 }
 
-func startSGraphResolveFieldHook(rundata *Rundata, fieldPlan *FieldPlan, ctx context.Context, listIndex int) (context.Context, resolveFieldFinishFuncHandler) {
+func startSGraphResolveFieldHook(rundata *graphql.Rundata, fieldPlan *graphql.FieldPlan, ctx context.Context, listIndex int) (context.Context, graphql.ResolveInfo, resolveFieldFinishFuncHandler) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if rundata == nil || fieldPlan == nil {
-		return ctx, nil
+		return ctx, graphql.ResolveInfo{}, nil
 	}
 
-	// ResolveInfo 需要同时包含 build 期字段元数据和请求期变量/root/fragments。
+	// ResolveInfo 由 plan 元数据和本次请求的 Rundata 共同生成，并显式传给 resolver。
 	info := buildSGraphResolveInfo(rundata, fieldPlan, responsePathForFieldPlan(fieldPlan, listIndex))
-	fieldCtx := contextWithResolveInfo(ctx, &info)
 	if len(rundata.extensions) == 0 {
-		// 即使没有 extension，也要让 wrapResolverFunc 能从 ctx 取到 ResolveInfo。
-		return fieldCtx, nil
+		return ctx, info, nil
 	}
 
-	extErrs, extCtx, finish := handleExtensionsResolveFieldDidStartWithContext(rundata.extensions, fieldCtx, &info)
+	// extension 返回的 context 仍继续传给 resolver，用于保留 trace/span 等调用链信息。
+	extErrs, extCtx, finish := handleExtensionsResolveFieldDidStartWithContext(rundata.extensions, ctx, &info)
 	rundata.AddExtensionErrors(extErrs)
-	return contextWithResolveInfo(extCtx, &info), finish
+	return extCtx, info, finish
 }
 
-func finishSGraphResolveFieldHook(rundata *Rundata, finish resolveFieldFinishFuncHandler, val interface{}, err error) {
+func finishSGraphResolveFieldHook(rundata *graphql.Rundata, finish resolveFieldFinishFuncHandler, val interface{}, err error) {
 	if finish == nil {
 		return
 	}
@@ -310,9 +274,9 @@ func finishSGraphResolveFieldHook(rundata *Rundata, finish resolveFieldFinishFun
 	}
 }
 
-func buildSGraphResolveInfo(rundata *Rundata, fieldPlan *FieldPlan, path *ResponsePath) ResolveInfo {
+func buildSGraphResolveInfo(rundata *graphql.Rundata, fieldPlan *graphql.FieldPlan, path *graphql.ResponsePath) graphql.ResolveInfo {
 	// plan 中只缓存 schema/AST 结构信息，请求相关的变量、root 和 extension 状态都来自 Rundata。
-	info := ResolveInfo{
+	info := graphql.ResolveInfo{
 		FieldName:      fieldPlan.fieldName,
 		FieldASTs:      fieldPlan.fieldASTs,
 		Path:           path,
@@ -327,18 +291,18 @@ func buildSGraphResolveInfo(rundata *Rundata, fieldPlan *FieldPlan, path *Respon
 		info.Schema = *rundata.schema
 	}
 	if info.ReturnType == nil {
-		if returnType, ok := fieldPlan.fieldValueMetaInfo.OriginalType.(Output); ok {
+		if returnType, ok := fieldPlan.fieldValueMetaInfo.OriginalType.(graphql.Output); ok {
 			info.ReturnType = returnType
 		}
 	}
 	return info
 }
 
-func responsePathForFieldPlan(fieldPlan *FieldPlan, listIndex int) *ResponsePath {
+func responsePathForFieldPlan(fieldPlan *graphql.FieldPlan, listIndex int) *graphql.ResponsePath {
 	if fieldPlan == nil {
 		return nil
 	}
-	var path *ResponsePath
+	var path *graphql.ResponsePath
 	paths := fieldPlan.GetPaths()
 	for i, key := range paths {
 		if listIndex >= 0 && i == len(paths)-1 {
@@ -350,7 +314,7 @@ func responsePathForFieldPlan(fieldPlan *FieldPlan, listIndex int) *ResponsePath
 	return path
 }
 
-func addExtensionResults(p *ExecuteParams, result *Result) {
+func addExtensionResults(p *graphql.ExecuteParams, result *graphql.Result) {
 	if len(p.Schema.extensions) != 0 {
 		for _, ext := range p.Schema.extensions {
 			func() {

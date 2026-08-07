@@ -2,7 +2,9 @@ package graphql
 
 import (
 	"context"
+
 	"github.com/graphql-go/graphql/language/ast"
+	"github.com/graphql-go/graphql/sgraph"
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/parser"
@@ -49,7 +51,7 @@ func Do(p Params) *Result {
 		Name: "GraphQL request",
 	})
 	//extErrs := make([]gqlerrors.FormattedError, 0)
-	var parseFinishFn parseFinishFuncHandler
+	var parseFinishFn sgraph.parseFinishFuncHandler
 	var AST *ast.Document
 	var err error
 
@@ -57,7 +59,7 @@ func Do(p Params) *Result {
 
 	//if !exist {
 	// run init on the extensions
-	extErrs := handleExtensionsInits(&p)
+	extErrs := sgraph.handleExtensionsInits(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
@@ -67,7 +69,7 @@ func Do(p Params) *Result {
 	//	AST = astVal.(*ast.Document)
 	//}
 
-	extErrs, parseFinishFn = handleExtensionsParseDidStart(&p)
+	extErrs, parseFinishFn = sgraph.handleExtensionsParseDidStart(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
@@ -98,7 +100,7 @@ func Do(p Params) *Result {
 	}
 
 	// notify extensions about the start of the validation
-	extErrs, validationFinishFn := handleExtensionsValidationDidStart(&p)
+	extErrs, validationFinishFn := sgraph.handleExtensionsValidationDidStart(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,

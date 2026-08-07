@@ -7,6 +7,7 @@ import (
 
 	"github.com/graphql-go/graphql/language/ast"
 	"github.com/graphql-go/graphql/language/printer"
+	"github.com/graphql-go/graphql/sgraph"
 )
 
 const (
@@ -259,7 +260,7 @@ func init() {
 						if inputVal.DefaultValue == nil {
 							return nil, nil
 						}
-						if isNullish(inputVal.DefaultValue) {
+						if sgraph.isNullish(inputVal.DefaultValue) {
 							return nil, nil
 						}
 						astVal := astFromValue(inputVal.DefaultValue, inputVal)
@@ -697,7 +698,7 @@ func astFromValue(value interface{}, ttype Type) ast.Value {
 		val := astFromValue(value, ttype.OfType)
 		return val
 	}
-	if isNullish(value) {
+	if sgraph.isNullish(value) {
 		return nil
 	}
 	valueVal := reflect.ValueOf(value)

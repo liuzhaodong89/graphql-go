@@ -25,7 +25,7 @@ type TypeRuntimeScope struct {
 
 const DefaultParamKeyTypename = "typeName"
 
-var TypeNameResolverFunc = func(source any, params map[string]any, ctx context.Context) (any, error) {
+var TypeNameResolverFunc = func(source any, params map[string]any, info ResolveInfo, ctx context.Context) (any, error) {
 	if params != nil {
 		if typeName, ok := params[DefaultParamKeyTypename].(string); ok {
 			return typeName, nil
@@ -840,16 +840,11 @@ func (builder *PlanBuilder) wrapResolverFunc(fieldResolveFn FieldResolveFn) Reso
 	type firstResponseGetter interface {
 		GetFirstResponse() any
 	}
-	return func(source any, params map[string]any, ctx context.Context) (any, error) {
+	return func(source any, params map[string]any, info ResolveInfo, ctx context.Context) (any, error) {
 		actualSource := source
 		if wrappedSource, ok := source.(firstResponseGetter); ok {
 			// 兼容内部 FieldResponse 包装值；GraphSoul 的业务 resolver source 仍由调用点决定。
 			actualSource = wrappedSource.GetFirstResponse()
-		}
-		info := ResolveInfo{}
-		if currentInfo := resolveInfoFromContext(ctx); currentInfo != nil {
-			// GraphSoul ResolverFunc 签名没有 ResolveInfo，执行前通过 ctx 注入，再还原成 graphql-go 的 ResolveParams。
-			info = *currentInfo
 		}
 		return fieldResolveFn(ResolveParams{
 			Source:  actualSource,
@@ -972,7 +967,16 @@ func (builder *PlanBuilder) parseParamPlansByArgDefs(argDefs []*Argument, argAST
 			if variable.Name == nil {
 				return nil, fmt.Errorf("invalid variable name")
 			}
-			result = append(result, NewInputParamPlan(argDef.PrivateName, variable.Name.Value))
+			inputPlan := NewInputParamPlan(argDef.PrivateName, variable.Name.Value)
+			if argDef.DefaultValue != nil {
+				parsedDefault, parsedDefaultErr := builder.parseInputValue(argDef.Type, argDef.DefaultValue)
+				if parsedDefaultErr != nil {
+					return nil, parsedDefaultErr
+				}
+				// Plan 只记录 Schema 默认值；是否采用默认值由请求期参数组装根据变量是否存在决定。
+				inputPlan.inputDefaultValue = parsedDefault
+			}
+			result = append(result, inputPlan)
 			continue
 		}
 
@@ -1015,26 +1019,6 @@ func astContainsVariable(v ast.Value) bool {
 		}
 	}
 	return false
-}
-
-type inputsContextKeyType struct{}
-
-var inputsContextKey = inputsContextKeyType{}
-
-// ContextWithInputs 把本请求（已协变）变量放进 ctx，供内省 resolver 运行期读取。
-func ContextWithInputs(ctx context.Context, inputs map[string]any) context.Context {
-	return context.WithValue(ctx, inputsContextKey, inputs)
-}
-
-// InputsFromContext 取出本请求变量；不存在返回 nil（按未提供处理）。
-func InputsFromContext(ctx context.Context) map[string]any {
-	if ctx == nil {
-		return nil
-	}
-	if v, ok := ctx.Value(inputsContextKey).(map[string]any); ok {
-		return v
-	}
-	return nil
 }
 
 func (builder *PlanBuilder) parseParamPlans(args []*ast.Argument) ([]*ParamPlan, error) {
@@ -1241,7 +1225,7 @@ func (builder *PlanBuilder) parseIntrospectionMetaTypeField(current ast.Field, p
 		return nil, childrenFieldsErr
 	}
 	//resolverFunc
-	resolverFunc := func(source any, params map[string]any, ctx context.Context) (any, error) {
+	resolverFunc := func(source any, params map[string]any, info ResolveInfo, ctx context.Context) (any, error) {
 		name, _ := params["name"].(string)
 		if name == "" {
 			return nil, nil
@@ -1250,7 +1234,8 @@ func (builder *PlanBuilder) parseIntrospectionMetaTypeField(current ast.Field, p
 		if t == nil {
 			return nil, nil
 		}
-		return GenerateTypeMetaResult(builder.schema, t, childrenFields, InputsFromContext(ctx)), nil
+		// 内省参数可能引用请求变量；变量通过 ResolveInfo 显式传入，不再隐藏在 context 中。
+		return GenerateTypeMetaResult(builder.schema, t, childrenFields, info.VariableValues), nil
 	}
 	fieldPlan := &FieldPlan{
 		fieldId:                    fieldId,
@@ -1329,8 +1314,9 @@ func (builder *PlanBuilder) parseIntrospectionMetaSchemaField(current ast.Field,
 		return nil, childrenFieldsErr
 	}
 	//resolverFunc
-	resolverFunc := func(source any, params map[string]any, ctx context.Context) (any, error) {
-		return GenerateSchemaMetaResult(builder.schema, childrenFields, InputsFromContext(ctx)), nil
+	resolverFunc := func(source any, params map[string]any, info ResolveInfo, ctx context.Context) (any, error) {
+		// 内省参数可能引用请求变量；变量通过 ResolveInfo 显式传入，不再隐藏在 context 中。
+		return GenerateSchemaMetaResult(builder.schema, childrenFields, info.VariableValues), nil
 	}
 
 	fieldPlan := &FieldPlan{
@@ -1386,7 +1372,7 @@ func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeR
 	paths = append(parentPaths, responseName)
 	// parentKeyFieldName 只用于父 list 下 resolver 结果回填；无 resolver 字段直接从父 item 取值。
 	parentKeyFieldName = builder.checkAndParseParentKeyFieldNames(parentFieldIsList, parentTypeScope)
-	fieldHasResolver := fieldDefinition.Resolve != nil || fieldDefinition.BatchResolve != nil
+	fieldHasResolver := fieldDefinition.Resolve != nil || fieldDefinition.BulkResolve != nil
 	if parentFieldIsList && fieldHasResolver && parentKeyFieldName == "" {
 		return nil, fmt.Errorf("parent key field name for resolver result binding is empty")
 	}
@@ -1405,8 +1391,8 @@ func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeR
 	}
 
 	//resultParentKeyName
-	resultParentKeyName = fieldDefinition.BatchResultMappedFieldName
-	if fieldDefinition.BatchResolve != nil && fieldDefinition.BatchResultMappedFieldName == "" {
+	resultParentKeyName = fieldDefinition.BulkResultMappedFieldName
+	if fieldDefinition.BulkResolve != nil && fieldDefinition.BulkResultMappedFieldName == "" {
 		return nil, fmt.Errorf("result parent key field name for result binding is empty")
 	}
 
@@ -1425,7 +1411,7 @@ func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeR
 	if typeRuntimeScopeErr != nil {
 		return nil, typeRuntimeScopeErr
 	}
-	usesNormalResolver := fieldDefinition.Resolve != nil && (!parentFieldIsList || fieldDefinition.BatchResolve == nil)
+	usesNormalResolver := fieldDefinition.Resolve != nil && (!parentFieldIsList || fieldDefinition.BulkResolve == nil)
 	needParentFieldFullResult := parentFieldId > 0 &&
 		usesNormalResolver &&
 		(parentFieldIsList || (parentTypeScope != nil && parentTypeScope.GetDynamicTypeResolverFunction() != nil))
@@ -1479,7 +1465,7 @@ func (builder *PlanBuilder) parseField(current ast.Field, parentTypeScope *TypeR
 		paramPlans:                 paramPlans,
 		resolverFunc:               builder.wrapResolverFunc(fieldDefinition.Resolve),
 		arrParamPlans:              arrayParamPlans,
-		arrayResolverFunc:          builder.wrapResolverFunc(fieldDefinition.BatchResolve),
+		arrayResolverFunc:          builder.wrapResolverFunc(fieldDefinition.BulkResolve),
 		allowedRuntimeTypeNames:    parentTypeScope.GetAllowedTypeNamesForField(),
 		runtimeTypeResolverFunc:    parentTypeScope.GetDynamicTypeResolverFunction(),
 		compiledTypeName:           parentTypeScope.GetStaticTypeName(),
