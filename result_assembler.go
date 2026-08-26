@@ -1,16 +1,14 @@
-package sgraph
+package graphql
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"reflect"
-
-	"github.com/graphql-go/graphql"
 )
 
 type SGraphResultAssembler struct {
-	schema *graphql.Schema
+	schema *Schema
 }
 
 func (a *SGraphResultAssembler) assembleGraphResult(plan *SGraphExecutionPlan, rundata *Rundata, root map[string]any, ctx context.Context) *SGraphResult {
@@ -21,13 +19,19 @@ func (a *SGraphResultAssembler) assembleGraphResult(plan *SGraphExecutionPlan, r
 
 	roots := plan.roots
 	orderedResponsesMap := newSGraphResponseOrderedMap(len(roots))
+	// FieldPlan保存静态responseName，请求期只复用List下标栈，避免递归组装时反复复制完整路径。
+	if cap(rundata.assemblyListIndexes) < plan.maxListPathDepth {
+		rundata.assemblyListIndexes = make([]int, 0, plan.maxListPathDepth)
+	} else {
+		rundata.assemblyListIndexes = rundata.assemblyListIndexes[:0]
+	}
 
 	for _, rootField := range roots {
 		rootFieldWrapperTypeInfo := rootField.fieldWrapperTypeInfo
 		//组装阶段再次判断include/skip指令
 		included, includeErr := evaluateSkipIncludeDirectivesShouldExecuteField(rootField, rundata, ctx)
 		if includeErr != nil {
-			rundata.addFieldError(rootField.fieldId, FieldErrorTypeField, includeErr, rootField.paths)
+			rundata.addFieldErrorAtPlanPath(rootField, FieldErrorTypeField, includeErr, rundata.assemblyListIndexes)
 			if rootFieldWrapperTypeInfo.notNil {
 				orderedResponsesMap = nil
 				break
@@ -73,6 +77,7 @@ func (a *SGraphResultAssembler) assembleGraphResult(plan *SGraphExecutionPlan, r
 			}
 		}
 	}
+	rundata.flushPendingBulkBindingErrors()
 	result.orderedResponses = orderedResponsesMap
 	result.errors = rundata.getAllFieldErrors()
 	result.extensionErrors = rundata.getAllExtensionErrors()
@@ -100,7 +105,7 @@ func (a *SGraphResultAssembler) buildObjectFieldValue(fieldPlan *FieldPlan, pare
 			//根据skip和include指令判断是否组装
 			included, includeErr := evaluateSkipIncludeDirectivesShouldExecuteField(child, rundata, ctx)
 			if includeErr != nil {
-				rundata.addFieldError(child.fieldId, FieldErrorTypeField, includeErr, child.paths)
+				rundata.addFieldErrorAtPlanPath(child, FieldErrorTypeField, includeErr, rundata.assemblyListIndexes)
 				if childWrapperTypeInfo.notNil {
 					return nil
 				}
@@ -165,8 +170,8 @@ func (a *SGraphResultAssembler) buildListFieldValue(field *FieldPlan, parentResp
 	}
 	fieldResponseAsList, fieldResponseAsListOk := asListValue(fieldResponse)
 	if !fieldResponseAsListOk {
-		err := fmt.Errorf("field response is not a list %s", FieldPlan{}.fieldName)
-		rundata.addFieldError(field.fieldId, FieldErrorTypeField, err, field.paths)
+		err := fmt.Errorf("field response is not a list %s", field.fieldName)
+		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 		return nil
 	}
 
@@ -177,17 +182,24 @@ func (a *SGraphResultAssembler) buildListFieldValue(field *FieldPlan, parentResp
 func (a *SGraphResultAssembler) buildListValueItems(field *FieldPlan, elementWrappTypeInfo *FieldWrapperTypeInfo, items []any, rundata *Rundata, ctx context.Context) []any {
 	if elementWrappTypeInfo == nil {
 		err := fmt.Errorf("list field %s has no element wrapper type info", field.fieldName)
-		rundata.addFieldError(field.fieldId, FieldErrorTypeField, err, field.paths)
+		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 		return nil
 	}
 
+	baseListDepth := len(rundata.assemblyListIndexes)
+	defer func() {
+		// 递归和提前返回都必须恢复栈深度，避免污染后续字段的错误路径。
+		rundata.assemblyListIndexes = rundata.assemblyListIndexes[:baseListDepth]
+	}()
+
 	result := make([]any, 0, len(items))
-	for _, item := range items {
+	for index, item := range items {
+		rundata.assemblyListIndexes = append(rundata.assemblyListIndexes[:baseListDepth], index)
 		if isNilInterfaceValue(item) {
 			if elementWrappTypeInfo.notNil {
-				if rundata.fieldErrors[field.fieldId].Load() == nil {
+				if !rundata.hasFieldErrorAtPlanPath(field, rundata.assemblyListIndexes) {
 					err := fmt.Errorf("cannot return null for non-nullable list element of field %s", field.responseName)
-					rundata.addFieldError(field.fieldId, FieldErrorTypeField, err, field.paths)
+					rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 				}
 				return nil
 			}
@@ -199,7 +211,7 @@ func (a *SGraphResultAssembler) buildListValueItems(field *FieldPlan, elementWra
 			childItems, ok := asListValue(item)
 			if !ok {
 				err := fmt.Errorf("expected iterable list element for field %s", field.responseName)
-				rundata.addFieldError(field.fieldId, FieldErrorTypeField, err, field.paths)
+				rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 				if elementWrappTypeInfo.notNil {
 					return nil
 				}
@@ -263,7 +275,7 @@ func (a *SGraphResultAssembler) buildObjectItemInListValueItems(fieldPlan *Field
 			included, includeErr := evaluateSkipIncludeDirectivesShouldExecuteField(child, rundata, ctx)
 			if includeErr != nil {
 				//指令执行错误时处理null值冒泡
-				rundata.addFieldError(child.fieldId, FieldErrorTypeField, includeErr, child.paths)
+				rundata.addFieldErrorAtPlanPath(child, FieldErrorTypeField, includeErr, rundata.assemblyListIndexes)
 				if childWrapperTypeInfo.notNil {
 					return nil
 				}
@@ -277,13 +289,13 @@ func (a *SGraphResultAssembler) buildObjectItemInListValueItems(fieldPlan *Field
 				if !evaluateCompiledTypeShouldExecuteField(child, ctx) {
 					continue
 				}
-			} else if !evaluateDynamicTypeShouldExecuteField(child, currentFieldResponse, ctx) {
+			} else if !evaluateRuntimeAllowedTypeShouldExecuteField(child, runtimeTypeName) {
 				continue
 			}
 
 			if child.isIntrospectionTypeNameField() && child.fieldTypeScope.dynamicTypeResolver != nil {
 				if runtimeTypeName == "" {
-					rundata.addFieldError(child.fieldId, FieldErrorTypeField, errors.New("__typename resolved failed, value is empty"), child.paths)
+					rundata.addFieldErrorAtPlanPath(child, FieldErrorTypeField, errors.New("__typename resolved failed, value is empty"), rundata.assemblyListIndexes)
 					//null值冒泡
 					if childWrapperTypeInfo.notNil {
 						return nil
@@ -295,7 +307,7 @@ func (a *SGraphResultAssembler) buildObjectItemInListValueItems(fieldPlan *Field
 				if serialized == nil && childWrapperTypeInfo.notNil {
 					return nil
 				}
-				result.set(child.responseName, nil)
+				result.set(child.responseName, serialized)
 				continue
 			}
 			if childWrapperTypeInfo.isList {
@@ -319,53 +331,11 @@ func (a *SGraphResultAssembler) buildObjectItemInListValueItems(fieldPlan *Field
 					}
 					result.set(child.responseName, childResult)
 				case FIELD_ELEMENT_TYPE_SCALAR, FIELD_ELEMENT_TYPE_ENUM:
-					childResult := rundata.getFieldResponseByFieldId(child.fieldId)
-					if childResult != nil && childResult.hasBulkResponseBinding() {
-						if currentFieldResponseMap, isFieldResponseMap := currentFieldResponse.(map[string]any); isFieldResponseMap {
-							compositeKey := generateCompositeKey([]string{child.parentKeyFieldName}, currentFieldResponseMap)
-							if val, ok := childResult.lookResponseByCompositeKey(compositeKey); ok {
-								serialized := serializeLeafValue(child, val, rundata)
-								if serialized == nil && childWrapperTypeInfo.notNil {
-									if rundata.fieldErrors[child.fieldId].Load() == nil {
-										err := fmt.Errorf("cannot return null for non-nullable field %s", child.responseName)
-										rundata.addFieldError(child.fieldId, FieldErrorTypeField, err, child.paths)
-									}
-									return nil
-								}
-								result.set(child.responseName, serialized)
-							} else {
-								//null值冒泡
-								if childWrapperTypeInfo.notNil {
-									if rundata.fieldErrors[child.fieldId].Load() == nil {
-										err := fmt.Errorf("cannot return null for non-nullable field %s", child.responseName)
-										rundata.addFieldError(child.fieldId, FieldErrorTypeField, err, child.paths)
-									}
-									return nil
-								}
-								result.set(child.responseName, childResult)
-							}
-						} else {
-							if childWrapperTypeInfo.notNil {
-								if rundata.fieldErrors[child.fieldId].Load() == nil {
-									err := fmt.Errorf("cannot return null for non-nullable field %s", child.responseName)
-									rundata.addFieldError(child.fieldId, FieldErrorTypeField, err, child.paths)
-								}
-								return nil
-							}
-							result.set(child.responseName, childResult)
-						}
-					} else {
-						//TODO 这里考虑修改buildScalarOrEnumValue方法，直接从父节点数据中组装，不用再查询rundata本节点的数据
-						scalarOrEnumResult := a.buildScalarOrEnumFieldValue(child, currentFieldResponse, rundata, ctx)
-						if scalarOrEnumResult != nil {
-							result.set(child.responseName, scalarOrEnumResult)
-						} else {
-							if childWrapperTypeInfo.notNil {
-								return nil
-							}
-							result.set(child.responseName, nil)
-						}
+					scalarOrEnumResult := a.buildScalarOrEnumFieldValue(child, currentFieldResponse, rundata, ctx)
+					if scalarOrEnumResult == nil && childWrapperTypeInfo.notNil {
+						return nil
 					}
+					result.set(child.responseName, scalarOrEnumResult)
 				}
 			}
 		}
@@ -411,20 +381,11 @@ func (a *SGraphResultAssembler) buildObjectItemInListValueObjectItem(fieldPlan *
 		//根据子节点继续遍历生成map
 		children := fieldPlan.childrenFields
 		result = newSGraphResponseOrderedMap(len(children))
-		//非空抽象字段已经由validateAbstractFieldValue解析完成
-		runtimeTypeResolved := runtimeTypeName != ""
-		resolveRuntimeTypeName := func(child *FieldPlan) string {
-			if !runtimeTypeResolved && child.fieldTypeScope.dynamicTypeResolver != nil {
-				runtimeTypeName = child.fieldTypeScope.dynamicTypeResolver(fieldResponse, &ctx)
-				runtimeTypeResolved = true
-			}
-			return runtimeTypeName
-		}
 		for _, child := range children {
 			childWrapperTypeInfo := child.fieldWrapperTypeInfo
 			included, includeErr := evaluateSkipIncludeDirectivesShouldExecuteField(child, rundata, ctx)
 			if includeErr != nil {
-				rundata.addFieldError(child.fieldId, FieldErrorTypeField, includeErr, child.paths)
+				rundata.addFieldErrorAtPlanPath(child, FieldErrorTypeField, includeErr, rundata.assemblyListIndexes)
 				if childWrapperTypeInfo.notNil {
 					return nil
 				}
@@ -439,7 +400,7 @@ func (a *SGraphResultAssembler) buildObjectItemInListValueObjectItem(fieldPlan *
 				if !evaluateCompiledTypeShouldExecuteField(child, ctx) {
 					continue
 				}
-			} else if !evaluateRuntimeAllowedTypeShouldExecuteField(child, resolveRuntimeTypeName(child)) {
+			} else if !evaluateRuntimeAllowedTypeShouldExecuteField(child, runtimeTypeName) {
 				continue
 			}
 			if childWrapperTypeInfo.isList {
@@ -501,7 +462,7 @@ func (a *SGraphResultAssembler) buildListValueInListValueObjectItem(fieldPlan *F
 	currentFieldResponseAsList, currentFieldResponseAsListOk := asListValue(currentFieldResponse)
 	if !currentFieldResponseAsListOk {
 		err := fmt.Errorf("expected iterable field %s validated failed while building result", fieldPlan.responseName)
-		rundata.addFieldError(fieldPlan.fieldId, FieldErrorTypeField, err, fieldPlan.paths)
+		rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 		return nil
 	}
 	fieldWrapperTypeInfo := fieldPlan.fieldWrapperTypeInfo
@@ -520,22 +481,48 @@ func (a *SGraphResultAssembler) extractFieldResponse(fieldPlan *FieldPlan, paren
 	if hasResolver {
 		fieldResult := rundata.getFieldResponseByFieldId(fieldPlan.fieldId)
 		if fieldResult != nil {
-			//父节点是List，子字段必须按照composite key渠当前父元素对应的结果
-			if fieldResult.hasBulkResponseBinding() {
-				parentResponseMap, ok := parentResponse.(map[string]any)
-				if !ok {
-					return nil, nil
+			if fieldResult.hasParentBinding() {
+				var bindingKey string
+				switch fieldResult.parentBindingMode {
+				case fieldResponseBindingCompositeKey:
+					parentResponseMap, ok := parentResponse.(map[string]any)
+					if !ok {
+						return nil, nil
+					}
+					parentKeyFieldName := fieldPlan.parentKeyFieldName
+					if parentKeyFieldName == "" {
+						return nil, nil
+					}
+					//字段缺失和字段值为nil不一样，缺失要报错
+					if _, exists := parentResponseMap[parentKeyFieldName]; !exists {
+						return nil, nil
+					}
+					bindingKey = generateCompositeKey([]string{parentKeyFieldName}, parentResponseMap)
+					// Bulk错误在命中父occurrence后才具备完整List路径，写入后删除该key避免重复上报。
+					fieldResult.reportBulkBindingErrors(bindingKey, fieldPlan, rundata)
+				case fieldResponseBindingResponsePath:
+					currentPath := responsePathForFieldOccurrence(fieldPlan, rundata.assemblyListIndexes)
+					if currentPath == nil || currentPath.Prev == nil {
+						err := fmt.Errorf("parent occurrence path is missing while assembling field %s", fieldPlan.fieldName)
+						rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, err, rundata.assemblyListIndexes)
+						return nil, err
+					}
+					var err error
+					bindingKey, err = responsePathBindingKey(currentPath.Prev)
+					if err != nil {
+						rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, err, rundata.assemblyListIndexes)
+						return nil, err
+					}
+				default:
+					err := fmt.Errorf("field %s has invalid parent binding mode", fieldPlan.fieldName)
+					rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeTree, err, rundata.assemblyListIndexes)
+					return nil, err
 				}
-				parentKeyFieldName := fieldPlan.parentKeyFieldName
-				if parentKeyFieldName == "" {
-					return nil, nil
-				}
-				compositeKey := generateCompositeKey([]string{parentKeyFieldName}, parentResponseMap)
-				if bindingChildResponse, bindingChildResponseOk := fieldResult.lookResponseByCompositeKey(compositeKey); bindingChildResponseOk {
+				if bindingChildResponse, bindingChildResponseOk := fieldResult.lookParentResponse(bindingKey); bindingChildResponseOk {
 					return bindingChildResponse, nil
 				}
 				//该父元素没有子结果时，返回空List
-				if fieldPlan.bulkResolverFunc != nil && fieldPlan.fieldWrapperTypeInfo.isList {
+				if fieldPlan.fieldWrapperTypeInfo.isList {
 					return []any{}, nil
 				}
 				return nil, nil
@@ -558,9 +545,9 @@ func (a *SGraphResultAssembler) extractFieldResponse(fieldPlan *FieldPlan, paren
 
 	// 普通业务对象使用 schema fieldName；内省中间结果当前已经按照 responseName 生成。
 	propertyKey := fieldPlan.fieldName
-	if fieldPlan.responseName != propertyKey && fieldPlan.responseName != "" {
-		switch fieldPlan.fieldTypeScope.staticTypeName {
-		case "__Schema", "__Type", "__Field", "_InputValue", "__EnumValue", "__Directive":
+	if fieldPlan.responseName != propertyKey && fieldPlan.parentType != nil {
+		switch fieldPlan.parentType.Name() {
+		case "__Schema", "__Type", "__Field", "__InputValue", "__EnumValue", "__Directive":
 			propertyKey = fieldPlan.responseName
 		}
 	}
@@ -569,20 +556,27 @@ func (a *SGraphResultAssembler) extractFieldResponse(fieldPlan *FieldPlan, paren
 	if parentResponseMap, parentResponseMapOk := parentResponse.(map[string]any); parentResponseMapOk {
 		if len(rundata.extensions) == 0 {
 			result := parentResponseMap[propertyKey]
+			if funcErr := rejectDeferredFunctionProperty(fieldPlan, result, rundata); funcErr != nil {
+				return nil, funcErr
+			}
 			addNonNullCompletionErrorIfNeeded(fieldPlan, result, rundata)
 			return result, nil
 		}
-		_, _, finishHook := startSGraphResolveFieldHook(rundata, fieldPlan, ctx, -1)
+		_, _, finishHook := startSGraphResolveFieldHook(rundata, fieldPlan, ctx, responsePathForFieldOccurrence(fieldPlan, rundata.assemblyListIndexes))
 		result := parentResponseMap[propertyKey]
+		if funcErr := rejectDeferredFunctionProperty(fieldPlan, result, rundata); funcErr != nil {
+			finishSGraphResolveFieldHook(rundata, finishHook, nil, funcErr)
+			return nil, funcErr
+		}
 		finishSGraphResolveFieldHook(rundata, finishHook, result, nil)
 		addNonNullCompletionErrorIfNeeded(fieldPlan, result, rundata)
 		return result, nil
 	}
 
 	// named map、map[string]T 等 string-key map 也直接读取属性，避免落入 DefaultResolveFn 后重新启用函数属性语义。
-	if _, isFieldResolver := parentResponse.(graphql.FieldResolver); !isFieldResolver {
+	if _, isFieldResolver := parentResponse.(FieldResolver); !isFieldResolver {
 		parentValue := reflect.ValueOf(parentResponse)
-		if parentValue.IsValid() && parentValue.Kind() == reflect.Map && parentValue.Type().Key().Kind() != reflect.String {
+		if parentValue.IsValid() && parentValue.Kind() == reflect.Map && parentValue.Type().Key().Kind() == reflect.String {
 			mapKey := reflect.New(parentValue.Type().Key()).Elem()
 			mapKey.SetString(propertyKey)
 
@@ -592,9 +586,17 @@ func (a *SGraphResultAssembler) extractFieldResponse(fieldPlan *FieldPlan, paren
 				result = mapValue.Interface()
 			}
 
+			funcErr := rejectDeferredFunctionProperty(fieldPlan, result, rundata)
 			if len(rundata.extensions) != 0 {
-				_, _, finishHook := startSGraphResolveFieldHook(rundata, fieldPlan, ctx, -1)
-				finishSGraphResolveFieldHook(rundata, finishHook, result, nil)
+				_, _, finishHook := startSGraphResolveFieldHook(rundata, fieldPlan, ctx, responsePathForFieldOccurrence(fieldPlan, rundata.assemblyListIndexes))
+				if funcErr != nil {
+					finishSGraphResolveFieldHook(rundata, finishHook, nil, funcErr)
+				} else {
+					finishSGraphResolveFieldHook(rundata, finishHook, result, nil)
+				}
+			}
+			if funcErr != nil {
+				return nil, funcErr
 			}
 
 			addNonNullCompletionErrorIfNeeded(fieldPlan, result, rundata)
@@ -603,15 +605,21 @@ func (a *SGraphResultAssembler) extractFieldResponse(fieldPlan *FieldPlan, paren
 	}
 
 	// struct、json/graphql tag 和 FieldResolver 继续使用 graphql-go DefaultResolveFn，保留现有默认取值能力。
-	fieldCtx, info, finishHook := startSGraphResolveFieldHook(rundata, fieldPlan, ctx, -1)
-	result, resolveErr := callDefaultResolveFn(graphql.ResolveParams{
+	fieldCtx, info, finishHook := startSGraphResolveFieldHook(rundata, fieldPlan, ctx, responsePathForFieldOccurrence(fieldPlan, rundata.assemblyListIndexes))
+	result, resolveErr := callDefaultResolveFn(ResolveParams{
 		Source:  parentResponse,
 		Info:    info,
 		Context: fieldCtx,
 	})
+	if resolveErr == nil {
+		if funcErr := rejectDeferredFunctionProperty(fieldPlan, result, rundata); funcErr != nil {
+			finishSGraphResolveFieldHook(rundata, finishHook, nil, funcErr)
+			return nil, funcErr
+		}
+	}
 	finishSGraphResolveFieldHook(rundata, finishHook, result, resolveErr)
 	if resolveErr != nil {
-		rundata.addFieldError(fieldPlan.fieldId, FieldErrorTypeField, resolveErr, fieldPlan.paths)
+		rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, resolveErr, rundata.assemblyListIndexes)
 		return nil, resolveErr
 	}
 
@@ -619,81 +627,149 @@ func (a *SGraphResultAssembler) extractFieldResponse(fieldPlan *FieldPlan, paren
 	return result, nil
 }
 
-// 遇到抽象类型时推断运行时类型并校验合法性。string类型返回值代表当前value运行时具体Object类型名称，bool类型返回值表示抽象类型校验是否合法。true允许继续，false代表是nil且调用方自行处理null值冒泡
-func (a *SGraphResultAssembler) validateAbstractFieldValue(field *FieldPlan, value any, rundata *Rundata, ctx context.Context) (string, bool) {
+// 校验Object/Interface/Union运行时值。typeName是实际Object类型名，valid=false时调用方按null处理并继续执行冒泡。
+func (a *SGraphResultAssembler) validateAbstractFieldValue(field *FieldPlan, value any, rundata *Rundata, ctx context.Context) (typeName string, valid bool) {
 	if field == nil || isNilInterfaceValue(value) {
 		return "", true
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			typeName = ""
+			valid = false
+			if rundata != nil {
+				rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, recoveredValueAsError(recovered), rundata.assemblyListIndexes)
+			}
+		}
+	}()
 
-	//当前字段是否为抽象类型，不是抽象类不做处理直接返回
-	fieldWrapperTypeInfo := field.fieldWrapperTypeInfo
-	var abs graphql.Abstract
-	switch tt := fieldWrapperTypeInfo.baseType.(type) {
-	case *graphql.Interface:
-		abs = tt
-	case *graphql.Union:
-		abs = tt
-	default:
+	// List字段的实际输出类型位于元素wrapper中，需要逐层下钻到Object/Interface/Union。
+	fieldWrapperTypeInfo := &field.fieldWrapperTypeInfo
+	var objectType *Object
+	var abs Abstract
+	for fieldWrapperTypeInfo != nil {
+		switch tt := fieldWrapperTypeInfo.baseType.(type) {
+		case *Object:
+			objectType = tt
+		case *Interface:
+			abs = tt
+		case *Union:
+			abs = tt
+		}
+		if objectType != nil || abs != nil {
+			break
+		}
+		fieldWrapperTypeInfo = fieldWrapperTypeInfo.elementWrapperTypeInfo
+	}
+
+	// 具体Object没有IsTypeOf时无需额外校验，保留普通对象的快速路径。
+	if objectType != nil && objectType.IsTypeOf == nil {
+		return objectType.Name(), true
+	}
+	if objectType == nil && abs == nil {
 		return "", true
 	}
 
-	//获取全部PossibleTypes，优先执行ResolveType，否则执行IsTypeOf
-	possibleTypes := a.schema.PossibleTypes(abs)
-	typeName := ""
-	switch t := abs.(type) {
-	case *graphql.Interface:
-		if t.ResolveType != nil {
-			if obj := t.ResolveType(graphql.ResolveTypeParams{
-				Value:   value,
-				Context: ctx,
-			}); obj != nil {
-				typeName = obj.Name()
-			}
+	// IsTypeOf/ResolveType必须获得当前字段发生位置对应的完整ResolveInfo。
+	info := buildSGraphResolveInfo(
+		rundata,
+		field,
+		responsePathForFieldOccurrence(field, rundata.assemblyListIndexes),
+	)
+	if objectType != nil {
+		if objectType.IsTypeOf(IsTypeOfParams{
+			Value:   value,
+			Info:    info,
+			Context: ctx,
+		}) {
+			return objectType.Name(), true
 		}
-	case *graphql.Union:
+
+		rundata.addFieldErrorAtPlanPath(
+			field,
+			FieldErrorTypeField,
+			fmt.Errorf(`Expected value of type "%v" but got: %T.`, objectType, value),
+			rundata.assemblyListIndexes,
+		)
+		return "", false
+	}
+
+	// 抽象类型优先执行ResolveType；未配置或未命中时，再通过PossibleType.IsTypeOf推断。
+	possibleTypes := a.schema.PossibleTypes(abs)
+	var runtimeType *Object
+	switch t := abs.(type) {
+	case *Interface:
 		if t.ResolveType != nil {
-			if obj := t.ResolveType(graphql.ResolveTypeParams{
+			runtimeType = t.ResolveType(ResolveTypeParams{
 				Value:   value,
+				Info:    info,
 				Context: ctx,
-			}); obj != nil {
-				typeName = obj.Name()
-			}
+			})
+		}
+	case *Union:
+		if t.ResolveType != nil {
+			runtimeType = t.ResolveType(ResolveTypeParams{
+				Value:   value,
+				Info:    info,
+				Context: ctx,
+			})
 		}
 	}
 
-	if typeName == "" {
+	if runtimeType == nil {
 		for _, possibleType := range possibleTypes {
 			if possibleType.IsTypeOf == nil {
 				continue
 			}
-			if possibleType.IsTypeOf(graphql.IsTypeOfParams{
+			if possibleType.IsTypeOf(IsTypeOfParams{
 				Value:   value,
+				Info:    info,
 				Context: ctx,
 			}) {
-				typeName = possibleType.Name()
+				runtimeType = possibleType
 				break
 			}
 		}
 	}
 
 	//无法推断运行时类型，报错返回
-	if typeName == "" {
-		rundata.addFieldError(field.fieldId, FieldErrorTypeField, fmt.Errorf("abstract type %s must resolve to an Object type at runtime", abs.Name()), field.paths)
+	if runtimeType == nil {
+		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, fmt.Errorf("abstract type %s must resolve to an Object type at runtime", abs.Name()), rundata.assemblyListIndexes)
 		return "", false
 	}
 
+	typeName = runtimeType.Name()
+	runtimeTypeAllowed := false
 	for _, possibleType := range possibleTypes {
 		if possibleType.Name() == typeName {
-			return typeName, true
+			runtimeTypeAllowed = true
+			break
 		}
 	}
+	if !runtimeTypeAllowed {
+		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, fmt.Errorf("runtime object type %q is not a possible type for %q", typeName, abs.Name()), rundata.assemblyListIndexes)
+		return "", false
+	}
 
-	rundata.addFieldError(field.fieldId, FieldErrorTypeField, fmt.Errorf("runtime object type %q is not a possible type for %q", typeName, abs.Name()), field.paths)
-	return "", false
+	// graphql-go在ResolveType后仍会通过具体Object.IsTypeOf校验返回值。
+	if runtimeType.IsTypeOf != nil && !runtimeType.IsTypeOf(IsTypeOfParams{
+		Value:   value,
+		Info:    info,
+		Context: ctx,
+	}) {
+		rundata.addFieldErrorAtPlanPath(
+			field,
+			FieldErrorTypeField,
+			fmt.Errorf(`Expected value of type "%v" but got: %T.`, runtimeType, value),
+			rundata.assemblyListIndexes,
+		)
+		return "", false
+	}
+
+	return typeName, true
 }
 
 // 使组装阶段的默认resolver与graphql-go resolveField具有相同的paic转execution error语义
-func callDefaultResolveFn(param graphql.ResolveParams) (result any, err error) {
+func callDefaultResolveFn(param ResolveParams) (result any, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result = nil
@@ -704,16 +780,34 @@ func callDefaultResolveFn(param graphql.ResolveParams) (result any, err error) {
 			}
 		}
 	}()
-	return graphql.DefaultResolveFn(param)
+	return DefaultResolveFn(param)
+}
+
+// 结果组装阶段不执行函数形式的延迟属性。命中函数值时返回字段错误，避免把函数指针
+// 交给叶子序列化后变成 "0x..." 之类的无意义字符串写进响应。
+// 规范 §6.4.3 CoerceResult 要求结果强制转换必须产出该类型的有效值，否则必须抛执行错误。
+func rejectDeferredFunctionProperty(fieldPlan *FieldPlan, value any, rundata *Rundata) error {
+	if fieldPlan == nil || value == nil {
+		return nil
+	}
+	valueType := reflect.TypeOf(value)
+	if valueType == nil || valueType.Kind() != reflect.Func {
+		return nil
+	}
+	err := fmt.Errorf("field %s resolves to a function value; the result assembler does not evaluate deferred properties, configure a resolver for this field instead", fieldPlan.fieldName)
+	if rundata != nil {
+		rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, err, rundata.assemblyListIndexes)
+	}
+	return err
 }
 
 // 只在字段尚未记录执行错误时补充Non-Null完成错误，避免reoslver/default resolver的原始错误被通用的null错误覆盖
 func addNonNullCompletionErrorIfNeeded(fieldPlan *FieldPlan, value any, rundata *Rundata) {
-	if fieldPlan == nil || rundata == nil || !fieldPlan.fieldWrapperTypeInfo.notNil || !isNilInterfaceValue(value) || rundata.fieldErrors[fieldPlan.fieldId].Load() != nil {
+	if fieldPlan == nil || rundata == nil || !fieldPlan.fieldWrapperTypeInfo.notNil || !isNilInterfaceValue(value) || rundata.hasFieldErrorAtPlanPath(fieldPlan, rundata.assemblyListIndexes) {
 		return
 	}
 	err := fmt.Errorf("cannot return null for non-nullable field %s", fieldPlan.fieldName)
-	rundata.addFieldError(fieldPlan.fieldId, FieldErrorTypeField, err, fieldPlan.paths)
+	rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 }
 
 func serializeLeafValue(fieldPlan *FieldPlan, value any, rundata *Rundata) (serialized any) {
@@ -732,7 +826,7 @@ func serializeLeafValue(fieldPlan *FieldPlan, value any, rundata *Rundata) (seri
 				serializeErr = fmt.Errorf("cannot serialize leaf value for %s:%v", fieldPlan.fieldName, recovered)
 			}
 			if rundata != nil {
-				rundata.addFieldError(fieldPlan.fieldId, FieldErrorTypeField, serializeErr, fieldPlan.paths)
+				rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, serializeErr, rundata.assemblyListIndexes)
 			}
 			serialized = nil
 		}
@@ -740,9 +834,9 @@ func serializeLeafValue(fieldPlan *FieldPlan, value any, rundata *Rundata) (seri
 
 	info := fieldPlan.fieldWrapperTypeInfo
 	switch t := info.baseType.(type) {
-	case *graphql.Scalar:
+	case *Scalar:
 		serialized = t.Serialize(value)
-	case *graphql.Enum:
+	case *Enum:
 		serialized = t.Serialize(value)
 	default:
 		return value
@@ -756,7 +850,7 @@ func serializeLeafValue(fieldPlan *FieldPlan, value any, rundata *Rundata) (seri
 		}
 		serializeErr := fmt.Errorf("cannot serialize leaf value for %s:%s", fieldPlan.fieldName, typeName)
 		if rundata != nil {
-			rundata.addFieldError(fieldPlan.fieldId, FieldErrorTypeField, serializeErr, fieldPlan.paths)
+			rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, serializeErr, rundata.assemblyListIndexes)
 		}
 		return nil
 	}

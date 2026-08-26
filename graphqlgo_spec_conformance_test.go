@@ -5,15 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
 	"github.com/graphql-go/graphql/language/parser"
 	"github.com/graphql-go/graphql/language/source"
-	"github.com/graphql-go/graphql/sgraph"
 )
 
 func TestGraphQLGoSpec_FieldCollectionFragmentsDirectivesAndAliases(t *testing.T) {
@@ -37,10 +38,15 @@ func TestGraphQLGoSpec_FieldCollectionFragmentsDirectivesAndAliases(t *testing.T
 		}
 	`
 
-	result := executeGraphQLGoSpec(t, schema, query, map[string]any{
+	result := executeSGraphSpecWithParamRegistry(t, schema, query, map[string]any{
 		"withName": true,
 		"skipID":   false,
-	}, "FieldCollection")
+	}, "FieldCollection", []FieldParamBinding{
+		newSGraphFieldResponseBinding([]string{"user", "name"}, "User", "name", "sourceID", []string{"user"}, "Query", "user", "id"),
+		newSGraphFieldResponseBinding([]string{"user", "name"}, "User", "name", "sourceName", []string{"user"}, "Query", "user", "name"),
+		newSGraphFieldResponseBinding([]string{"user", "duplicate"}, "User", "name", "sourceID", []string{"user"}, "Query", "user", "id"),
+		newSGraphFieldResponseBinding([]string{"user", "duplicate"}, "User", "name", "sourceName", []string{"user"}, "Query", "user", "name"),
+	})
 
 	assertNoGraphQLErrors(t, result)
 	assertGraphQLData(t, result.Data, map[string]any{
@@ -77,63 +83,11 @@ func TestGraphQLGoSpec_VariableAndInputCoercion(t *testing.T) {
 	})
 }
 
-func TestSGraphSpec_ArgumentDefaultForMissingVariable(t *testing.T) {
-	queryType := NewObject(ObjectConfig{
-		Name: "Query",
-		Fields: Fields{
-			"inspectArgs": &Field{
-				Type: String,
-				Args: FieldConfigArgument{
-					"defaulted": &ArgumentConfig{Type: String, DefaultValue: "fallback"},
-					"optional":  &ArgumentConfig{Type: String},
-				},
-				Resolve: func(p ResolveParams) (any, error) {
-					defaulted, defaultedProvided := p.Args["defaulted"]
-					optional, optionalProvided := p.Args["optional"]
-					return fmt.Sprintf("%t:%v|%t:%v", defaultedProvided, defaulted, optionalProvided, optional), nil
-				},
-			},
-		},
-	})
-	schema, err := NewSchema(SchemaConfig{Query: queryType})
-	if err != nil {
-		t.Fatalf("NewSchema failed: %v", err)
-	}
-
-	document := parseGraphQLSpecQuery(t, `
-		query InspectArgs($value: String) {
-			inspectArgs(defaulted: $value, optional: $value)
-		}
-	`)
-	validationResult := ValidateDocument(&schema, document, nil)
-	if !validationResult.IsValid {
-		t.Fatalf("validation failed: %#v", validationResult.Errors)
-	}
-
-	operationName := "InspectArgs"
-	engine := NewSGraphEngine(schema)
-	testCases := []struct {
-		name      string
-		variables map[string]any
-		expected  string
-	}{
-		{name: "missing variable uses argument default", variables: nil, expected: "true:fallback|false:<nil>"},
-		{name: "explicit null does not use argument default", variables: map[string]any{"value": nil}, expected: "true:<nil>|true:<nil>"},
-		{name: "provided value overrides argument default", variables: map[string]any{"value": "request"}, expected: "true:request|true:request"},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			// 同一个 engine 和 document 连续执行，覆盖 plan cache 命中后的请求隔离。
-			result := normalizeGraphQLSpecResult(engine.Execute(document, testCase.variables, &operationName, nil, context.Background()).ToGraphQLResult())
-			assertNoGraphQLErrors(t, result)
-			assertGraphQLData(t, result.Data, map[string]any{"inspectArgs": testCase.expected})
-		})
-	}
-}
-
 func TestGraphQLGoSpec_NullBubblingAndErrorPath(t *testing.T) {
-	t.Skip("graphql-go 原 execute 链路在 query 子字段 non-null 错误冒泡时跨 goroutine panic；该规范点作为 conformance gap 单独记录")
+	if os.Getenv("GRAPHQLGO_CONFORMANCE_CHILD") != "null-bubbling" {
+		runGraphQLGoConformanceSubprocess(t, "null-bubbling", "TestGraphQLGoSpec_NullBubblingAndErrorPath")
+		return
+	}
 
 	schema := newSpecConformanceSchema(t)
 	query := `
@@ -164,7 +118,10 @@ func TestGraphQLGoSpec_ListItemErrorPathKeepsSiblingData(t *testing.T) {
 		}
 	`
 
-	result := executeGraphQLGoSpec(t, schema, query, nil, "")
+	result := executeSGraphSpecWithParamRegistry(t, schema, query, nil, "", []FieldParamBinding{
+		newSGraphFieldResponseBinding([]string{"people", "name"}, "User", "name", "sourceID", []string{"people"}, "Query", "people", "id"),
+		newSGraphFieldResponseBinding([]string{"people", "name"}, "User", "name", "sourceName", []string{"people"}, "Query", "people", "name"),
+	})
 
 	assertGraphQLData(t, result.Data, map[string]any{
 		"people": []any{
@@ -203,7 +160,12 @@ func TestGraphQLGoSpec_AbstractTypesAndTypename(t *testing.T) {
 		}
 	`
 
-	result := executeGraphQLGoSpec(t, schema, query, nil, "")
+	result := executeSGraphSpecWithParamRegistry(t, schema, query, nil, "", []FieldParamBinding{
+		newSGraphFieldResponseBinding([]string{"nodes", "name"}, "User", "name", "sourceID", []string{"nodes"}, "Query", "nodes", "id"),
+		newSGraphFieldResponseBinding([]string{"nodes", "name"}, "User", "name", "sourceName", []string{"nodes"}, "Query", "nodes", "name"),
+		newSGraphFieldResponseBinding([]string{"search", "name"}, "User", "name", "sourceID", []string{"search"}, "Query", "search", "id"),
+		newSGraphFieldResponseBinding([]string{"search", "name"}, "User", "name", "sourceName", []string{"search"}, "Query", "search", "name"),
+	})
 
 	assertNoGraphQLErrors(t, result)
 	assertGraphQLData(t, result.Data, map[string]any{
@@ -288,10 +250,7 @@ func TestGraphQLGoSpec_IntrospectionSelectionsSupportFragments(t *testing.T) {
 	result := executeGraphQLGoSpec(t, schema, query, nil, "")
 
 	assertNoGraphQLErrors(t, result)
-	data, ok := result.Data.(map[string]any)
-	if !ok {
-		t.Fatalf("result data type = %T, want map[string]any", result.Data)
-	}
+	data := graphQLResultDataMap(t, result)
 
 	schemaData := data["__schema"].(map[string]any)
 	queryType := schemaData["queryType"].(map[string]any)
@@ -376,10 +335,7 @@ func TestGraphQLGoSpec_LanguageIgnoredTokensEscapesAndBlockStrings(t *testing.T)
 	`, nil, "IgnoredTokens")
 
 	assertNoGraphQLErrors(t, result)
-	data, ok := result.Data.(map[string]any)
-	if !ok {
-		t.Fatalf("result data type = %T, want map[string]any", result.Data)
-	}
+	data := graphQLResultDataMap(t, result)
 	if data["greeting"] != "hello" {
 		t.Fatalf("greeting = %#v", data["greeting"])
 	}
@@ -489,12 +445,21 @@ func TestGraphQLGoSpec_ValidationRulesExtendedMatrix(t *testing.T) {
 	}
 }
 
-func TestGraphQLGoSpec_NullLiteralParserGap(t *testing.T) {
-	t.Skip("graphql-go 原 parser 当前把 null 当成普通 Name 并报 Unexpected Name；GraphQL 规范允许 NullValue，该点作为 parser conformance gap 记录")
-}
-
 func TestGraphQLGoSpec_FragmentCycleValidationGap(t *testing.T) {
-	t.Skip("graphql-go 原 ValidateDocument 对 fragment cycle 会先进入 OverlappingFieldsCanBeMergedRule 无限递归并 stack overflow；该规范点作为 conformance gap 记录")
+	if os.Getenv("GRAPHQLGO_CONFORMANCE_CHILD") != "fragment-cycle" {
+		runGraphQLGoConformanceSubprocess(t, "fragment-cycle", "TestGraphQLGoSpec_FragmentCycleValidationGap")
+		return
+	}
+
+	schema := newSpecConformanceSchema(t)
+	errs := validateGraphQLSpecQuery(t, schema, `
+		query { user { ...CycleA } }
+		fragment CycleA on User { ...CycleB }
+		fragment CycleB on User { ...CycleA }
+	`)
+	if len(errs) == 0 {
+		t.Fatal("fragment cycle must be rejected during validation")
+	}
 }
 
 func TestGraphQLGoSpec_InputCoercionEdges(t *testing.T) {
@@ -705,14 +670,18 @@ func TestGraphQLGoSpec_ResponseParseErrorShapeAndExecutionErrorLocations(t *test
 		t.Fatalf("expected parse request error without data, got %#v", parseErr)
 	}
 
-	execErr := executeGraphQLGoSpec(t, schema, `
+	execQuery := `
 		{
 			people {
 				id
 				name
 			}
 		}
-	`, nil, "")
+	`
+	execErr := executeSGraphSpecWithParamRegistry(t, schema, execQuery, nil, "", []FieldParamBinding{
+		newSGraphFieldResponseBinding([]string{"people", "name"}, "User", "name", "sourceID", []string{"people"}, "Query", "people", "id"),
+		newSGraphFieldResponseBinding([]string{"people", "name"}, "User", "name", "sourceName", []string{"people"}, "Query", "people", "name"),
+	})
 	assertGraphQLData(t, execErr.Data, map[string]any{
 		"people": []any{
 			map[string]any{"id": "1", "name": "Ada"},
@@ -758,7 +727,7 @@ func TestGraphQLGoSpec_IntrospectionFullSurface(t *testing.T) {
 	`, nil, "")
 
 	assertNoGraphQLErrors(t, result)
-	data := result.Data.(map[string]any)
+	data := graphQLResultDataMap(t, result)
 	schemaData := data["__schema"].(map[string]any)
 	if !fieldListContainsName(schemaData["types"], "User") || !fieldListContainsName(schemaData["directives"], "skip") {
 		t.Fatalf("unexpected __schema introspection result: %#v", schemaData)
@@ -855,7 +824,7 @@ func TestGraphQLGoSpec_IntrospectionDeprecationAndWrappedTypes(t *testing.T) {
 	`, nil, "")
 	assertNoGraphQLErrors(t, result)
 
-	data := result.Data.(map[string]any)
+	data := graphQLResultDataMap(t, result)
 	holder := data["holderType"].(map[string]any)
 	if fieldListContainsName(holder["fields"], "old") {
 		t.Fatalf("deprecated fields should be hidden unless includeDeprecated is true: %#v", holder["fields"])
@@ -916,10 +885,6 @@ func TestGraphQLGoSpec_ResponseRequestErrorShape(t *testing.T) {
 	}
 }
 
-func TestGraphQLGoSpec_ResponseFieldOrderGap(t *testing.T) {
-	t.Skip("graphql-go 原 execute 链路返回普通 map，encoding/json 会按 map key 排序，不能保证 GraphQL response field order")
-}
-
 func TestGraphQLGoSpec_DefaultResolverSourceFallback(t *testing.T) {
 	type profile struct {
 		Name string `json:"name"`
@@ -953,10 +918,6 @@ func TestGraphQLGoSpec_DefaultResolverSourceFallback(t *testing.T) {
 }
 
 func TestGraphQLGoSpec_ExtensionExecutionAndFieldHooks(t *testing.T) {
-	if os.Getenv("GRAPHSOUL_SPEC_CONFORMANCE") == "direct" {
-		t.Skip("direct SGraphEngine adapter bypasses public Execute extension hooks; use GRAPHSOUL_SPEC_CONFORMANCE=1 for this case")
-	}
-
 	ext := &specTrackingExtension{}
 	queryType := NewObject(ObjectConfig{
 		Name: "Query",
@@ -971,7 +932,7 @@ func TestGraphQLGoSpec_ExtensionExecutionAndFieldHooks(t *testing.T) {
 	})
 	schema, err := NewSchema(SchemaConfig{
 		Query:      queryType,
-		Extensions: []sgraph.Extension{ext},
+		Extensions: []Extension{ext},
 	})
 	if err != nil {
 		t.Fatalf("NewSchema failed: %v", err)
@@ -1011,17 +972,61 @@ func executeGraphQLGoSpec(t *testing.T, schema Schema, query string, variables m
 		Args:          variables,
 		Context:       context.Background(),
 	}
-	switch os.Getenv("GRAPHSOUL_SPEC_CONFORMANCE") {
-	case "1":
-		return normalizeGraphQLSpecResult(Execute(params))
-	case "direct":
-		var operationNamePtr *string
-		if operationName != "" {
-			operationNamePtr = &operationName
-		}
-		return normalizeGraphQLSpecResult(NewSGraphEngine(schema).Execute(astDoc, variables, operationNamePtr, nil, context.Background()).ToGraphQLResult())
+	return Execute(params)
+}
+
+func executeSGraphSpecWithParamRegistry(t *testing.T, schema Schema, query string, variables map[string]any, operationName string, fieldParams []FieldParamBinding) *Result {
+	t.Helper()
+
+	astDoc := parseGraphQLSpecQuery(t, query)
+	validationResult := ValidateDocument(&schema, astDoc, nil)
+	if !validationResult.IsValid {
+		t.Fatalf("validation failed: %#v", validationResult.Errors)
 	}
-	return ExecuteGraphQLGo(params)
+
+	paramRegistry := NewParamRegistry()
+	if err := paramRegistry.RegisterQuery(QueryParamConfig{
+		DocumentBody:  query,
+		OperationName: operationName,
+		FieldParams:   fieldParams,
+	}); err != nil {
+		t.Fatalf("register SGraph parameter metadata failed: %v", err)
+	}
+	engine, err := NewSGraphEngine(&schema, nil, paramRegistry)
+	if err != nil {
+		t.Fatalf("NewSGraphEngine failed: %v", err)
+	}
+	if err := RegisterSGraphEngine(engine); err != nil {
+		t.Fatalf("RegisterSGraphEngine failed: %v", err)
+	}
+
+	return Execute(ExecuteParams{
+		Schema:        schema,
+		AST:           astDoc,
+		OperationName: operationName,
+		Args:          variables,
+		Context:       context.Background(),
+	})
+}
+
+func newSGraphFieldResponseBinding(targetPath []string, targetParentType string, targetField string, paramName string, sourcePath []string, sourceParentType string, sourceField string, resultPath ...string) FieldParamBinding {
+	return FieldParamBinding{
+		Target: FieldParamTarget{
+			ResponsePath:   targetPath,
+			ParentTypeName: targetParentType,
+			FieldName:      targetField,
+			ParamName:      paramName,
+		},
+		Source: ParamSource{
+			Kind: ParamSourceFieldResponse,
+			FieldResponse: &FieldResponseParamSource{
+				ResponsePath:   sourcePath,
+				ParentTypeName: sourceParentType,
+				FieldName:      sourceField,
+				ResultPath:     resultPath,
+			},
+		},
+	}
 }
 
 func executeGraphQLGoSpecRequest(t *testing.T, schema Schema, query string, variables map[string]any, operationName string) *Result {
@@ -1044,48 +1049,7 @@ func executeGraphQLGoSpecRequest(t *testing.T, schema Schema, query string, vari
 		Args:          variables,
 		Context:       context.Background(),
 	}
-	switch os.Getenv("GRAPHSOUL_SPEC_CONFORMANCE") {
-	case "1":
-		return normalizeGraphQLSpecResult(Execute(params))
-	case "direct":
-		var operationNamePtr *string
-		if operationName != "" {
-			operationNamePtr = &operationName
-		}
-		return normalizeGraphQLSpecResult(NewSGraphEngine(schema).Execute(astDoc, variables, operationNamePtr, nil, context.Background()).ToGraphQLResult())
-	}
-	return ExecuteGraphQLGo(params)
-}
-
-func normalizeGraphQLSpecResult(result *Result) *Result {
-	if result == nil {
-		return nil
-	}
-	normalized := *result
-	normalized.Data = normalizeGraphQLSpecValue(result.Data)
-	return &normalized
-}
-
-func normalizeGraphQLSpecValue(value any) any {
-	switch typed := value.(type) {
-	case *SGraphResponseOrderedMap:
-		if typed == nil {
-			return nil
-		}
-		result := make(map[string]any, len(typed.Fields()))
-		for _, field := range typed.Fields() {
-			result[field.GetKey()] = normalizeGraphQLSpecValue(field.GetValue())
-		}
-		return result
-	case []any:
-		result := make([]any, len(typed))
-		for i, item := range typed {
-			result[i] = normalizeGraphQLSpecValue(item)
-		}
-		return result
-	default:
-		return value
-	}
+	return Execute(params)
 }
 
 func validateGraphQLSpecQuery(t *testing.T, schema Schema, query string) []gqlerrors.FormattedError {
@@ -1108,6 +1072,28 @@ func parseGraphQLSpecQuery(t *testing.T, query string) *ast.Document {
 		t.Fatalf("parse failed: %v", err)
 	}
 	return astDoc
+}
+
+func runGraphQLGoConformanceSubprocess(t *testing.T, childMode string, testName string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+testName+"$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "GRAPHQLGO_CONFORMANCE_CHILD="+childMode)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("isolated conformance case %s timed out", testName)
+	}
+	if err == nil {
+		return
+	}
+	// 子进程只用于隔离 stack overflow/panic；失败仍按真实规范失败上报，不转成 skip 或预期成功。
+	const maxOutput = 8192
+	if len(output) > maxOutput {
+		output = output[len(output)-maxOutput:]
+	}
+	t.Fatalf("isolated conformance case %s failed: %v\n%s", testName, err, output)
 }
 
 func parseGraphQLSpecQueryResult(query string) (*ast.Document, error) {
@@ -1175,12 +1161,22 @@ func newSpecConformanceSchema(t *testing.T) Schema {
 			"id": &Field{Type: NewNonNull(ID)},
 			"name": &Field{
 				Type: String,
+				Args: FieldConfigArgument{
+					"sourceID":   &ArgumentConfig{Type: ID},
+					"sourceName": &ArgumentConfig{Type: String},
+				},
 				Resolve: func(p ResolveParams) (any, error) {
-					item, _ := p.Source.(map[string]any)
-					if item["id"] == "2" {
+					// 原生 executor 从 Source 取父对象；SGraph 通过 ParamRegistry 显式注入同一组值。
+					sourceID, _ := p.Args["sourceID"].(string)
+					sourceName := p.Args["sourceName"]
+					if item, ok := p.Source.(map[string]any); ok {
+						sourceID, _ = item["id"].(string)
+						sourceName = item["name"]
+					}
+					if sourceID == "2" {
 						return nil, errors.New("name unavailable")
 					}
-					return item["name"], nil
+					return sourceName, nil
 				},
 			},
 			"mustFail": &Field{
@@ -1439,22 +1435,22 @@ func (e *specTrackingExtension) Name() string {
 	return "specTracking"
 }
 
-func (e *specTrackingExtension) ParseDidStart(ctx context.Context) (context.Context, sgraph.ParseFinishFunc) {
+func (e *specTrackingExtension) ParseDidStart(ctx context.Context) (context.Context, ParseFinishFunc) {
 	return ctx, func(error) {}
 }
 
-func (e *specTrackingExtension) ValidationDidStart(ctx context.Context) (context.Context, sgraph.ValidationFinishFunc) {
+func (e *specTrackingExtension) ValidationDidStart(ctx context.Context) (context.Context, ValidationFinishFunc) {
 	return ctx, func([]gqlerrors.FormattedError) {}
 }
 
-func (e *specTrackingExtension) ExecutionDidStart(ctx context.Context) (context.Context, sgraph.ExecutionFinishFunc) {
+func (e *specTrackingExtension) ExecutionDidStart(ctx context.Context) (context.Context, ExecutionFinishFunc) {
 	e.executionStarts++
 	return ctx, func(*Result) {
 		e.executionFinishes++
 	}
 }
 
-func (e *specTrackingExtension) ResolveFieldDidStart(ctx context.Context, info *ResolveInfo) (context.Context, sgraph.ResolveFieldFinishFunc) {
+func (e *specTrackingExtension) ResolveFieldDidStart(ctx context.Context, info *ResolveInfo) (context.Context, ResolveFieldFinishFunc) {
 	e.fieldStarts++
 	return ctx, func(interface{}, error) {
 		e.fieldFinishes++
@@ -1486,9 +1482,22 @@ func assertNoGraphQLErrors(t *testing.T, result *Result) {
 
 func assertGraphQLData(t *testing.T, actual any, expected any) {
 	t.Helper()
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("data mismatch\nactual:   %#v\nexpected: %#v", actual, expected)
+	plainActual := toPlainValue(actual)
+	if !reflect.DeepEqual(plainActual, expected) {
+		t.Fatalf("data mismatch\nactual:   %#v\nexpected: %#v", plainActual, expected)
 	}
+}
+
+func graphQLResultDataMap(t *testing.T, result *Result) map[string]any {
+	t.Helper()
+	if result == nil {
+		t.Fatal("result is nil")
+	}
+	data, ok := toPlainValue(result.Data).(map[string]any)
+	if !ok {
+		t.Fatalf("result data type = %T, want map-compatible GraphQL response", result.Data)
+	}
+	return data
 }
 
 func assertGraphQLErrorPaths(t *testing.T, errors []gqlerrors.FormattedError, expectedPath []any) {

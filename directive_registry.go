@@ -1,22 +1,22 @@
-package sgraph
+package graphql
 
 import (
 	"context"
+	"errors"
 	"fmt"
-
-	"github.com/graphql-go/graphql"
+	"sync"
 )
 
 // DirectiveCompiler 指令编译方法接口
 type DirectiveCompiler interface {
 	// Compile name指令名称，Location指令实际出现的位置例如Field，Args参数键值对，schema当前engine绑定的schema
-	Compile(name string, location string, args map[string]any, schema *graphql.Schema) (*DirectiveCompileResult, error)
+	Compile(name string, location string, args map[string]any, schema *Schema) (*DirectiveCompileResult, error)
 }
 
 // RuntimeDirectivePlanCompiler 用于参数含变量的自定义指令。
 // 这类指令不能在 compile 阶段读取变量值，只能生成运行期计划。
 type RuntimeDirectivePlanCompiler interface {
-	RuntimeCompile(name string, location string, argPlans []*ParamPlan, schema *graphql.Schema) (*DirectiveCompileResult, error)
+	RuntimeCompile(name string, location string, argPlans []*ParamPlan, schema *Schema) (*DirectiveCompileResult, error)
 }
 
 // DirectiveRuntimeHandler 指令运行时方法接口
@@ -31,12 +31,14 @@ type DirectiveRuntimeHandler interface {
 
 // DirectiveRegistry Directive注册表
 type DirectiveRegistry struct {
+	mu           sync.RWMutex
+	frozen       bool
 	compilers    map[string]DirectiveCompiler       //指令名-Compiler，该指令在构建时如何编译
 	handlers     map[string]DirectiveRuntimeHandler //指令名-RuntimeHandler，该指令在运行时是否执行step、执行前后怎么做切面修改
 	metadataOnly map[string]bool                    //白名单，允许该指令没有compiler
 }
 
-func newDirectiveRegistry() *DirectiveRegistry {
+func NewDirectiveRegistry() *DirectiveRegistry {
 	result := &DirectiveRegistry{
 		compilers:    make(map[string]DirectiveCompiler),
 		handlers:     make(map[string]DirectiveRuntimeHandler),
@@ -49,59 +51,160 @@ func newDirectiveRegistry() *DirectiveRegistry {
 }
 
 func (r *DirectiveRegistry) Register(name string, compiler DirectiveCompiler, handler any) error {
+	if r == nil {
+		return errors.New("directive registry is nil")
+	}
 	if name == "" {
 		return fmt.Errorf("name is empty")
 	}
 
-	if compiler != nil {
-		r.compilers[name] = compiler
-	}
+	var runtimeHandler DirectiveRuntimeHandler
 	switch h := handler.(type) {
 	case nil:
 	case DirectiveRuntimeHandler:
-		r.handlers[name] = h
+		runtimeHandler = h
 	default:
 		return fmt.Errorf("unsupported directive runtime handler for %s", name)
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.frozen {
+		return fmt.Errorf("directive registry is frozen")
+	}
+	if r.compilers == nil {
+		r.compilers = make(map[string]DirectiveCompiler)
+	}
+	if r.handlers == nil {
+		r.handlers = make(map[string]DirectiveRuntimeHandler)
+	}
+	if r.metadataOnly == nil {
+		r.metadataOnly = make(map[string]bool)
+	}
+	if r.metadataOnly[name] {
+		return fmt.Errorf("directive %s is already registered as metadata-only", name)
+	}
+	if compiler != nil {
+		r.compilers[name] = compiler
+	}
+	if runtimeHandler != nil {
+		r.handlers[name] = runtimeHandler
+	}
+	return nil
+}
+
+// RegisterMetadataOnly 注册只保留名称、位置和参数计划，但不参与运行时执行的指令。
+func (r *DirectiveRegistry) RegisterMetadataOnly(name string) error {
+	if r == nil {
+		return errors.New("directive registry is nil")
+	}
+	if name == "" {
+		return errors.New("directive name is empty")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.frozen {
+		return errors.New("directive registry is frozen")
+	}
+	if r.compilers[name] != nil || r.handlers[name] != nil {
+		return fmt.Errorf("directive %s already has a compiler or runtime handler", name)
+	}
+	if r.metadataOnly == nil {
+		r.metadataOnly = make(map[string]bool)
+	}
+	if r.metadataOnly[name] {
+		return fmt.Errorf("metadata-only directive %s is already registered", name)
+	}
+	r.metadataOnly[name] = true
 	return nil
 }
 
 func (r *DirectiveRegistry) Compiler(name string) DirectiveCompiler {
-	if r == nil || r.compilers == nil {
+	if r == nil {
 		return nil
 	}
-	return r.compilers[name]
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.compilers == nil {
+		return nil
+	}
+	compiler := r.compilers[name]
+	return compiler
 }
 
 func (r *DirectiveRegistry) RuntimeHandler(name string) DirectiveRuntimeHandler {
-	if r == nil || r.handlers == nil {
+	if r == nil {
 		return nil
 	}
-	return r.handlers[name]
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.handlers == nil {
+		return nil
+	}
+	handler := r.handlers[name]
+	return handler
 }
 
 func (r *DirectiveRegistry) MetadataOnly(name string) bool {
-	if r == nil || r.metadataOnly == nil {
+	if r == nil {
 		return false
 	}
-	return r.metadataOnly[name]
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.metadataOnly == nil {
+		return false
+	}
+	metadataOnly := r.metadataOnly[name]
+	return metadataOnly
+}
+
+func (r *DirectiveRegistry) cloneAndFreeze() *DirectiveRegistry {
+	if r == nil {
+		result := NewDirectiveRegistry()
+		result.frozen = true
+		return result
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := &DirectiveRegistry{
+		frozen:       true,
+		compilers:    make(map[string]DirectiveCompiler, len(r.compilers)),
+		handlers:     make(map[string]DirectiveRuntimeHandler, len(r.handlers)),
+		metadataOnly: make(map[string]bool, len(r.metadataOnly)),
+	}
+
+	for name, compiler := range r.compilers {
+		result.compilers[name] = compiler
+	}
+	for name, handler := range r.handlers {
+		result.handlers[name] = handler
+	}
+	for name, metadataOnly := range r.metadataOnly {
+		result.metadataOnly[name] = metadataOnly
+	}
+	return result
 }
 
 type DirectiveCompileResult struct {
-	IncludeDecision      bool             //当前selection是否要在静态编译期保留，true保留，false删除
+	IncludeDecision      *bool            //当前selection是否要在静态编译期保留，true保留，false删除，nil表示不做静态裁剪
 	RuntimePlans         []*DirectivePlan //动态运行期的指令计划
 	DependencyParamPlans []*ParamPlan     //动态运行期所依赖的参数计划
 }
 
 type SkipDirectiveCompiler struct{}
 
-func (SkipDirectiveCompiler) Compile(name string, location string, args map[string]any, schema *graphql.Schema) (*DirectiveCompileResult, error) {
-	skipIf, _ := args["if"].(bool)
+func (SkipDirectiveCompiler) Compile(name string, location string, args map[string]any, schema *Schema) (*DirectiveCompileResult, error) {
+	skipIf, ok := args["if"].(bool)
+	if !ok {
+		return nil, fmt.Errorf("if directive argument must be a boolean")
+	}
 
 	if skipIf {
 		include := false
-		return &DirectiveCompileResult{IncludeDecision: include}, nil
+		return &DirectiveCompileResult{IncludeDecision: &include}, nil
 	}
 
 	return &DirectiveCompileResult{}, nil
@@ -109,12 +212,16 @@ func (SkipDirectiveCompiler) Compile(name string, location string, args map[stri
 
 type IncludeDirectiveCompiler struct{}
 
-func (IncludeDirectiveCompiler) Compile(name string, location string, args map[string]any, schema *graphql.Schema) (*DirectiveCompileResult, error) {
-	includeIf, _ := args["if"].(bool)
+func (IncludeDirectiveCompiler) Compile(name string, location string, args map[string]any, schema *Schema) (*DirectiveCompileResult, error) {
+	includeIf, ok := args["if"].(bool)
+
+	if !ok {
+		return nil, fmt.Errorf("if directive argument must be a boolean")
+	}
 
 	if !includeIf {
 		include := false
-		return &DirectiveCompileResult{IncludeDecision: include}, nil
+		return &DirectiveCompileResult{IncludeDecision: &include}, nil
 	}
 
 	return &DirectiveCompileResult{}, nil

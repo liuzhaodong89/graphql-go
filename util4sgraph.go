@@ -1,4 +1,4 @@
-package sgraph
+package graphql
 
 import (
 	"errors"
@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/language/ast"
 )
 
@@ -18,9 +17,6 @@ const IntrospectionFieldNameTypename string = "__typename"
 const IntrospectionFieldNameMetaType string = "__type"
 const IntrospectionFieldNameMetaSchema string = "__schema"
 const sGraphRundataPoolMaxFieldSlots = 8192
-
-// 小batch直接串行执行，避免goroutine调度成本超过并发收益。
-const sGraphConcurrentStepMin = 8
 
 func toAnySlice(v any) []any {
 	rv := reflect.ValueOf(v)
@@ -47,8 +43,8 @@ func isSlice(v any) bool {
 	return rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array
 }
 
-func isNonNullInput(t graphql.Input) bool {
-	_, ok := t.(*graphql.NonNull)
+func isNonNullInput(t Input) bool {
+	_, ok := t.(*NonNull)
 	return ok
 }
 
@@ -73,125 +69,14 @@ func astContainsVariable(v ast.Value) bool {
 	return false
 }
 
-func valueFromAST(valueAST ast.Value, inputType graphql.Input, originalInputs map[string]any) (any, error) {
-	if valueAST == nil {
-		return nil, fmt.Errorf("value is nil")
-	}
-
-	//变量引用：值已在 parseOperationVariables 按声明类型协变，直接取用，不烤、缓存安全
-	if variable, ok := valueAST.(*ast.Variable); ok {
-		if variable.Name == nil {
-			return nil, fmt.Errorf("variable name is nil")
-		}
-		val, provided := originalInputs[variable.Name.Value]
-		if !provided || val == nil {
-			if _, isNonNull := inputType.(*graphql.NonNull); isNonNull {
-				return nil, fmt.Errorf("variable %q is required for a non-null input", variable.Name.Value)
-			}
-			return nil, nil
-		}
-		return val, nil
-	}
-
-	switch t := inputType.(type) {
-	case *graphql.NonNull:
-		value, err := valueFromAST(valueAST, t.OfType.(graphql.Input), originalInputs)
-		if err != nil {
-			return nil, err
-		}
-		if value == nil {
-			return nil, fmt.Errorf("value is nil")
-		}
-		return value, nil
-	case *graphql.List:
-		if listAST, ok := valueAST.(*ast.ListValue); ok {
-			values := make([]any, 0)
-
-			for _, value := range listAST.Values {
-				item, err := valueFromAST(value, t.OfType, originalInputs)
-				if err != nil {
-					return nil, err
-				}
-				values = append(values, item)
-			}
-			return values, nil
-		}
-
-		single, err := valueFromAST(valueAST, t.OfType.(graphql.Input), originalInputs)
-		if err != nil {
-			return nil, err
-		}
-
-		return []any{single}, nil
-	case *graphql.InputObject:
-		objectAST, ok := valueAST.(*ast.ObjectValue)
-		if !ok {
-			return nil, fmt.Errorf("value is not an object")
-		}
-
-		astFields := map[string]*ast.ObjectField{}
-		for _, field := range objectAST.Fields {
-			astFields[field.Name.Value] = field
-		}
-
-		fieldDefs := t.Fields()
-		result := map[string]any{}
-
-		for astFieldName := range astFields {
-			if _, ok := fieldDefs[astFieldName]; !ok {
-				return nil, fmt.Errorf("unknown field %s", astFieldName)
-			}
-		}
-
-		for fieldName, fieldDef := range fieldDefs {
-			fieldAST, provided := astFields[fieldName]
-
-			if !provided {
-				if fieldDef.DefaultValue != nil {
-					result[fieldName] = fieldDef.DefaultValue
-					continue
-				}
-
-				if isNonNullInput(fieldDef.Type) {
-					return nil, fmt.Errorf("field %s is not a non-nullable field", fieldName)
-				}
-
-				continue
-			}
-
-			//修正：原先误传 fieldAST(*ast.ObjectField)，应传其内部值 fieldAST.Value
-			fieldValue, fieldValueErr := valueFromAST(fieldAST.Value, fieldDef.Type, originalInputs)
-			if fieldValueErr != nil {
-				return nil, fieldValueErr
-			}
-			result[fieldName] = fieldValue
-		}
-		return result, nil
-	case *graphql.Scalar:
-		parsed := t.ParseLiteral(valueAST)
-		if parsed == nil {
-			return nil, fmt.Errorf("value is nil")
-		}
-		return parsed, nil
-	case *graphql.Enum:
-		parsed := t.ParseLiteral(valueAST)
-		if parsed == nil {
-			return nil, fmt.Errorf("value is nil")
-		}
-		return parsed, nil
-	default:
-		return nil, fmt.Errorf("unknown type %T", t)
-	}
-}
-
-func paramsContainsRuntimeTypeVariable(params []*ParamPlan) bool {
-	for _, p := range params {
-		if p.paramType == PARAM_TYPE_ENUM_INPUT || p.paramType == PARAM_TYPE_ENUM_VAR_TEMPLATE {
-			return true
-		}
-	}
-	return false
-}
+//func paramsContainsRuntimeTypeVariable(params []*ParamPlan) bool {
+//	for _, p := range params {
+//		if p.paramType == PARAM_TYPE_ENUM_INPUT || p.paramType == PARAM_TYPE_ENUM_VAR_TEMPLATE {
+//			return true
+//		}
+//	}
+//	return false
+//}
 
 func getASTResponseName(field *ast.Field) string {
 	if field != nil && field.Alias != nil && field.Alias.Value != "" {
@@ -232,37 +117,36 @@ func splitSkipIncludeDirectives(plans []*DirectivePlan) ([]*DirectivePlan, []*Di
 	return conditionalPlans, otherPlans
 }
 
-func getFieldDefinition(parentType any, fieldName string) (*graphql.FieldDefinition, error) {
+func getFieldDefinition(parentType any, fieldName string) (*FieldDefinition, error) {
 	if parentType == nil {
 		return nil, errors.New("no type scope provided while building selection set")
 	}
 	switch t := parentType.(type) {
-	case *graphql.Object:
+	case *Object:
 		fieldDefinition := t.Fields()[fieldName]
 		if fieldDefinition == nil {
 			return nil, errors.New("no field definition found in Object for " + fieldName)
 		}
 		return fieldDefinition, nil
-	case *graphql.Interface:
+	case *Interface:
 		fieldDefinition := t.Fields()[fieldName]
 		if fieldDefinition == nil {
 			return nil, errors.New("no field definition found in Interface for " + fieldName)
 		}
 		return fieldDefinition, nil
-	case *graphql.Union:
+	case *Union:
 		return nil, fmt.Errorf("no type definition found in Union for %s", fieldName)
 	default:
 		return nil, fmt.Errorf("no type definition found for %s", fieldName)
 	}
-	return nil, nil
 }
 
-func getBaseType(t graphql.Type) (graphql.Type, error) {
+func getBaseType(t Type) (Type, error) {
 	for {
 		switch tt := t.(type) {
-		case *graphql.List:
+		case *List:
 			t = tt.OfType
-		case *graphql.NonNull:
+		case *NonNull:
 			t = tt.OfType
 		default:
 			return tt, nil
@@ -282,11 +166,11 @@ func fieldASTsForFieldPlanAsLegacy(current ast.Field, fieldBluePrints []FieldFla
 	return result
 }
 
-func getParentCompositeFromScope(scope *FieldTypeScope) graphql.Composite {
+func getParentCompositeFromScope(scope *FieldTypeScope) Composite {
 	if scope == nil {
 		return nil
 	}
-	parentComposite, _ := scope.declaredType.(graphql.Composite)
+	parentComposite, _ := scope.declaredType.(Composite)
 	return parentComposite
 }
 
@@ -310,34 +194,34 @@ func walkMaxFieldId(fp *FieldPlan, max *uint32) {
 	}
 }
 
-func introspectionKind(t graphql.Type) string {
+func introspectionKind(t Type) string {
 	switch t.(type) {
-	case *graphql.Scalar:
-		return graphql.TypeKindScalar
-	case *graphql.Object:
-		return graphql.TypeKindObject
-	case *graphql.Enum:
-		return graphql.TypeKindEnum
-	case *graphql.List:
-		return graphql.TypeKindList
-	case *graphql.NonNull:
-		return graphql.TypeKindNonNull
-	case *graphql.Interface:
-		return graphql.TypeKindInterface
-	case *graphql.Union:
-		return graphql.TypeKindUnion
-	case *graphql.InputObject:
-		return graphql.TypeKindInputObject
+	case *Scalar:
+		return TypeKindScalar
+	case *Object:
+		return TypeKindObject
+	case *Enum:
+		return TypeKindEnum
+	case *List:
+		return TypeKindList
+	case *NonNull:
+		return TypeKindNonNull
+	case *Interface:
+		return TypeKindInterface
+	case *Union:
+		return TypeKindUnion
+	case *InputObject:
+		return TypeKindInputObject
 	default:
 		return ""
 	}
 }
 
-func typeNameOrNil(t graphql.Type) any {
+func typeNameOrNil(t Type) any {
 	switch tt := t.(type) {
-	case *graphql.List:
+	case *List:
 		return nil
-	case *graphql.NonNull:
+	case *NonNull:
 		return nil
 	default:
 		if tt == nil {
@@ -347,11 +231,11 @@ func typeNameOrNil(t graphql.Type) any {
 	}
 }
 
-func typeDescriptionOrNil(t graphql.Type) any {
+func typeDescriptionOrNil(t Type) any {
 	switch tt := t.(type) {
-	case *graphql.List:
+	case *List:
 		return nil
-	case *graphql.NonNull:
+	case *NonNull:
 		return nil
 	default:
 		if tt == nil {
@@ -367,9 +251,9 @@ func typeDescriptionOrNil(t graphql.Type) any {
 
 func inputValueName(v any) string {
 	switch tt := v.(type) {
-	case *graphql.Argument:
+	case *Argument:
 		return tt.Name()
-	case *graphql.InputObjectField:
+	case *InputObjectField:
 		return tt.Name()
 	default:
 		return ""
@@ -378,12 +262,12 @@ func inputValueName(v any) string {
 
 func inputValueDescription(v any) any {
 	switch tt := v.(type) {
-	case *graphql.Argument:
+	case *Argument:
 		if tt.Description() == "" {
 			return nil
 		}
 		return tt.Description()
-	case *graphql.InputObjectField:
+	case *InputObjectField:
 		if tt.Description() == "" {
 			return nil
 		}
@@ -393,11 +277,11 @@ func inputValueDescription(v any) any {
 	}
 }
 
-func inputValueType(v any) graphql.Type {
+func inputValueType(v any) Type {
 	switch tt := v.(type) {
-	case *graphql.Argument:
+	case *Argument:
 		return tt.Type
-	case *graphql.InputObjectField:
+	case *InputObjectField:
 		return tt.Type
 	default:
 		return nil
@@ -406,13 +290,13 @@ func inputValueType(v any) graphql.Type {
 
 func inputValueDefaultValue(v any) any {
 	var defaultValue any
-	var valueType graphql.Type
+	var valueType Type
 
 	switch tt := v.(type) {
-	case *graphql.Argument:
+	case *Argument:
 		valueType = tt.Type
 		defaultValue = tt.DefaultValue
-	case *graphql.InputObjectField:
+	case *InputObjectField:
 		valueType = tt.Type
 		defaultValue = tt.DefaultValue
 	default:
@@ -426,7 +310,7 @@ func inputValueDefaultValue(v any) any {
 }
 
 // TODO要补list,input object,enum,null
-func defaultValueLiteral(value any, t graphql.Type) any {
+func defaultValueLiteral(value any, t Type) any {
 	if value == nil {
 		return nil
 	}
@@ -471,11 +355,11 @@ func argValue(field *FieldPlan, name string, inputs map[string]any) any {
 	return nil
 }
 
-func insideWrappedType(t graphql.Type) graphql.Type {
+func insideWrappedType(t Type) Type {
 	switch tt := t.(type) {
-	case *graphql.List:
+	case *List:
 		return tt.OfType
-	case *graphql.NonNull:
+	case *NonNull:
 		return tt.OfType
 	default:
 		return nil
@@ -496,11 +380,22 @@ func isNilInterfaceValue(v any) bool {
 	}
 }
 
-// 将any类型的value转换成对应的类型切片并返回
+// recoveredValueAsError 将任意 panic 值转换为 error，避免对字符串等非 error panic 做类型断言时再次 panic。
+func recoveredValueAsError(recovered any) error {
+	if recoveredErr, ok := recovered.(error); ok {
+		return recoveredErr
+	}
+	return fmt.Errorf("%v", recovered)
+}
+
+// 将any类型的value转换成对应的类型切片并返回。
 func asListValue(value any) ([]any, bool) {
+	// nil、typed-nil slice 和 typed-nil pointer 都保持当前的 GraphQL null 语义。
 	if isNilInterfaceValue(value) {
 		return nil, true
 	}
+
+	// 常用类型保留无反射快路径，避免普通 List resolver 增加反射开销。
 	switch items := value.(type) {
 	case []any:
 		return items, true
@@ -536,14 +431,22 @@ func asListValue(value any) ([]any, bool) {
 		return copySliceToAny(items), true
 	}
 
-	// resolver 可能返回 []string、[]map[string]any 等 typed slice；
-	// 常见类型先走上面的 type switch 快路径，未知 typed slice 再用反射兜底。
 	rv := reflect.ValueOf(value)
+
+	// 与 graphql-go 原生 completeListValue 保持一致：
+	// resolver 返回 *[]T 或 *[N]T 时解引用一层，再按 List 结果处理。
+	if rv.Kind() == reflect.Ptr {
+		rv = rv.Elem()
+		if !rv.IsValid() {
+			return nil, true
+		}
+	}
+
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
 		result := make([]any, rv.Len())
-		for i := 0; i < rv.Len(); i++ {
-			result[i] = rv.Index(i).Interface()
+		for index := 0; index < rv.Len(); index++ {
+			result[index] = rv.Index(index).Interface()
 		}
 		return result, true
 	default:
@@ -573,6 +476,47 @@ func generateCompositeKey(fieldNames []string, source map[string]any) string {
 	return strings.Join(parts, ":")
 }
 
+// responsePathBindingKey将请求级动态响应路径编码成稳定的父结果绑定key。
+// 字段名携带长度且List下标使用独立类型标记，避免不同路径产生相同编码。
+func responsePathBindingKey(path *ResponsePath) (string, error) {
+	if path == nil {
+		return "", errors.New("response path is nil")
+	}
+
+	depth := 0
+	for current := path; current != nil; current = current.Prev {
+		depth++
+	}
+
+	keys := make([]any, depth)
+	index := depth - 1
+	for current := path; current != nil; current = current.Prev {
+		keys[index] = current.Key
+		index--
+	}
+
+	var builder strings.Builder
+	builder.Grow(depth * 8)
+	builder.WriteString("path|")
+	for _, key := range keys {
+		switch value := key.(type) {
+		case string:
+			builder.WriteByte('s')
+			builder.WriteString(strconv.Itoa(len(value)))
+			builder.WriteByte(':')
+			builder.WriteString(value)
+			builder.WriteByte('|')
+		case int:
+			builder.WriteByte('i')
+			builder.WriteString(strconv.Itoa(value))
+			builder.WriteByte('|')
+		default:
+			return "", fmt.Errorf("unsupported response path key type %T", key)
+		}
+	}
+	return builder.String(), nil
+}
+
 func valueToString(value any) string {
 	switch v := value.(type) {
 	case string:
@@ -590,4 +534,33 @@ func valueToString(value any) string {
 	default:
 		return fmt.Sprintf("%v", value)
 	}
+}
+
+func paramsRequireRuntimeEvaluation(params []*ParamPlan) bool {
+	for _, p := range params {
+		if p == nil {
+			continue
+		}
+
+		if p.paramType == PARAM_TYPE_ENUM_INPUT || p.paramType == PARAM_TYPE_ENUM_VAR_TEMPLATE || p.paramType == PARAM_TYPE_ENUM_FIELD_RESPONSE_ATTRIBUTE {
+			return true
+		}
+	}
+	return false
+}
+
+func paramsContainsFieldResponse(params []*ParamPlan) bool {
+	for _, p := range params {
+		if p != nil && p.paramType == PARAM_TYPE_ENUM_FIELD_RESPONSE_ATTRIBUTE {
+			return true
+		}
+	}
+	return false
+}
+
+func appendResponsePath(parent []string, responseName string) []string {
+	result := make([]string, len(parent)+1)
+	copy(result, parent)
+	result[len(parent)] = responseName
+	return result
 }

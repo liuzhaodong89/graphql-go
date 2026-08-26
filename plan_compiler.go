@@ -1,4 +1,4 @@
-package sgraph
+package graphql
 
 import (
 	"context"
@@ -7,15 +7,24 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/language/ast"
 )
 
 type PlanCompiler struct {
-	schema            *graphql.Schema                    //原始schema
+	schema            *Schema                            //原始schema
 	fragments         map[string]*ast.FragmentDefinition //片段信息
 	directiveRegistry *DirectiveRegistry                 //directive注册表
 	fieldIdCounter    atomic.Uint32                      //fieldId生成器
+
+	paramBindings                   *queryParamBindings      //当前query命中的只读外部参数配置
+	fieldBindingFieldIDs            []uint32                 //外部字段参数配置实际命中的fieldId
+	directiveBindingASTs            []*ast.Directive         //外部指令参数配置实际命中的AST occurrence
+	directiveBindingMatches         map[*ast.Directive][]int //用于拒绝覆盖被合并丢弃的普通指令occurrence
+	externalBindingsByDirectivePlan map[*DirectivePlan][]int //把继承的运行期指令追溯到外部配置
+	variableDefinitions             map[string]*ast.VariableDefinition
+	usedVariables                   map[string]struct{}
+	unresolvedParamDependencies     []unresolvedParamDependency
+	fieldOwners                     map[uint32]fieldOwnerKey
 }
 
 // compile阶段Field对象封装
@@ -26,7 +35,7 @@ type FieldFlattenEntry struct {
 	dependencyParams []*ParamPlan
 }
 
-func compileExecutionPlan(document *ast.Document, schema *graphql.Schema, operationName *string, directiveRegistry *DirectiveRegistry) (*SGraphExecutionPlan, error) {
+func compileExecutionPlan(document *ast.Document, schema *Schema, operationName *string, directiveRegistry *DirectiveRegistry, paramRegistry *ParamRegistry) (*SGraphExecutionPlan, error) {
 	//校验参数
 	if document == nil {
 		return nil, errors.New("no document provided")
@@ -43,24 +52,15 @@ func compileExecutionPlan(document *ast.Document, schema *graphql.Schema, operat
 	}
 
 	//解析operation和fragments
-	var operationDefinition *ast.OperationDefinition
+	operationDefinition, operationErr := selectOperationDefinition(document, operationName)
+	if operationErr != nil {
+		return nil, operationErr
+	}
 	fragments := make(map[string]*ast.FragmentDefinition)
 	for _, def := range document.Definitions {
-		switch t := def.(type) {
+		switch definition := def.(type) {
 		case *ast.FragmentDefinition:
-			fragments[t.Name.Value] = t
-		case *ast.OperationDefinition:
-			if operationName != nil {
-				if t.Name != nil && t.Name.Value == *operationName {
-					operationDefinition = t
-				}
-			} else {
-				if operationDefinition == nil {
-					operationDefinition = t
-				} else {
-					return nil, errors.New("operation definition already exists")
-				}
-			}
+			fragments[definition.Name.Value] = definition
 		}
 	}
 	//校验operationDefinition是否解析成功
@@ -71,13 +71,15 @@ func compileExecutionPlan(document *ast.Document, schema *graphql.Schema, operat
 		return nil, errors.New("operation definition is nil because operation name is nil")
 	}
 	compiler.fragments = fragments
+	compiler.initializeParamRegistry(document, operationDefinition, paramRegistry)
+
 	result.schemaResolveInfo.operation = operationDefinition
 	result.schemaResolveInfo.fragments = make(map[string]ast.Definition, len(fragments))
 	for name, fragment := range fragments {
 		result.schemaResolveInfo.fragments[name] = fragment
 	}
 
-	var rootNodeType *graphql.Object
+	var rootNodeType *Object
 	switch operationDefinition.Operation {
 	case "query":
 		rootNodeType = schema.QueryType()
@@ -91,13 +93,13 @@ func compileExecutionPlan(document *ast.Document, schema *graphql.Schema, operat
 	if directiveRegistry != nil {
 		dr = directiveRegistry
 	} else {
-		dr = newDirectiveRegistry()
+		dr = NewDirectiveRegistry()
 	}
 	compiler.directiveRegistry = dr
 
 	//先compile directives，fields tree的编译依赖directives
 	operationLocation := operationDirectiveLocation(operationDefinition.Operation)
-	queryCompiled, queryErr := compiler.compileDirectives(operationDefinition.Directives, operationLocation, nil)
+	queryCompiled, queryErr := compiler.compileDirectives(operationDefinition.Directives, operationLocation, nil, directiveCompileScope{location: operationLocation})
 	if queryErr != nil {
 		return nil, queryErr
 	}
@@ -111,15 +113,91 @@ func compileExecutionPlan(document *ast.Document, schema *graphql.Schema, operat
 		return nil, fieldPlansErr
 	}
 	result.roots = fieldPlans
+	if finalizeErr := compiler.finalizeParamRegistry(fieldPlans); finalizeErr != nil {
+		return nil, finalizeErr
+	}
 	result.maxFieldId = compiler.GetMaxFieldId(fieldPlans)
+	result.fieldPlansById = make(map[uint32]*FieldPlan, int(result.maxFieldId))
+	maxListPathDepth, responsePathErr := prepareResponsePathMetadata(fieldPlans, nil, 0, result.fieldPlansById)
+	if responsePathErr != nil {
+		return nil, responsePathErr
+	}
+	result.maxListPathDepth = maxListPathDepth
 	return result, nil
 }
 
+// prepareResponsePathMetadata预计算动态错误路径所需的静态信息，并同步生成fieldId只读索引。
+func prepareResponsePathMetadata(fields []*FieldPlan, parentPathListDepths []int, ancestorListDepth int, fieldPlansById map[uint32]*FieldPlan) (int, error) {
+	if fieldPlansById == nil {
+		return 0, errors.New("field plan index is nil")
+	}
+	maxListDepth := ancestorListDepth
+	for _, field := range fields {
+		if field == nil {
+			continue
+		}
+		if field.fieldId == 0 {
+			return 0, errors.New("field id must be greater than 0")
+		}
+		if _, exists := fieldPlansById[field.fieldId]; exists {
+			return 0, fmt.Errorf("field id already defined: %d", field.fieldId)
+		}
+		fieldPlansById[field.fieldId] = field
+		if len(field.paths) != len(parentPathListDepths)+1 {
+			return 0, fmt.Errorf("field %s response path depth %d does not match plan tree depth %d", field.responseName, len(field.paths), len(parentPathListDepths)+1)
+		}
+
+		listDepth := 0
+		for wrapper := &field.fieldWrapperTypeInfo; wrapper != nil && wrapper.isList; wrapper = wrapper.elementWrapperTypeInfo {
+			listDepth++
+		}
+		field.pathListDepths = make([]int, len(parentPathListDepths)+1)
+		copy(field.pathListDepths, parentPathListDepths)
+		field.pathListDepths[len(parentPathListDepths)] = listDepth
+
+		currentListDepth := ancestorListDepth + listDepth
+		if currentListDepth > maxListDepth {
+			maxListDepth = currentListDepth
+		}
+
+		childDepth, childErr := prepareResponsePathMetadata(field.childrenFields, field.pathListDepths, currentListDepth, fieldPlansById)
+		if childErr != nil {
+			return 0, childErr
+		}
+		if childDepth > maxListDepth {
+			maxListDepth = childDepth
+		}
+
+		if field.fieldWrapperTypeInfo.isList {
+			for _, child := range field.childrenFields {
+				if child == nil {
+					continue
+				}
+				usesIterationResolver := child.resolverFunc != nil && child.bulkResolverFunc == nil
+				bulkNeedsParentPaths := child.bulkResolverFunc != nil && child.needsOccurrencePath
+				if usesIterationResolver || bulkNeedsParentPaths {
+					field.needsOccurrencePath = true
+					break
+				}
+			}
+		}
+	}
+	return maxListDepth, nil
+}
+
 // 编译指令
-func (compiler *PlanCompiler) compileDirectives(directiveASTs []*ast.Directive, location string, inherited []*DirectivePlan) (*DirectiveCompileResult, error) {
+func (compiler *PlanCompiler) compileDirectives(directiveASTs []*ast.Directive, location string, inherited []*DirectivePlan, scope directiveCompileScope) (*DirectiveCompileResult, error) {
 	result := &DirectiveCompileResult{
 		RuntimePlans: append([]*DirectivePlan{}, inherited...),
 	}
+
+	for _, inheritedPlan := range inherited {
+		if inheritedPlan != nil {
+			appendExternalDirectiveDependencies(result, inheritedPlan.argsPlans)
+		}
+	}
+	scope.location = location
+
 	//校验directives名称、位置、重复使用
 	if directiveValidationErr := compiler.validateDirectiveUsages(directiveASTs, location); directiveValidationErr != nil {
 		return nil, directiveValidationErr
@@ -134,76 +212,138 @@ func (compiler *PlanCompiler) compileDirectives(directiveASTs []*ast.Directive, 
 			return nil, paramPlansErr
 		}
 
+		paramPlans, overriddenParams, bindingErr := compiler.applyDirectiveParamBindings(directiveAST, scope, directiveDef.Args, paramPlans)
+		if bindingErr != nil {
+			return nil, bindingErr
+		}
+
 		directiveCompiler := compiler.directiveRegistry.Compiler(directiveName)
-		//如果directive含有请求变量
-		if paramsContainsRuntimeTypeVariable(paramPlans) {
-			if directiveName == "skip" || directiveName == "include" {
-				runtimeHandler := compiler.directiveRegistry.RuntimeHandler(directiveName)
-				if runtimeHandler == nil {
-					return nil, errors.New("runtime handler for directive " + directiveName + " not found")
+		requiresRuntime := paramsRequireRuntimeEvaluation(paramPlans)
+
+		//metadata-only指令没有编译行为，但仍保留参数plan
+		if directiveCompiler == nil {
+			if !compiler.directiveRegistry.MetadataOnly(directiveName) {
+				return nil, fmt.Errorf("no directive compiler found for %s", directiveName)
+			}
+			if paramsContainsFieldResponse(paramPlans) {
+				return nil, fmt.Errorf("metadata-only directive %s cannot consume FIELD_RESPONSE", directiveName)
+			}
+
+			var argsRaw map[string]any
+			var argsRawErr error
+			if !requiresRuntime {
+				argsRaw, argsRawErr = compileArgsRawFromParamPlans(paramPlans)
+				if argsRawErr != nil {
+					return nil, argsRawErr
 				}
-				result.RuntimePlans = append(result.RuntimePlans, &DirectivePlan{
+			}
+
+			metadataPlan := &DirectivePlan{
+				name:           directiveName,
+				location:       location,
+				argsRaw:        argsRaw,
+				argsPlans:      paramPlans,
+				stage:          DIRECTIVE_STAGE_METADATA_ONLY,
+				runtimeHandler: DefaultEmptyDirectiveRuntimeHandler{},
+			}
+			result.RuntimePlans = append(result.RuntimePlans, metadataPlan)
+			compiler.recordExternalDirectivePlans(directiveAST, scope, []*DirectivePlan{
+				metadataPlan,
+			})
+			continue
+		}
+
+		if requiresRuntime {
+			//skip/include的变量参数直接交给运行时handler判断
+			if directiveName == "skip" || directiveName == "include" {
+				if paramsContainsFieldResponse(paramPlans) {
+					return nil, fmt.Errorf("directive %s cannot consume FIELD_RESPONSE", directiveName)
+				}
+				handler := compiler.directiveRegistry.RuntimeHandler(directiveName)
+				if handler == nil {
+					return nil, fmt.Errorf("no runtime handler found for %s", directiveName)
+				}
+
+				runtimePlan := &DirectivePlan{
 					name:           directiveName,
 					location:       location,
 					argsPlans:      paramPlans,
 					stage:          DIRECTIVE_STAGE_SHOULD_EXECUTE,
-					runtimeHandler: runtimeHandler,
+					runtimeHandler: handler,
+				}
+				result.RuntimePlans = append(result.RuntimePlans, runtimePlan)
+				compiler.recordExternalDirectivePlans(directiveAST, scope, []*DirectivePlan{
+					runtimePlan,
 				})
 				continue
 			}
 
-			//含有请求变量必须支持运行期DirectivePlan
-			runtimeCompiler, runtimeCompilerOk := directiveCompiler.(RuntimeDirectivePlanCompiler)
-			if !runtimeCompilerOk {
-				return nil, errors.New("runtime compiler for directive " + directiveName + " not found")
+			runtimeCompiler, ok := directiveCompiler.(RuntimeDirectivePlanCompiler)
+			if !ok {
+				return nil, fmt.Errorf("no runtime compiler found for %s", directiveName)
 			}
 
-			compiledResult, compiledResultErr := runtimeCompiler.RuntimeCompile(directiveName, location, paramPlans, compiler.schema)
-			if compiledResultErr != nil {
-				return nil, compiledResultErr
+			compiled, compileErr := runtimeCompiler.RuntimeCompile(directiveName, location, paramPlans, compiler.schema)
+			if compileErr != nil {
+				return nil, compileErr
 			}
-			//RuntimeCompiler的DirectivePlan如果有自己的参数按照自己的来，没有则默认使用Directive解析出的ParamPlan
-			for _, rp := range compiledResult.RuntimePlans {
-				if rp != nil && rp.argsPlans == nil {
-					rp.argsPlans = paramPlans
+			if compiled == nil {
+				return nil, fmt.Errorf("runtime compiler for directive %s returned nil", directiveName)
+			}
+
+			if paramsContainsFieldResponse(paramPlans) && !directiveRuntimePlansExecute(compiled.RuntimePlans) {
+				return nil, fmt.Errorf("directive %s FIELD_RESPONSE parameter has no executable runtime plan", directiveName)
+			}
+
+			for _, plan := range compiled.RuntimePlans {
+				if plan == nil {
+					return nil, fmt.Errorf("runtime compiler for directive %s returned a nil runtime plan", directiveName)
+				}
+
+				if plan.name == "" {
+					plan.name = directiveName
+				}
+				if plan.location == "" {
+					plan.location = location
 				}
 			}
-			compiler.bindRuntimeHandler2Directive(compiledResult.RuntimePlans)
-			compiler.mergeCompiledResults(result, compiledResult)
+
+			mergeExternalDirectiveArgPlans(compiled.RuntimePlans, paramPlans, overriddenParams)
+			appendExternalDirectiveDependencies(compiled, paramPlans)
+			compiler.recordExternalDirectivePlans(directiveAST, scope, compiled.RuntimePlans)
+
+			compiler.bindRuntimeHandler2Directive(compiled.RuntimePlans)
+			compiler.mergeCompiledResults(result, compiled)
 			continue
 		}
 
-		//对于没有变量的参数，直接烤制字面量
-		argsRaw, argsRawErr := compiler.compileArgsRawFromDefsAndASTs(directiveDef.Args, directiveAST.Arguments)
-		if argsRawErr != nil {
-			return nil, argsRawErr
+		argsRaw, err := compileArgsRawFromParamPlans(paramPlans)
+		if err != nil {
+			return nil, err
 		}
 
-		if directiveCompiler == nil {
-			if compiler.directiveRegistry.MetadataOnly(directiveName) {
-				result.RuntimePlans = append(result.RuntimePlans, &DirectivePlan{
-					name:           directiveName,
-					argsRaw:        argsRaw,
-					argsPlans:      paramPlans,
-					location:       location,
-					stage:          DIRECTIVE_STAGE_METADATA_ONLY,
-					runtimeHandler: DefaultEmptyDirectiveRuntimeHandler{},
-				})
-				continue
+		compiled, compileErr := directiveCompiler.Compile(directiveName, location, argsRaw, compiler.schema)
+		if compileErr != nil {
+			return nil, compileErr
+		}
+		if compiled == nil {
+			return nil, fmt.Errorf("runtime compiler for directive %s returned nil", directiveName)
+		}
+
+		for _, plan := range compiled.RuntimePlans {
+			if plan == nil {
+				return nil, fmt.Errorf("compiler for directive %s returned a nil runtime plan", directiveName)
 			}
-			return nil, fmt.Errorf("runtime compiler for directive %s not found", directiveName)
-		}
-
-		compiled, compiledErr := directiveCompiler.Compile(directiveName, location, argsRaw, compiler.schema)
-		if compiledErr != nil {
-			return nil, compiledErr
-		}
-
-		for _, rp := range compiled.RuntimePlans {
-			if rp != nil && rp.argsPlans != nil {
-				rp.argsPlans = paramPlans
+			if plan.name == "" {
+				plan.name = directiveName
+			}
+			if plan.location == "" {
+				plan.location = location
 			}
 		}
+		mergeExternalDirectiveArgPlans(compiled.RuntimePlans, paramPlans, overriddenParams)
+		appendExternalDirectiveDependencies(compiled, paramPlans)
+		compiler.recordExternalDirectivePlans(directiveAST, scope, compiled.RuntimePlans)
 		compiler.bindRuntimeHandler2Directive(compiled.RuntimePlans)
 		compiler.mergeCompiledResults(result, compiled)
 	}
@@ -237,7 +377,7 @@ func (compiler *PlanCompiler) validateDirectiveUsages(directiveASTs []*ast.Direc
 	return nil
 }
 
-func (compiler *PlanCompiler) validateDirectiveLocation(directiveDefinition *graphql.Directive, location string) bool {
+func (compiler *PlanCompiler) validateDirectiveLocation(directiveDefinition *Directive, location string) bool {
 	for _, allowedLocation := range directiveDefinition.Locations {
 		if allowedLocation == location {
 			return true
@@ -247,9 +387,9 @@ func (compiler *PlanCompiler) validateDirectiveLocation(directiveDefinition *gra
 }
 
 // 根据argDefinition解析出ParamPlan
-func (compiler *PlanCompiler) compileParamPlansByArgDefs(argDefs []*graphql.Argument, argASTs []*ast.Argument) ([]*ParamPlan, error) {
+func (compiler *PlanCompiler) compileParamPlansByArgDefs(argDefs []*Argument, argASTs []*ast.Argument) ([]*ParamPlan, error) {
 	//校验argASTs使用是否合法
-	defMap := make(map[string]*graphql.Argument)
+	defMap := make(map[string]*Argument)
 	for _, argDef := range argDefs {
 		defMap[argDef.Name()] = argDef
 	}
@@ -257,7 +397,7 @@ func (compiler *PlanCompiler) compileParamPlansByArgDefs(argDefs []*graphql.Argu
 	astMap := map[string]*ast.Argument{}
 	for _, astArg := range argASTs {
 		if astArg == nil || astArg.Name == nil {
-			return nil, fmt.Errorf("invalid argument: %s", astArg.Name)
+			return nil, fmt.Errorf("invalid argument:argument or its name is nil")
 		}
 		astName := astArg.Name.Value
 		if _, ok := defMap[astName]; !ok {
@@ -276,16 +416,12 @@ func (compiler *PlanCompiler) compileParamPlansByArgDefs(argDefs []*graphql.Argu
 
 		if !provided {
 			if argDef.DefaultValue != nil {
-				compiledDefault, compiledDefaultErr := compiler.compileInputValue(argDef.Type, argDef.DefaultValue)
-				if compiledDefaultErr != nil {
-					return nil, compiledDefaultErr
-				}
-				result = append(result, newConstParamPlan(argDef.PrivateName, compiledDefault))
+				result = append(result, newConstParamPlan(argDef.PrivateName, argDef.DefaultValue))
 				continue
 			}
 
 			if isNonNullInput(argDef.Type) {
-				return nil, fmt.Errorf("non-null input argument definition: %s", argDef.Name)
+				return nil, fmt.Errorf("non-null input argument definition: %s", argDef.Name())
 			}
 			continue
 		}
@@ -294,15 +430,11 @@ func (compiler *PlanCompiler) compileParamPlansByArgDefs(argDefs []*graphql.Argu
 		if variable, vok := argAST.Value.(*ast.Variable); vok {
 			//校验实参名是否为空
 			if variable.Name == nil {
-				return nil, fmt.Errorf("invalid variable definition: %s", variable.Name)
+				return nil, fmt.Errorf("invalid variable definition")
 			}
 			inputParamPlan := newInputParamPlan(argDef.Name(), variable.Name.Value)
 			if argDef.DefaultValue != nil {
-				compiledDefaultVal, compiledDefaultValErr := compiler.compileInputValue(argDef.Type, argDef.DefaultValue)
-				if compiledDefaultValErr != nil {
-					return nil, compiledDefaultValErr
-				}
-				inputParamPlan.inputDefaultValue = compiledDefaultVal
+				inputParamPlan.inputDefaultValue = argDef.DefaultValue
 			}
 			result = append(result, inputParamPlan)
 			continue
@@ -315,27 +447,20 @@ func (compiler *PlanCompiler) compileParamPlansByArgDefs(argDefs []*graphql.Argu
 		}
 
 		//纯字面量参数，烤制成常量
-		value, valueErr := valueFromAST(argAST.Value, argDef.Type, nil)
-		if valueErr != nil {
-			return nil, valueErr
-		}
-		inputValue, inputValueErr := compiler.compileInputValue(argDef.Type, value)
-		if inputValueErr != nil {
-			return nil, inputValueErr
-		}
-		result = append(result, newConstParamPlan(argDef.PrivateName, inputValue))
+		value := valueFromAST(argAST.Value, argDef.Type, nil)
+		result = append(result, newConstParamPlan(argDef.PrivateName, value))
 	}
 	return result, nil
 }
 
-func (compiler *PlanCompiler) compileInputValue(inputType graphql.Input, source any) (any, error) {
+func (compiler *PlanCompiler) compileInputValue(inputType Input, source any) (any, error) {
 	//检查并拆开封装类型non-null
-	if nonNullType, ok := inputType.(*graphql.NonNull); ok {
+	if nonNullType, ok := inputType.(*NonNull); ok {
 		if source == nil {
 			return nil, fmt.Errorf("non null input value is required")
 		}
 
-		innerType, innerOk := nonNullType.OfType.(graphql.Input)
+		innerType, innerOk := nonNullType.OfType.(Input)
 		if !innerOk {
 			return nil, fmt.Errorf("non null input base type is required")
 		}
@@ -349,8 +474,8 @@ func (compiler *PlanCompiler) compileInputValue(inputType graphql.Input, source 
 	}
 
 	switch t := inputType.(type) {
-	case *graphql.List:
-		inner := t.OfType.(graphql.Input)
+	case *List:
+		inner := t.OfType.(Input)
 
 		if isSlice(source) {
 			sourceItems := toAnySlice(source)
@@ -374,7 +499,7 @@ func (compiler *PlanCompiler) compileInputValue(inputType graphql.Input, source 
 
 		return []any{single}, nil
 
-	case *graphql.InputObject:
+	case *InputObject:
 		sourceMap, ok := source.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("input value is required")
@@ -411,13 +536,13 @@ func (compiler *PlanCompiler) compileInputValue(inputType graphql.Input, source 
 			result[fieldName] = parsedFieldValue
 		}
 		return result, nil
-	case *graphql.Scalar:
+	case *Scalar:
 		parsed := t.ParseValue(source)
 		if parsed == nil {
 			return nil, fmt.Errorf("scalar is required")
 		}
 		return parsed, nil
-	case *graphql.Enum:
+	case *Enum:
 		parsed := t.ParseValue(source)
 		if parsed == nil {
 			return nil, fmt.Errorf("enum is required")
@@ -431,7 +556,11 @@ func (compiler *PlanCompiler) compileInputValue(inputType graphql.Input, source 
 // 查找directive注册表中的handler，绑定到DirectivePlan上
 func (compiler *PlanCompiler) bindRuntimeHandler2Directive(directivePlans []*DirectivePlan) {
 	for _, plan := range directivePlans {
-		if plan != nil {
+		if plan == nil {
+			continue
+		}
+		//已经绑定runtimeHandler的跳过
+		if plan.runtimeHandler != nil {
 			continue
 		}
 
@@ -443,54 +572,57 @@ func (compiler *PlanCompiler) bindRuntimeHandler2Directive(directivePlans []*Dir
 
 		if plan.stage == DIRECTIVE_STAGE_METADATA_ONLY {
 			plan.runtimeHandler = &DefaultEmptyDirectiveRuntimeHandler{}
-			continue
 		}
 	}
 }
 
 // 合并指令编译结果。对于selection是否裁剪，以source为准。
-func (compiler *PlanCompiler) mergeCompiledResults(src *DirectiveCompileResult, dst *DirectiveCompileResult) {
-	if src.IncludeDecision == false {
-		include := false
-		dst.IncludeDecision = include
+func (compiler *PlanCompiler) mergeCompiledResults(dst *DirectiveCompileResult, src *DirectiveCompileResult) {
+	if src == nil || dst == nil {
+		return
+	}
+	if src.IncludeDecision != nil {
+		if *src.IncludeDecision == false || dst.IncludeDecision == nil {
+			include := *src.IncludeDecision
+			dst.IncludeDecision = &include
+		}
 	}
 
 	dst.RuntimePlans = append(dst.RuntimePlans, src.RuntimePlans...)
 	dst.DependencyParamPlans = append(dst.DependencyParamPlans, src.DependencyParamPlans...)
 }
 
-func (compiler *PlanCompiler) compileArgsRawFromDefsAndASTs(argDefs []*graphql.Argument, argASTs []*ast.Argument) (map[string]any, error) {
-	argDefMap := make(map[string]*graphql.Argument)
+func (compiler *PlanCompiler) compileArgsRawFromDefsAndASTs(argDefs []*Argument, argASTs []*ast.Argument) (map[string]any, error) {
+	argDefMap := make(map[string]*Argument, len(argDefs))
 	for _, argDef := range argDefs {
+		if argDef == nil {
+			return nil, errors.New("directive argument definition is required")
+		}
 		argDefMap[argDef.Name()] = argDef
 	}
 
-	argASTMap := make(map[string]*ast.Argument)
+	argASTMap := make(map[string]*ast.Argument, len(argASTs))
 	for _, argAST := range argASTs {
+		if argAST == nil || argAST.Name == nil {
+			return nil, errors.New("directive argument AST is invalid")
+		}
 		argName := argAST.Name.Value
-		_, ok := argDefMap[argName]
-		if !ok {
-			return nil, fmt.Errorf("unknown argument %s", argName)
+		if _, exists := argDefMap[argName]; !exists {
+			return nil, fmt.Errorf("unknown argument definition %s", argName)
+		}
+		if _, exists := argASTMap[argName]; exists {
+			return nil, fmt.Errorf("duplicate argument AST %s", argName)
 		}
 		argASTMap[argName] = argAST
 	}
 
-	result := make(map[string]any)
+	result := make(map[string]any, len(argDefs))
 
-	for argName, argDef := range argDefMap {
+	for _, argDef := range argDefs {
+		argName := argDef.Name()
 		argAST, provided := argASTMap[argName]
 		if provided {
-			value, valErr := valueFromAST(argAST.Value, argDef.Type, nil)
-			if valErr != nil {
-				return nil, valErr
-			}
-
-			compiledValue, compiledValErr := compiler.compileInputValue(argDef, value)
-			if compiledValErr != nil {
-				return nil, compiledValErr
-			}
-
-			result[argName] = compiledValue
+			result[argName] = valueFromAST(argAST.Value, argDef.Type, nil)
 			continue
 		}
 
@@ -510,11 +642,11 @@ func (compiler *PlanCompiler) compileArgsRawFromDefsAndASTs(argDefs []*graphql.A
 func operationDirectiveLocation(operation string) string {
 	switch operation {
 	case ast.OperationTypeMutation:
-		return graphql.DirectiveLocationMutation
+		return DirectiveLocationMutation
 	case ast.OperationTypeSubscription:
-		return graphql.DirectiveLocationSubscription
+		return DirectiveLocationSubscription
 	default:
-		return graphql.DirectiveLocationQuery
+		return DirectiveLocationQuery
 	}
 }
 
@@ -526,20 +658,20 @@ func (compiler *PlanCompiler) compileSelectionSetWithFlattenEntries(current *ast
 	if current == nil {
 		return nil, nil
 	}
-	fieldEntries, fieldEntriesErr := compiler.flattenSelections(current, fieldTypeScope, inheritedDirectives)
+	fieldEntries, fieldEntriesErr := compiler.flattenSelections(current, fieldTypeScope, inheritedDirectives, parentPaths)
 	if fieldEntriesErr != nil {
 		return nil, fieldEntriesErr
 	}
 	return compiler.compileFieldPlansFromEntries(fieldEntries, parentFieldId, parentFieldIsList, parentPaths, isIntrospection)
 }
 
-func (compiler *PlanCompiler) flattenSelections(selectionSet *ast.SelectionSet, fieldTypeScope *FieldTypeScope, inheritedDirectives []*DirectivePlan) ([]FieldFlattenEntry, error) {
+func (compiler *PlanCompiler) flattenSelections(selectionSet *ast.SelectionSet, fieldTypeScope *FieldTypeScope, inheritedDirectives []*DirectivePlan, parentPaths []string) ([]FieldFlattenEntry, error) {
 	if selectionSet == nil {
 		return nil, nil
 	}
 	var result []FieldFlattenEntry
 	for _, selection := range selectionSet.Selections {
-		fieldEntries, fieldEntriesErr := compiler.flattenOneSelection(selection, fieldTypeScope, inheritedDirectives)
+		fieldEntries, fieldEntriesErr := compiler.flattenOneSelection(selection, fieldTypeScope, inheritedDirectives, parentPaths)
 		if fieldEntriesErr != nil {
 			return nil, fieldEntriesErr
 		}
@@ -548,15 +680,21 @@ func (compiler *PlanCompiler) flattenSelections(selectionSet *ast.SelectionSet, 
 	return result, nil
 }
 
-func (compiler *PlanCompiler) flattenOneSelection(selection ast.Selection, parentFieldTypeScope *FieldTypeScope, inheritedDirectives []*DirectivePlan) ([]FieldFlattenEntry, error) {
+func (compiler *PlanCompiler) flattenOneSelection(selection ast.Selection, parentFieldTypeScope *FieldTypeScope, inheritedDirectives []*DirectivePlan, parentPaths []string) ([]FieldFlattenEntry, error) {
 	switch sel := selection.(type) {
 	case *ast.Field:
+		fieldName := ""
+		if sel.Name != nil {
+			fieldName = sel.Name.Value
+		}
+
+		responsePath := appendResponsePath(parentPaths, getASTResponseName(sel))
 		//编译指令，根据指令编译期的结果判断是否返回FieldPlan
-		compiledDrectives, compiledDirectivesErr := compiler.compileDirectives(sel.Directives, graphql.DirectiveLocationField, inheritedDirectives)
+		compiledDrectives, compiledDirectivesErr := compiler.compileDirectives(sel.Directives, DirectiveLocationField, inheritedDirectives, directiveCompileScope{responsePath: responsePath, parentTypeName: fieldTypeScopeName(parentFieldTypeScope), fieldName: fieldName})
 		if compiledDirectivesErr != nil {
 			return nil, compiledDirectivesErr
 		}
-		if compiledDrectives != nil && compiledDrectives.IncludeDecision == false {
+		if compiledDrectives != nil && compiledDrectives.IncludeDecision != nil && *compiledDrectives.IncludeDecision == false {
 			return nil, nil
 		}
 		return []FieldFlattenEntry{{
@@ -566,30 +704,36 @@ func (compiler *PlanCompiler) flattenOneSelection(selection ast.Selection, paren
 			dependencyParams: compiledDrectives.DependencyParamPlans,
 		}}, nil
 	case *ast.InlineFragment:
-		compiled, compiledErr := compiler.compileDirectives(sel.Directives, graphql.DirectiveLocationInlineFragment, inheritedDirectives)
+		compiled, compiledErr := compiler.compileDirectives(sel.Directives, DirectiveLocationInlineFragment, inheritedDirectives, directiveCompileScope{responsePath: parentPaths})
 		if compiledErr != nil {
 			return nil, compiledErr
 		}
-		if compiled != nil && compiled.IncludeDecision == false {
+		if compiled != nil && compiled.IncludeDecision != nil && *compiled.IncludeDecision == false {
 			return nil, nil
 		}
-		croppedFieldTypeScope, croppedFieldTypeScopeErr := cropFieldTypeScope(compiler, parentFieldTypeScope, sel.TypeCondition)
-		if croppedFieldTypeScopeErr != nil {
-			return nil, croppedFieldTypeScopeErr
+		//内联fragment允许没有类型判断，此时搭配directive使用，类型直接继承父字段
+		inlineFieldTypeScope := parentFieldTypeScope
+		if sel.TypeCondition != nil {
+			croppedFieldTypeScope, croppedFieldTypeScopeErr := cropFieldTypeScope(compiler, parentFieldTypeScope, sel.TypeCondition)
+			if croppedFieldTypeScopeErr != nil {
+				return nil, croppedFieldTypeScopeErr
+			}
+			inlineFieldTypeScope = croppedFieldTypeScope
 		}
-		return compiler.flattenSelections(sel.SelectionSet, croppedFieldTypeScope, compiled.RuntimePlans)
+		return compiler.flattenSelections(sel.SelectionSet, inlineFieldTypeScope, compiled.RuntimePlans, parentPaths)
 	case *ast.FragmentSpread:
-		spreadCompiledDirectives, spreadCompiledDirectivesErr := compiler.compileDirectives(sel.Directives, graphql.DirectiveLocationFragmentSpread, inheritedDirectives)
-		if spreadCompiledDirectivesErr != nil {
-			return nil, spreadCompiledDirectivesErr
-		}
-		if spreadCompiledDirectives != nil && spreadCompiledDirectives.IncludeDecision == false {
-			return nil, nil
-		}
 		//检查片段是否存在
 		if sel.Name == nil {
 			return nil, fmt.Errorf("no fragment spread found")
 		}
+		spreadCompiledDirectives, spreadCompiledDirectivesErr := compiler.compileDirectives(sel.Directives, DirectiveLocationFragmentSpread, inheritedDirectives, directiveCompileScope{responsePath: parentPaths, fragmentName: sel.Name.Value})
+		if spreadCompiledDirectivesErr != nil {
+			return nil, spreadCompiledDirectivesErr
+		}
+		if spreadCompiledDirectives != nil && spreadCompiledDirectives.IncludeDecision != nil && *spreadCompiledDirectives.IncludeDecision == false {
+			return nil, nil
+		}
+
 		spreadFrag, spreadFragOk := compiler.fragments[sel.Name.Value]
 		if !spreadFragOk {
 			return nil, fmt.Errorf("no fragment spread found for %s", sel.Name.Value)
@@ -598,11 +742,14 @@ func (compiler *PlanCompiler) flattenOneSelection(selection ast.Selection, paren
 		if croppedTypeScopeErr != nil {
 			return nil, croppedTypeScopeErr
 		}
-		fragCompiledDirectives, fragCompiledDirectivesErr := compiler.compileDirectives(sel.Directives, graphql.DirectiveLocationFragmentSpread, spreadCompiledDirectives.RuntimePlans)
+		fragCompiledDirectives, fragCompiledDirectivesErr := compiler.compileDirectives(spreadFrag.Directives, DirectiveLocationFragmentDefinition, spreadCompiledDirectives.RuntimePlans, directiveCompileScope{fragmentName: sel.Name.Value})
 		if fragCompiledDirectivesErr != nil {
 			return nil, fragCompiledDirectivesErr
 		}
-		return compiler.flattenSelections(spreadFrag.SelectionSet, croppedTypeScope, fragCompiledDirectives.RuntimePlans)
+		if fragCompiledDirectives.IncludeDecision != nil && *fragCompiledDirectives.IncludeDecision == false {
+			return nil, nil
+		}
+		return compiler.flattenSelections(spreadFrag.SelectionSet, croppedTypeScope, fragCompiledDirectives.RuntimePlans, parentPaths)
 	}
 	return nil, nil
 }
@@ -645,6 +792,9 @@ func (compiler *PlanCompiler) compileFieldPlansFromEntries(fieldEntries []FieldF
 	for _, key := range orderedKeys {
 		group := groups[key]
 
+		if err := compiler.validateDiscardedDirectiveOverrides(group.fieldEntries); err != nil {
+			return nil, err
+		}
 		field := group.fieldEntries[0].field
 		skipIncludeDirectiveGroups := make([][]*DirectivePlan, 0, len(group.fieldEntries))
 		//每个重复字段都保留自己的 @skip/@include 条件，运行期按 OR 语义判断
@@ -664,22 +814,22 @@ func (compiler *PlanCompiler) compileFieldPlansFromEntries(fieldEntries []FieldF
 
 		//根据不同类型的内省字段走不同的FieldPlan生成方法
 		switch fieldName {
-		case graphql.IntrospectionFieldNameMetaSchema:
-			return compiler.compileIntrospectionMetaSchemaField(field, group.fieldTypeScope, parentFieldId, parentPaths, runtimeDirectives, group.dependencyParams, skipIncludeDirectiveGroups, fieldEntries)
-		case graphql.IntrospectionFieldNameTypename:
-			return compiler.compileIntrospectionTypenameField(field, group.fieldTypeScope, parentFieldId, parentFieldIsList, runtimeDirectives, group.dependencyParams, parentPaths, skipIncludeDirectiveGroups)
-		case graphql.IntrospectionFieldNameMetaType:
-			return compiler.compileIntrospectionMetaTypeField(field, group.fieldTypeScope, parentFieldId, runtimeDirectives, group.dependencyParams, parentPaths, skipIncludeDirectiveGroups, fieldEntries)
+		case IntrospectionFieldNameMetaSchema:
+			fieldPlans, fieldErr = compiler.compileIntrospectionMetaSchemaField(field, group.fieldTypeScope, parentFieldId, parentPaths, runtimeDirectives, group.dependencyParams, skipIncludeDirectiveGroups, group.fieldEntries)
+		case IntrospectionFieldNameTypename:
+			fieldPlans, fieldErr = compiler.compileIntrospectionTypenameField(field, group.fieldTypeScope, parentFieldId, parentFieldIsList, runtimeDirectives, group.dependencyParams, parentPaths, skipIncludeDirectiveGroups)
+		case IntrospectionFieldNameMetaType:
+			fieldPlans, fieldErr = compiler.compileIntrospectionMetaTypeField(field, group.fieldTypeScope, parentFieldId, runtimeDirectives, group.dependencyParams, parentPaths, skipIncludeDirectiveGroups, group.fieldEntries)
 		default:
 			if isIntrospection {
 				var fieldPlan *FieldPlan
-				fieldPlan, fieldErr = compiler.compileCommonIntrospectionField(field, parentFieldId, group.fieldTypeScope, parentPaths, runtimeDirectives, group.dependencyParams, skipIncludeDirectiveGroups, fieldEntries)
-				if fieldErr == nil {
+				fieldPlan, fieldErr = compiler.compileCommonIntrospectionField(field, parentFieldId, group.fieldTypeScope, parentPaths, runtimeDirectives, group.dependencyParams, skipIncludeDirectiveGroups, group.fieldEntries)
+				if fieldErr == nil && fieldPlan != nil {
 					fieldPlans = []*FieldPlan{fieldPlan}
 				}
 			} else {
 				//默认字段走默认FieldPlan生成方法
-				fieldPlans, fieldErr = compiler.compileFieldPlans(field, parentFieldId, group.fieldTypeScope, parentFieldIsList, parentPaths, runtimeDirectives, group.dependencyParams, skipIncludeDirectiveGroups, fieldEntries)
+				fieldPlans, fieldErr = compiler.compileFieldPlans(field, parentFieldId, group.fieldTypeScope, parentFieldIsList, parentPaths, runtimeDirectives, group.dependencyParams, skipIncludeDirectiveGroups, group.fieldEntries)
 			}
 		}
 		if fieldErr != nil {
@@ -696,14 +846,19 @@ func (compiler *PlanCompiler) generateFieldId() uint32 {
 }
 
 func (compiler *PlanCompiler) compileFieldPlans(current ast.Field, parentFieldId uint32, parentTypeScope *FieldTypeScope, parentFieldIsList bool, parentPaths []string, directivePlans []*DirectivePlan, directiveDependencyParams []*ParamPlan, skipIncludeDirectivePlans [][]*DirectivePlan, fieldEntries []FieldFlattenEntry) ([]*FieldPlan, error) {
+	if current.Name == nil || current.Name.Value == "" {
+		return nil, errors.New("field name is required")
+	}
+	//fieldName
+	fieldName := current.Name.Value
 	//ResponseName
 	responseName := getASTResponseName(&current)
 	//FieldId
 	fieldId := compiler.generateFieldId()
 	//paths
-	paths := append(parentPaths, responseName)
+	paths := appendResponsePath(parentPaths, responseName)
 	//FieldWrapperTypeInfo
-	fieldDefinition, fieldDefinitionErr := getFieldDefinition(parentTypeScope.declaredType, responseName)
+	fieldDefinition, fieldDefinitionErr := getFieldDefinition(parentTypeScope.declaredType, fieldName)
 	if fieldDefinitionErr != nil {
 		return nil, fieldDefinitionErr
 	}
@@ -714,17 +869,41 @@ func (compiler *PlanCompiler) compileFieldPlans(current ast.Field, parentFieldId
 	if fieldWrapperTypeInfo == nil {
 		return nil, fmt.Errorf("compile field wrapper type info error")
 	}
+	if fieldDefinition.BulkResolve != nil {
+		baseType, baseTypeErr := getBaseType(fieldDefinition.Type)
+		if baseTypeErr != nil {
+			return nil, baseTypeErr
+		}
+		switch baseType.(type) {
+		case *Scalar, *Enum:
+			return nil, fmt.Errorf("bulk resolver field %s must return object values carrying %s", responseName, fieldDefinition.BulkResultMappedFieldName)
+		}
+	}
 	//ParentFieldKeyName
-	parentKeyFieldName := compiler.checkAndCompileParentKeyFieldNames(parentFieldIsList, parentTypeScope)
-	fieldHasResolver := fieldDefinition.Resolve != nil || fieldDefinition.BulkResolve != nil
-	if parentFieldIsList && fieldHasResolver && parentKeyFieldName == "" {
-		return nil, fmt.Errorf("parent key field name for resolver %s result binding is empty", responseName)
+	parentKeyFieldName, parentKeyCandidateFieldNames := compiler.checkAndCompileParentKeyFieldNames(parentFieldIsList, parentTypeScope)
+	// Bulk结果允许乱序和一对多，只能使用业务key关联父元素；普通逐元素resolver可回退到请求级父occurrence路径。
+	if parentFieldIsList && fieldDefinition.BulkResolve != nil && parentKeyFieldName == "" {
+		if len(parentKeyCandidateFieldNames) > 1 {
+			// 父类型声明了多个ID字段时无法推断身份字段，此处报错而不是任选一个，
+			// 否则父子映射会整体落空并静默返回空列表。
+			return nil, fmt.Errorf("parent key field name for bulk resolver %s result binding is ambiguous: parent type %s declares multiple ID fields %v, declare an id: ID! field on the parent type to disambiguate", responseName, fieldTypeScopeName(parentTypeScope), parentKeyCandidateFieldNames)
+		}
+		return nil, fmt.Errorf("parent key field name for bulk resolver %s result binding is empty", responseName)
 	}
 	//ParamPlans
 	paramPlans, paramPlansErr := compiler.compileParamPlansByArgDefs(fieldDefinition.Args, current.Arguments)
 	if paramPlansErr != nil {
 		return nil, paramPlansErr
 	}
+
+	fieldOwner := fieldOwnerFromPlanScope(paths, parentTypeScope, fieldName)
+	compiler.recordFieldOwner(fieldId, fieldOwner)
+
+	paramPlans, paramPlansErr = compiler.applyFieldParamBindings(fieldOwner, fieldId, fieldDefinition.Args, paramPlans)
+	if paramPlansErr != nil {
+		return nil, paramPlansErr
+	}
+
 	//当前Field是否必须在ParentField之后执行
 	usesNormalResolver := fieldDefinition.Resolve != nil && (!parentFieldIsList || fieldDefinition.BulkResolve == nil)
 	//父节点存在且当前节点是普通节点且父节点是List类型或者父节点类型需要运行时动态判定
@@ -741,12 +920,10 @@ func (compiler *PlanCompiler) compileFieldPlans(current ast.Field, parentFieldId
 			paramPlans = append(paramPlans, newFieldResponseRawParamPlan(parentFieldId))
 		}
 	}
+
 	//ArrParamPlans
-	//TODO 是否直接使用字段上的参数
-	arrParamPlans, arrParamPlansErr := compiler.compileParamPlansByArgDefs(fieldDefinition.Args, current.Arguments)
-	if arrParamPlansErr != nil {
-		return nil, arrParamPlansErr
-	}
+	arrParamPlans := append([]*ParamPlan(nil), paramPlans...)
+
 	//ResultParentKeyName
 	resultParentKeyName := fieldDefinition.BulkResultMappedFieldName
 	if fieldDefinition.BulkResolve != nil && fieldDefinition.BulkResultMappedFieldName == "" {
@@ -762,7 +939,7 @@ func (compiler *PlanCompiler) compileFieldPlans(current ast.Field, parentFieldId
 	var childrenFieldsErr error
 	if len(fieldEntries) > 0 {
 		var childrenEntries []FieldFlattenEntry
-		childrenEntries, childrenFieldsErr = compiler.flattenChildrenFieldEntriesForField(fieldEntries, fieldTypeScope)
+		childrenEntries, childrenFieldsErr = compiler.flattenChildrenFieldEntriesForField(fieldEntries, fieldTypeScope, paths)
 		if childrenFieldsErr == nil {
 			childrenFields, childrenFieldsErr = compiler.compileFieldPlansFromEntries(childrenEntries, fieldId, fieldWrapperTypeInfo.isList, paths, false)
 		}
@@ -774,23 +951,24 @@ func (compiler *PlanCompiler) compileFieldPlans(current ast.Field, parentFieldId
 	}
 
 	fieldPlan := &FieldPlan{
-		fieldId:                    fieldId,
-		fieldName:                  current.Name.Value,
-		responseName:               responseName,
-		paths:                      paths,
-		fieldWrapperTypeInfo:       *fieldWrapperTypeInfo,
-		fieldASTs:                  fieldASTsForFieldPlanAsLegacy(current, fieldEntries),
-		returnType:                 fieldDefinition.Type,
-		parentType:                 getParentCompositeFromScope(parentTypeScope),
-		parentFieldId:              parentFieldId,
-		resultParentKeyName:        resultParentKeyName,
-		parentKeyFieldName:         parentKeyFieldName,
-		childrenFields:             childrenFields,
-		paramPlans:                 paramPlans,
-		resolverFunc:               wrapFieldResolverFunc(fieldDefinition.Resolve),
-		bulkParamPlans:             arrParamPlans,
-		bulkResolverFunc:           wrapFieldResolverFunc(fieldDefinition.BulkResolve),
-		fieldTypeScope:             fieldTypeScope,
+		fieldId:              fieldId,
+		fieldName:            fieldName,
+		responseName:         responseName,
+		paths:                paths,
+		fieldWrapperTypeInfo: *fieldWrapperTypeInfo,
+		fieldASTs:            fieldASTsForFieldPlanAsLegacy(current, fieldEntries),
+		returnType:           fieldDefinition.Type,
+		parentType:           getParentCompositeFromScope(parentTypeScope),
+		parentFieldId:        parentFieldId,
+		resultParentKeyName:  resultParentKeyName,
+		parentKeyFieldName:   parentKeyFieldName,
+		childrenFields:       childrenFields,
+		paramPlans:           paramPlans,
+		resolverFunc:         wrapFieldResolverFunc(fieldDefinition.Resolve),
+		bulkParamPlans:       arrParamPlans,
+		bulkResolverFunc:     wrapFieldResolverFunc(fieldDefinition.BulkResolve),
+		// FieldPlan保存字段所属父对象的类型范围；字段返回类型范围只用于递归编译childrenFields。
+		fieldTypeScope:             parentTypeScope,
 		directivePlans:             directivePlans,
 		directiveParamPlans:        directiveDependencyParams,
 		skipIncludeDirectiveGroups: skipIncludeDirectivePlans,
@@ -807,13 +985,13 @@ func (compiler *PlanCompiler) compileIntrospectionTypenameField(current ast.Fiel
 	}
 
 	fieldId = compiler.generateFieldId()
-	paths := append(parentPaths, responseName)
+	paths := appendResponsePath(parentPaths, responseName)
 
 	fieldWrapperTypeInfo := FieldWrapperTypeInfo{
 		isList:                 false,
 		notNil:                 true,
 		fieldElementTypeEnum:   FIELD_ELEMENT_TYPE_SCALAR,
-		baseType:               graphql.String,
+		baseType:               String,
 		elementWrapperTypeInfo: nil,
 	}
 	//childrenFields
@@ -841,15 +1019,17 @@ func (compiler *PlanCompiler) compileIntrospectionTypenameField(current ast.Fiel
 		paramPlans = append(paramPlans, typeNameParamPlan)
 	}
 	//parentKeyFieldName
-	parentKeyFieldName := compiler.checkAndCompileParentKeyFieldNames(parentFieldIsList, parentFieldTypeScope)
-	returnType := graphql.Output(graphql.String)
-	if graphql.TypeNameMetaFieldDef != nil && graphql.TypeNameMetaFieldDef.Type != nil {
-		returnType = graphql.TypeNameMetaFieldDef.Type
+	// __typename由父元素实际类型直接完成，bindIterationResponse对它提前返回，
+	// 该取值不参与父子绑定，因此候选歧义在这里无需处理。
+	parentKeyFieldName, _ := compiler.checkAndCompileParentKeyFieldNames(parentFieldIsList, parentFieldTypeScope)
+	returnType := Output(String)
+	if TypeNameMetaFieldDef != nil && TypeNameMetaFieldDef.Type != nil {
+		returnType = TypeNameMetaFieldDef.Type
 	}
 	fieldPlan := &FieldPlan{
 		fieldId:                    fieldId,
 		parentFieldId:              parentFieldId,
-		fieldName:                  graphql.IntrospectionFieldNameTypename,
+		fieldName:                  IntrospectionFieldNameTypename,
 		responseName:               responseName,
 		paths:                      paths,
 		fieldWrapperTypeInfo:       fieldWrapperTypeInfo,
@@ -884,9 +1064,9 @@ func (compiler *PlanCompiler) compileIntrospectionMetaTypeField(currentField ast
 	//fieldId
 	fieldId := compiler.generateFieldId()
 	//paths
-	paths := append(parentPaths, responseName)
+	paths := appendResponsePath(parentPaths, responseName)
 	//FieldWrapperTypeInfo
-	fieldDef := graphql.TypeMetaFieldDef
+	fieldDef := TypeMetaFieldDef
 	if fieldDef == nil {
 		return nil, fmt.Errorf("__type meta field definition is nil")
 	}
@@ -903,7 +1083,7 @@ func (compiler *PlanCompiler) compileIntrospectionMetaTypeField(currentField ast
 		return nil, paramPlansErr
 	}
 	//fieldTypeScope
-	fieldTypeScope, fieldTypeScopeErr := wrapStaticFieldTypeScope(graphql.TypeType)
+	fieldTypeScope, fieldTypeScopeErr := wrapStaticFieldTypeScope(TypeType)
 	if fieldTypeScopeErr != nil {
 		return nil, fieldTypeScopeErr
 	}
@@ -912,18 +1092,18 @@ func (compiler *PlanCompiler) compileIntrospectionMetaTypeField(currentField ast
 	var childrenFieldsErr error
 	if len(fieldEntries) > 0 {
 		var childFlattenEntries []FieldFlattenEntry
-		childFlattenEntries, childrenFieldsErr = compiler.flattenChildrenFieldEntriesForField(fieldEntries, fieldTypeScope)
+		childFlattenEntries, childrenFieldsErr = compiler.flattenChildrenFieldEntriesForField(fieldEntries, fieldTypeScope, paths)
 		if childrenFieldsErr == nil {
-			childrenFields, childrenFieldsErr = compiler.compileFieldPlansFromEntries(childFlattenEntries, parentFieldId, fieldWrapperTypeInfo.isList, paths, true)
+			childrenFields, childrenFieldsErr = compiler.compileFieldPlansFromEntries(childFlattenEntries, fieldId, fieldWrapperTypeInfo.isList, paths, true)
 		}
 	} else {
-		childrenFields, childrenFieldsErr = compiler.compileSelectionSetWithFlattenEntries(currentField.SelectionSet, fieldTypeScope, parentFieldId, fieldWrapperTypeInfo.isList, paths, directivePlans, true)
+		childrenFields, childrenFieldsErr = compiler.compileSelectionSetWithFlattenEntries(currentField.SelectionSet, fieldTypeScope, fieldId, fieldWrapperTypeInfo.isList, paths, directivePlans, true)
 	}
 	if childrenFieldsErr != nil {
 		return nil, childrenFieldsErr
 	}
 	//resolverFunc
-	resolverFunc := func(source any, params map[string]any, info graphql.ResolveInfo, ctx context.Context) (any, error) {
+	resolverFunc := func(source any, params map[string]any, info ResolveInfo, ctx context.Context) (any, error) {
 		name, _ := params["name"].(string)
 		if name == "" {
 			return nil, nil
@@ -938,7 +1118,7 @@ func (compiler *PlanCompiler) compileIntrospectionMetaTypeField(currentField ast
 	fieldPlan := &FieldPlan{
 		fieldId:                    fieldId,
 		parentFieldId:              0,
-		fieldName:                  graphql.IntrospectionFieldNameMetaType,
+		fieldName:                  IntrospectionFieldNameMetaType,
 		responseName:               responseName,
 		paths:                      paths,
 		fieldWrapperTypeInfo:       *fieldWrapperTypeInfo,
@@ -960,7 +1140,7 @@ func (compiler *PlanCompiler) compileIntrospectionMetaTypeField(currentField ast
 
 func (compiler *PlanCompiler) compileIntrospectionMetaSchemaField(current ast.Field, parentTypeScope *FieldTypeScope, parentFieldId uint32, parentPaths []string, inheritedDirectives []*DirectivePlan, directiveDependencyParams []*ParamPlan, skipIncludeDirectiveGroups [][]*DirectivePlan, fieldEntries []FieldFlattenEntry) ([]*FieldPlan, error) {
 	//检查入参
-	if parentTypeScope == nil || parentFieldId == 0 || parentTypeScope.declaredType != compiler.schema.QueryType() {
+	if parentTypeScope == nil || parentFieldId != 0 || parentTypeScope.declaredType != compiler.schema.QueryType() {
 		return nil, fmt.Errorf("invalid schema field")
 	}
 	//ResponseName
@@ -971,9 +1151,9 @@ func (compiler *PlanCompiler) compileIntrospectionMetaSchemaField(current ast.Fi
 	//FieldId
 	fieldId := compiler.generateFieldId()
 	//Paths
-	paths := append(parentPaths, responseName)
+	paths := appendResponsePath(parentPaths, responseName)
 	//FieldWrapperTypeInfo
-	fieldDef := graphql.TypeMetaFieldDef
+	fieldDef := SchemaMetaFieldDef
 	if fieldDef == nil {
 		return nil, fmt.Errorf("__type meta field definition is nil")
 	}
@@ -990,7 +1170,7 @@ func (compiler *PlanCompiler) compileIntrospectionMetaSchemaField(current ast.Fi
 		return nil, paramPlansErr
 	}
 	//TypeScope
-	fieldTypeScope, fieldTypeScopeErr := wrapStaticFieldTypeScope(graphql.TypeType)
+	fieldTypeScope, fieldTypeScopeErr := wrapStaticFieldTypeScope(SchemaType)
 	if fieldTypeScopeErr != nil {
 		return nil, fieldTypeScopeErr
 	}
@@ -999,15 +1179,21 @@ func (compiler *PlanCompiler) compileIntrospectionMetaSchemaField(current ast.Fi
 	var childrenFieldsErr error
 	if len(fieldEntries) > 0 {
 		var childFlattenEntries []FieldFlattenEntry
-		childFlattenEntries, childrenFieldsErr = compiler.flattenChildrenFieldEntriesForField(fieldEntries, fieldTypeScope)
+		childFlattenEntries, childrenFieldsErr = compiler.flattenChildrenFieldEntriesForField(fieldEntries, fieldTypeScope, paths)
 		if childrenFieldsErr == nil {
-			childrenFields, childrenFieldsErr = compiler.compileFieldPlansFromEntries(childFlattenEntries, parentFieldId, fieldWrapperTypeInfo.isList, paths, true)
+			childrenFields, childrenFieldsErr = compiler.compileFieldPlansFromEntries(childFlattenEntries, fieldId, fieldWrapperTypeInfo.isList, paths, true)
+		}
+		if childrenFieldsErr != nil {
+			return nil, childrenFieldsErr
 		}
 	} else {
-		childrenFields, childrenFieldsErr = compiler.compileSelectionSetWithFlattenEntries(current.SelectionSet, fieldTypeScope, parentFieldId, fieldWrapperTypeInfo.isList, paths, inheritedDirectives, true)
+		childrenFields, childrenFieldsErr = compiler.compileSelectionSetWithFlattenEntries(current.SelectionSet, fieldTypeScope, fieldId, fieldWrapperTypeInfo.isList, paths, inheritedDirectives, true)
+	}
+	if childrenFieldsErr != nil {
+		return nil, childrenFieldsErr
 	}
 	//resolverFunc
-	resolverFunc := func(source any, params map[string]any, info graphql.ResolveInfo, ctx context.Context) (any, error) {
+	resolverFunc := func(source any, params map[string]any, info ResolveInfo, ctx context.Context) (any, error) {
 		// 内省参数可能引用请求变量；变量通过 ResolveInfo 显式传入，不再隐藏在 context 中。
 		return GenerateSchemaMetaResult(compiler.schema, childrenFields, info.VariableValues), nil
 	}
@@ -1033,14 +1219,16 @@ func (compiler *PlanCompiler) compileIntrospectionMetaSchemaField(current ast.Fi
 }
 
 func (compiler *PlanCompiler) compileCommonIntrospectionField(current ast.Field, parentFieldId uint32, parentTypeScope *FieldTypeScope, parentPaths []string, directives []*DirectivePlan, directiveDependencyParams []*ParamPlan, skipIncludeDirectivesGroup [][]*DirectivePlan, fieldEntries []FieldFlattenEntry) (*FieldPlan, error) {
+	//fieldName
+	fieldName := current.Name.Value
 	//ResponseName
 	responseName := getASTResponseName(&current)
 	//FieldId
 	fieldId := compiler.generateFieldId()
 	//paths
-	paths := append(parentPaths, responseName)
+	paths := appendResponsePath(parentPaths, responseName)
 	//fieldWrapperTypeInfo
-	fieldDef, fieldDefErr := getFieldDefinition(parentTypeScope.declaredType, responseName)
+	fieldDef, fieldDefErr := getFieldDefinition(parentTypeScope.declaredType, fieldName)
 	if fieldDefErr != nil {
 		return nil, fieldDefErr
 	}
@@ -1064,21 +1252,21 @@ func (compiler *PlanCompiler) compileCommonIntrospectionField(current ast.Field,
 	if current.SelectionSet != nil && fieldTypeScope != nil && fieldTypeScope.declaredType != nil {
 		if len(fieldEntries) > 0 {
 			var childFlattenEntries []FieldFlattenEntry
-			childFlattenEntries, childrenFieldsErr = compiler.flattenChildrenFieldEntriesForField(fieldEntries, fieldTypeScope)
+			childFlattenEntries, childrenFieldsErr = compiler.flattenChildrenFieldEntriesForField(fieldEntries, fieldTypeScope, paths)
 			if childrenFieldsErr == nil {
-				childrenFields, childrenFieldsErr = compiler.compileFieldPlansFromEntries(childFlattenEntries, parentFieldId, fieldWrapperTypeInfo.isList, paths, true)
+				childrenFields, childrenFieldsErr = compiler.compileFieldPlansFromEntries(childFlattenEntries, fieldId, fieldWrapperTypeInfo.isList, paths, true)
 			}
 		} else {
-			childrenFields, childrenFieldsErr = compiler.compileSelectionSetWithFlattenEntries(current.SelectionSet, fieldTypeScope, parentFieldId, fieldWrapperTypeInfo.isList, paths, directives, true)
+			childrenFields, childrenFieldsErr = compiler.compileSelectionSetWithFlattenEntries(current.SelectionSet, fieldTypeScope, fieldId, fieldWrapperTypeInfo.isList, paths, directives, true)
 		}
 	}
-	if childrenFieldsErr == nil {
+	if childrenFieldsErr != nil {
 		return nil, childrenFieldsErr
 	}
 	return &FieldPlan{
 		fieldId:                    fieldId,
 		parentFieldId:              parentFieldId,
-		fieldName:                  current.Name.Value,
+		fieldName:                  fieldName,
 		responseName:               responseName,
 		paths:                      paths,
 		fieldWrapperTypeInfo:       *fieldWrapperTypeInfo,
@@ -1087,7 +1275,7 @@ func (compiler *PlanCompiler) compileCommonIntrospectionField(current ast.Field,
 		parentType:                 getParentCompositeFromScope(parentTypeScope),
 		childrenFields:             childrenFields,
 		paramPlans:                 paramPlans,
-		fieldTypeScope:             fieldTypeScope,
+		fieldTypeScope:             parentTypeScope,
 		directivePlans:             directives,
 		directiveParamPlans:        directiveDependencyParams,
 		skipIncludeDirectiveGroups: skipIncludeDirectivesGroup,
@@ -1095,7 +1283,7 @@ func (compiler *PlanCompiler) compileCommonIntrospectionField(current ast.Field,
 }
 
 // 当一个父字段已经由多个 occurrence 合并成一个 FieldPlan 后，把每个 occurrence 的子 SelectionSet 全部展开、继承各自的 directive 条件，生成统一的子 FieldEntry 列表，交给后续逻辑继续归并成子 FieldPlan
-func (compiler *PlanCompiler) flattenChildrenFieldEntriesForField(fieldFlattenEntries []FieldFlattenEntry, childTypeScope *FieldTypeScope) ([]FieldFlattenEntry, error) {
+func (compiler *PlanCompiler) flattenChildrenFieldEntriesForField(fieldFlattenEntries []FieldFlattenEntry, childTypeScope *FieldTypeScope, parentPaths []string) ([]FieldFlattenEntry, error) {
 	if len(fieldFlattenEntries) == 0 || childTypeScope == nil {
 		return nil, nil
 	}
@@ -1104,7 +1292,7 @@ func (compiler *PlanCompiler) flattenChildrenFieldEntriesForField(fieldFlattenEn
 		if fieldFlattenEntry.field.SelectionSet == nil {
 			continue
 		}
-		childrenFlattenEntries, err := compiler.flattenSelections(fieldFlattenEntry.field.SelectionSet, childTypeScope, fieldFlattenEntry.directives)
+		childrenFlattenEntries, err := compiler.flattenSelections(fieldFlattenEntry.field.SelectionSet, childTypeScope, fieldFlattenEntry.directives, parentPaths)
 		if err != nil {
 			return nil, err
 		}
@@ -1113,11 +1301,23 @@ func (compiler *PlanCompiler) flattenChildrenFieldEntriesForField(fieldFlattenEn
 	return result, nil
 }
 
-// 寻找父节点中类型为scalar ID的字段，默认取id，否则返回第一个类型为scalar ID的字段名。如果没找到则返回空字符串。
-func (compiler *PlanCompiler) checkAndCompileParentKeyFieldNames(parentFieldIsList bool, parentTypeScope *FieldTypeScope) string {
+// 寻找父节点中用于父子结果关联的key字段。
+// 返回值为(选中的字段名, 无法判定时的候选字段名列表)，二者不会同时非空。
+// 判定顺序：
+//  1. 父类型存在名为id且基础类型是内置ID scalar的字段，直接采用，这是约定的身份字段；
+//  2. 否则收集父类型中全部基础类型为ID的字段作为候选，恰好1个时采用；
+//  3. 候选为0个或>=2个时返回空字段名，由调用方决定报错还是回退到responsePath绑定。
+//
+// 候选>=2时不任选一个：Fields()是map，遍历顺序未定义且被运行时随机化，而这里的选择在
+// 编译期一次性决定并随Plan写入缓存，任选会造成同一schema每次进程启动绑定到不同字段。
+// 排序后取首位同样不可取：bulk场景下父key与BulkResultMappedFieldName的值必须语义对齐，
+// 选错字段会让父子映射整体落空并静默返回空列表，稳定地选错比随机选错更难发现。
+//
+// 返回的候选列表只用于调用方拼装错误信息，不写入FieldPlan，因此不会进入可缓存的Plan。
+func (compiler *PlanCompiler) checkAndCompileParentKeyFieldNames(parentFieldIsList bool, parentTypeScope *FieldTypeScope) (string, []string) {
 	//入参检查
 	if !parentFieldIsList || parentTypeScope == nil || parentTypeScope.declaredType == nil {
-		return ""
+		return "", nil
 	}
 	//获取约定的父节点KeyField的名称，即id
 	fieldDefinition, fieldDefinitionErr := getFieldDefinition(parentTypeScope.declaredType, ParentKeyFieldNameAsID)
@@ -1125,43 +1325,46 @@ func (compiler *PlanCompiler) checkAndCompileParentKeyFieldNames(parentFieldIsLi
 		//检查id字段的类型是否为scalar
 		t, te := getBaseType(fieldDefinition.Type)
 		if te != nil || t == nil {
-			return ""
+			return "", nil
 		}
-		if scalarType, ok := t.(*graphql.Scalar); ok && scalarType == graphql.ID {
-			return ParentKeyFieldNameAsID
+		if scalarType, ok := t.(*Scalar); ok && scalarType == ID {
+			return ParentKeyFieldNameAsID, nil
 		}
 	}
-	//如果不存在id字段，则遍历全部字段寻找ID类型的字段
+	//如果不存在可用的id字段，则收集全部ID类型字段作为候选
+	var parentFields FieldDefinitionMap
 	switch t := parentTypeScope.declaredType.(type) {
-	case *graphql.Object:
-		if len(t.Fields()) > 0 {
-			for _, field := range t.Fields() {
-				fieldValueType, fieldValueTypeErr := getBaseType(field.Type)
-				if fieldValueTypeErr != nil || fieldValueType == nil {
-					continue
-				}
-				if scalarType, ok := fieldValueType.(*graphql.Scalar); ok && scalarType == graphql.ID {
-					return field.Name
-				}
-			}
-		}
-	case *graphql.Interface:
-		if len(t.Fields()) > 0 {
-			for _, field := range t.Fields() {
-				fieldValueType, fieldValueTypeErr := getBaseType(field.Type)
-				if fieldValueTypeErr != nil || fieldValueType == nil {
-					continue
-				}
-				if scalarType, ok := fieldValueType.(*graphql.Scalar); ok && scalarType == graphql.ID {
-					return field.Name
-				}
-			}
-		}
+	case *Object:
+		parentFields = t.Fields()
+	case *Interface:
+		parentFields = t.Fields()
 	default:
-		return ""
+		return "", nil
 	}
 
-	return ""
+	candidateFieldNames := make([]string, 0, len(parentFields))
+	for _, field := range parentFields {
+		if field == nil {
+			continue
+		}
+		fieldValueType, fieldValueTypeErr := getBaseType(field.Type)
+		if fieldValueTypeErr != nil || fieldValueType == nil {
+			continue
+		}
+		if scalarType, ok := fieldValueType.(*Scalar); ok && scalarType == ID {
+			candidateFieldNames = append(candidateFieldNames, field.Name)
+		}
+	}
+	//候选唯一时推断结果与遍历顺序无关，可以安全采用
+	if len(candidateFieldNames) == 1 {
+		return candidateFieldNames[0], nil
+	}
+	if len(candidateFieldNames) == 0 {
+		return "", nil
+	}
+	//候选排序后回传，保证错误信息在多次运行之间稳定
+	sort.Strings(candidateFieldNames)
+	return "", candidateFieldNames
 }
 
 func (compiler *PlanCompiler) GetMaxFieldId(fieldPlans []*FieldPlan) uint32 {
@@ -1176,24 +1379,24 @@ func (compiler *PlanCompiler) GetMaxFieldId(fieldPlans []*FieldPlan) uint32 {
 
 // 例子：[[scalar!]!]!返回scalar。获取一个字段的基础类型，返回值只能是Object/Scalar/Enum/Interface/Union这几个，封装类型NotNull/List不算
 // 返回值分别是:基础类型，是否为isList，是否为NotNull，错误
-func (compiler *PlanCompiler) compileFieldWrapperTypeInfo(fd *graphql.FieldDefinition) (*FieldWrapperTypeInfo, error) {
+func (compiler *PlanCompiler) compileFieldWrapperTypeInfo(fd *FieldDefinition) (*FieldWrapperTypeInfo, error) {
 	if fd == nil {
 		return nil, errors.New("no type definition provided while building field wrapper")
 	}
 	result := &FieldWrapperTypeInfo{}
-	var currentType graphql.Output
+	var currentType Output
 	currentType = fd.Type
 
 	currentValueMetaInfo := result
 
 	for {
 		switch t := currentType.(type) {
-		case *graphql.NonNull:
+		case *NonNull:
 			currentType = t.OfType
 
 			currentValueMetaInfo.notNil = true
 			currentValueMetaInfo.baseType = t
-		case *graphql.List:
+		case *List:
 			currentType = t.OfType
 
 			currentValueMetaInfo.isList = true
@@ -1202,23 +1405,23 @@ func (compiler *PlanCompiler) compileFieldWrapperTypeInfo(fd *graphql.FieldDefin
 			elementType := &FieldWrapperTypeInfo{}
 			currentValueMetaInfo.elementWrapperTypeInfo = elementType
 			currentValueMetaInfo = elementType
-		case *graphql.Scalar:
+		case *Scalar:
 			currentValueMetaInfo.fieldElementTypeEnum = FIELD_ELEMENT_TYPE_SCALAR
 			currentValueMetaInfo.baseType = t
 			return result, nil
-		case *graphql.Object:
+		case *Object:
 			currentValueMetaInfo.fieldElementTypeEnum = FIELD_ELEMENT_TYPE_OBJECT
 			currentValueMetaInfo.baseType = t
 			return result, nil
-		case *graphql.Enum:
+		case *Enum:
 			currentValueMetaInfo.fieldElementTypeEnum = FIELD_ELEMENT_TYPE_ENUM
 			currentValueMetaInfo.baseType = t
 			return result, nil
-		case *graphql.Interface:
+		case *Interface:
 			currentValueMetaInfo.fieldElementTypeEnum = FIELD_ELEMENT_TYPE_OBJECT
 			currentValueMetaInfo.baseType = t
 			return result, nil
-		case *graphql.Union:
+		case *Union:
 			currentValueMetaInfo.fieldElementTypeEnum = FIELD_ELEMENT_TYPE_OBJECT
 			currentValueMetaInfo.baseType = t
 			return result, nil
@@ -1228,8 +1431,8 @@ func (compiler *PlanCompiler) compileFieldWrapperTypeInfo(fd *graphql.FieldDefin
 	}
 }
 
-func GenerateTypeMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, inputs map[string]any) map[string]any {
-	if t == nil {
+func GenerateTypeMetaResult(schema *Schema, t Type, children []*FieldPlan, inputs map[string]any) map[string]any {
+	if isNilInterfaceValue(t) {
 		return nil
 	}
 
@@ -1257,18 +1460,18 @@ func GenerateTypeMetaResult(schema *graphql.Schema, t graphql.Type, children []*
 		case "ofType":
 			result[child.getResponseName()] = GenerateTypeMetaResult(schema, insideWrappedType(t), child.getChildrenFields(), inputs)
 		case "__typename":
-			result[child.getResponseName()] = graphql.TypeType.Name()
+			result[child.getResponseName()] = TypeType.Name()
 		}
 	}
 	return result
 }
 
-func GenerateFieldsMetaResult(schema *graphql.Schema, children []*FieldPlan, t graphql.Type, includeDeprecated bool, inputs map[string]any) any {
-	var fields graphql.FieldDefinitionMap
+func GenerateFieldsMetaResult(schema *Schema, children []*FieldPlan, t Type, includeDeprecated bool, inputs map[string]any) any {
+	var fields FieldDefinitionMap
 	switch tt := t.(type) {
-	case *graphql.Object:
+	case *Object:
 		fields = tt.Fields()
-	case *graphql.Interface:
+	case *Interface:
 		fields = tt.Fields()
 	default:
 		return nil
@@ -1291,8 +1494,8 @@ func GenerateFieldsMetaResult(schema *graphql.Schema, children []*FieldPlan, t g
 	return result
 }
 
-func GenerateInputFieldsMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, inputs map[string]any) any {
-	inputObj, ok := t.(*graphql.InputObject)
+func GenerateInputFieldsMetaResult(schema *Schema, t Type, children []*FieldPlan, inputs map[string]any) any {
+	inputObj, ok := t.(*InputObject)
 	if !ok || inputObj == nil {
 		return nil
 	}
@@ -1312,7 +1515,7 @@ func GenerateInputFieldsMetaResult(schema *graphql.Schema, t graphql.Type, child
 	return result
 }
 
-func GenerateSingleFieldMetaResult(schema *graphql.Schema, fd *graphql.FieldDefinition, children []*FieldPlan, inputs map[string]any) map[string]any {
+func GenerateSingleFieldMetaResult(schema *Schema, fd *FieldDefinition, children []*FieldPlan, inputs map[string]any) map[string]any {
 	result := map[string]any{}
 
 	for _, child := range children {
@@ -1320,7 +1523,7 @@ func GenerateSingleFieldMetaResult(schema *graphql.Schema, fd *graphql.FieldDefi
 		case "name":
 			result[child.getResponseName()] = fd.Name
 		case "description":
-			if fd.Description != "" {
+			if fd.Description == "" {
 				result[child.getResponseName()] = nil
 			} else {
 				result[child.getResponseName()] = fd.Description
@@ -1342,13 +1545,13 @@ func GenerateSingleFieldMetaResult(schema *graphql.Schema, fd *graphql.FieldDefi
 	return result
 }
 
-func GeneratePossibleTypesMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, inputs map[string]any) any {
-	var abs graphql.Abstract
+func GeneratePossibleTypesMetaResult(schema *Schema, t Type, children []*FieldPlan, inputs map[string]any) any {
+	var abs Abstract
 
 	switch tt := t.(type) {
-	case *graphql.Interface:
+	case *Interface:
 		abs = tt
-	case *graphql.Union:
+	case *Union:
 		abs = tt
 	default:
 		return nil
@@ -1362,8 +1565,8 @@ func GeneratePossibleTypesMetaResult(schema *graphql.Schema, t graphql.Type, chi
 	return result
 }
 
-func GenerateInterfacesMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, inputs map[string]any) any {
-	obj, ok := t.(*graphql.Object)
+func GenerateInterfacesMetaResult(schema *Schema, t Type, children []*FieldPlan, inputs map[string]any) any {
+	obj, ok := t.(*Object)
 	if !ok || obj == nil {
 		return nil
 	}
@@ -1376,8 +1579,8 @@ func GenerateInterfacesMetaResult(schema *graphql.Schema, t graphql.Type, childr
 	return result
 }
 
-func GenerateEnumValuesMetaResult(schema *graphql.Schema, t graphql.Type, children []*FieldPlan, includeDeprecated bool, inputs map[string]any) any {
-	enumType, ok := t.(*graphql.Enum)
+func GenerateEnumValuesMetaResult(schema *Schema, t Type, children []*FieldPlan, includeDeprecated bool, inputs map[string]any) any {
+	enumType, ok := t.(*Enum)
 	if !ok || enumType == nil {
 		return nil
 	}
@@ -1393,7 +1596,7 @@ func GenerateEnumValuesMetaResult(schema *graphql.Schema, t graphql.Type, childr
 	return result
 }
 
-func GenerateSingleEnumValueMetaResult(vd *graphql.EnumValueDefinition, t graphql.Type, children []*FieldPlan, includeDeprecated bool, inputs map[string]any) any {
+func GenerateSingleEnumValueMetaResult(vd *EnumValueDefinition, t Type, children []*FieldPlan, includeDeprecated bool, inputs map[string]any) any {
 	if vd == nil {
 		return nil
 	}
@@ -1419,13 +1622,13 @@ func GenerateSingleEnumValueMetaResult(vd *graphql.EnumValueDefinition, t graphq
 				result[child.getResponseName()] = vd.DeprecationReason
 			}
 		case "__typename":
-			result[child.getResponseName()] = graphql.EnumValueType.Name()
+			result[child.getResponseName()] = EnumValueType.Name()
 		}
 	}
 	return result
 }
 
-func GenerateInputValuesMetaResult(schema *graphql.Schema, args []*graphql.Argument, children []*FieldPlan, inputs map[string]any) []any {
+func GenerateInputValuesMetaResult(schema *Schema, args []*Argument, children []*FieldPlan, inputs map[string]any) []any {
 	result := make([]any, 0)
 	for _, arg := range args {
 		result = append(result, GenerateSingleInputValueMetaResult(schema, arg, children, inputs))
@@ -1433,7 +1636,7 @@ func GenerateInputValuesMetaResult(schema *graphql.Schema, args []*graphql.Argum
 	return result
 }
 
-func GenerateSingleInputValueMetaResult(schema *graphql.Schema, v any, children []*FieldPlan, inputs map[string]any) map[string]any {
+func GenerateSingleInputValueMetaResult(schema *Schema, v any, children []*FieldPlan, inputs map[string]any) map[string]any {
 	result := make(map[string]any)
 	for _, child := range children {
 		switch child.getFieldName() {
@@ -1451,7 +1654,7 @@ func GenerateSingleInputValueMetaResult(schema *graphql.Schema, v any, children 
 }
 
 // 内省结果生成规则：用 fieldName 判断标准内省字段语义，用 responseName 写结果，保证 alias 不丢失。
-func GenerateSchemaMetaResult(schema *graphql.Schema, children []*FieldPlan, inputs map[string]any) map[string]any {
+func GenerateSchemaMetaResult(schema *Schema, children []*FieldPlan, inputs map[string]any) map[string]any {
 	if schema == nil {
 		return nil
 	}
@@ -1478,13 +1681,13 @@ func GenerateSchemaMetaResult(schema *graphql.Schema, children []*FieldPlan, inp
 			}
 			result[child.getResponseName()] = directives
 		case "__typename":
-			result[child.getResponseName()] = graphql.SchemaType.Name()
+			result[child.getResponseName()] = SchemaType.Name()
 		}
 	}
 	return result
 }
 
-func GenerateDirectiveMetaResult(schema *graphql.Schema, d *graphql.Directive, children []*FieldPlan, inputs map[string]any) map[string]any {
+func GenerateDirectiveMetaResult(schema *Schema, d *Directive, children []*FieldPlan, inputs map[string]any) map[string]any {
 	if d == nil {
 		return nil
 	}

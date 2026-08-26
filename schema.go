@@ -1,14 +1,12 @@
 package graphql
 
-import "github.com/graphql-go/graphql/sgraph"
-
 type SchemaConfig struct {
 	Query        *Object
 	Mutation     *Object
 	Subscription *Object
 	Types        []Type
 	Directives   []*Directive
-	Extensions   []sgraph.Extension
+	Extensions   []Extension
 }
 
 type TypeMap map[string]Type
@@ -44,7 +42,7 @@ type Schema struct {
 	subscriptionType *Object
 	implementations  map[string][]*Object
 	possibleTypeMap  map[string]map[string]bool
-	extensions       []sgraph.Extension
+	extensions       []Extension
 }
 
 func NewSchema(config SchemaConfig) (Schema, error) {
@@ -52,7 +50,7 @@ func NewSchema(config SchemaConfig) (Schema, error) {
 
 	schema := Schema{}
 
-	if err = sgraph.invariant(config.Query != nil, "Schema query must be Object Type but got: nil."); err != nil {
+	if err = invariant(config.Query != nil, "Schema query must be Object Type but got: nil."); err != nil {
 		return schema, err
 	}
 
@@ -267,7 +265,7 @@ func (gq *Schema) IsPossibleType(abstractType Abstract, possibleType *Object) bo
 }
 
 // AddExtensions can be used to add additional extensions to the schema
-func (gq *Schema) AddExtensions(e ...sgraph.Extension) {
+func (gq *Schema) AddExtensions(e ...Extension) {
 	gq.extensions = append(gq.extensions, e...)
 }
 
@@ -295,7 +293,7 @@ func typeMapReducer(schema *Schema, typeMap TypeMap, objectType Type) (TypeMap, 
 	}
 
 	if mappedObjectType, ok := typeMap[objectType.Name()]; ok {
-		err = sgraph.invariantf(
+		err = invariantf(
 			mappedObjectType == objectType,
 			`Schema must contain unique named types but contains multiple types named "%v".`, objectType.Name())
 		return typeMap, err
@@ -392,7 +390,7 @@ func assertObjectImplementsInterface(schema *Schema, object *Object, iface *Inte
 		ifaceField := ifaceFieldMap[fieldName]
 
 		// Assert interface field exists on object.
-		err := sgraph.invariantf(
+		err := invariantf(
 			objectField != nil,
 			`"%v" expects field "%v" but "%v" does not `+
 				`provide it.`, iface, fieldName, object)
@@ -403,7 +401,7 @@ func assertObjectImplementsInterface(schema *Schema, object *Object, iface *Inte
 
 		// Assert interface field type is satisfied by object field type, by being
 		// a valid subtype. (covariant)
-		err = sgraph.invariantf(
+		err = invariantf(
 			isTypeSubTypeOf(schema, objectField.Type, ifaceField.Type),
 			`%v.%v expects type "%v" but `+
 				`%v.%v provides type "%v".`,
@@ -425,7 +423,7 @@ func assertObjectImplementsInterface(schema *Schema, object *Object, iface *Inte
 				}
 			}
 			// Assert interface field arg exists on object field.
-			err = sgraph.invariantf(
+			err = invariantf(
 				objectArg != nil,
 				`%v.%v expects argument "%v" but `+
 					`%v.%v does not provide it.`,
@@ -438,7 +436,7 @@ func assertObjectImplementsInterface(schema *Schema, object *Object, iface *Inte
 
 			// Assert interface field arg type matches object field arg type.
 			// (invariant)
-			err = sgraph.invariantf(
+			err = invariantf(
 				isEqualType(ifaceArg.Type, objectArg.Type),
 				`%v.%v(%v:) expects type "%v" `+
 					`but %v.%v(%v:) provides `+
@@ -463,7 +461,7 @@ func assertObjectImplementsInterface(schema *Schema, object *Object, iface *Inte
 
 			if ifaceArg == nil {
 				_, ok := objectArg.Type.(*NonNull)
-				err = sgraph.invariantf(
+				err = invariantf(
 					!ok,
 					`%v.%v(%v:) is of required type `+
 						`"%v" but is not also provided by the interface %v.%v.`,

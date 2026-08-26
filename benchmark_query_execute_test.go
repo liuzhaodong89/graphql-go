@@ -16,7 +16,6 @@ var benchmarkQueryResultSink *Result
 
 func BenchmarkQueryExecute(b *testing.B) {
 	schema := newBenchmarkQuerySchema(b)
-	soulEngine := NewSGraphEngine(schema)
 	cases := []struct {
 		name      string
 		query     string
@@ -176,15 +175,6 @@ func BenchmarkQueryExecute(b *testing.B) {
 	for _, tc := range cases {
 		tc := tc
 		doc := benchmarkParseAndValidate(b, schema, tc.name, tc.query)
-		b.Run(tc.name+"/GraphSoul", func(b *testing.B) {
-			benchmarkExecuteQuery(b, ExecuteParams{
-				Schema:       schema,
-				SGraphEngine: soulEngine,
-				AST:          doc,
-				Args:         tc.variables,
-				Context:      context.Background(),
-			}, Execute)
-		})
 		b.Run(tc.name+"/GraphQLGo", func(b *testing.B) {
 			benchmarkExecuteQuery(b, ExecuteParams{
 				Schema:  schema,

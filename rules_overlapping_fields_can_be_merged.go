@@ -8,7 +8,6 @@ import (
 	"github.com/graphql-go/graphql/language/kinds"
 	"github.com/graphql-go/graphql/language/printer"
 	"github.com/graphql-go/graphql/language/visitor"
-	"github.com/graphql-go/graphql/sgraph"
 )
 
 func fieldsConflictMessage(responseName string, reason conflictReason) string {
@@ -505,7 +504,7 @@ func (rule *overlappingFieldsCanBeMergedRule) getFieldsAndFragmentNames(parentTy
 				typeCondition := selection.TypeCondition
 				inlineFragmentType := parentType
 				if typeCondition != nil {
-					ttype, err := sgraph.typeFromAST(*(rule.context.Schema()), typeCondition)
+					ttype, err := typeFromAST(*(rule.context.Schema()), typeCondition)
 					if err == nil {
 						inlineFragmentType, _ = ttype.(Named)
 					}
@@ -531,7 +530,7 @@ func (rule *overlappingFieldsCanBeMergedRule) getReferencedFieldsAndFragmentName
 	if cached, ok := rule.cacheMap[fragment.SelectionSet]; ok && cached != nil {
 		return cached
 	}
-	fragmentType, err := sgraph.typeFromAST(*(rule.context.Schema()), fragment.TypeCondition)
+	fragmentType, err := typeFromAST(*(rule.context.Schema()), fragment.TypeCondition)
 	if err != nil {
 		return nil
 	}

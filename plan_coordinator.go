@@ -1,4 +1,4 @@
-package sgraph
+package graphql
 
 import (
 	"errors"
@@ -15,20 +15,23 @@ func coordinateBatches(blueprint *SGraphExecutionPlan) ([]*BatchPlan, error) {
 	if !operationDefOk {
 		return nil, errors.New("operation definition is not an operationDefinition")
 	}
-	if operationDef.Name != nil && operationDef.Name.Value != ast.OperationTypeQuery {
-		return nil, fmt.Errorf("not supported opeartion type: %s", operationDef.Name)
+	if operationDef.Operation != ast.OperationTypeQuery {
+		return nil, fmt.Errorf("not supported operation type: %s", operationDef.Operation)
 	}
 
 	roots := blueprint.roots
 	if len(roots) == 0 {
-		return nil, fmt.Errorf("no roots found for %s", operationDef.Name)
+		if operationDef.Name == nil {
+			return nil, errors.New("no roots found")
+		}
+		return nil, fmt.Errorf("no roots found for %s", operationDef.Name.Value)
 	}
 
 	fieldById := make(map[uint32]*FieldPlan)
 	//key是fieldId，根据fieldId查对应Step
 	stepByFieldId := make(map[uint32]Step)
 	//元素是fieldId
-	fieldidsByStepOrder := make([]uint32, 0)
+	fieldIdsByStepOrder := make([]uint32, 0)
 
 	var actualMaxFieldId uint32
 	for _, root := range roots {
@@ -36,7 +39,7 @@ func coordinateBatches(blueprint *SGraphExecutionPlan) ([]*BatchPlan, error) {
 			return nil, errors.New("root cannot be nil")
 		}
 
-		maxFieldId, err := appendBatches(root, nil, true, fieldById, stepByFieldId, &fieldidsByStepOrder)
+		maxFieldId, err := appendBatches(root, nil, true, fieldById, stepByFieldId, &fieldIdsByStepOrder)
 		if err != nil {
 			return nil, err
 		}
@@ -52,17 +55,17 @@ func coordinateBatches(blueprint *SGraphExecutionPlan) ([]*BatchPlan, error) {
 
 	//DAG元信息
 	//记录当前fieldId的依赖节点数量
-	indegree := make(map[uint32]uint32, len(fieldidsByStepOrder))
+	indegree := make(map[uint32]uint32, len(fieldIdsByStepOrder))
 	//记录当前fieldId的被依赖节点id
-	dependents := make(map[uint32][]uint32, len(fieldidsByStepOrder))
+	dependents := make(map[uint32][]uint32, len(fieldIdsByStepOrder))
 	//记录当前fieldId的依赖节点id的set，去重
-	dependencySets := make(map[uint32]map[uint32]struct{}, len(fieldidsByStepOrder))
+	dependencySets := make(map[uint32]map[uint32]struct{}, len(fieldIdsByStepOrder))
 
-	for _, fieldId := range fieldidsByStepOrder {
+	for _, fieldId := range fieldIdsByStepOrder {
 		indegree[fieldId] = 0
 	}
 
-	for _, consumerId := range fieldidsByStepOrder {
+	for _, consumerId := range fieldIdsByStepOrder {
 		fieldPlan := fieldById[consumerId]
 
 		for _, paramPlans := range [3][]*ParamPlan{
@@ -114,10 +117,10 @@ func coordinateBatches(blueprint *SGraphExecutionPlan) ([]*BatchPlan, error) {
 	}
 
 	// 使用拓扑排序计算最长依赖层级
-	levels := make(map[uint32]uint32, len(fieldidsByStepOrder))
-	ready := make([]uint32, 0, len(fieldidsByStepOrder))
+	levels := make(map[uint32]uint32, len(fieldIdsByStepOrder))
+	ready := make([]uint32, 0, len(fieldIdsByStepOrder))
 
-	for _, fieldId := range fieldidsByStepOrder {
+	for _, fieldId := range fieldIdsByStepOrder {
 		if indegree[fieldId] == 0 {
 			ready = append(ready, fieldId)
 		}
@@ -130,7 +133,7 @@ func coordinateBatches(blueprint *SGraphExecutionPlan) ([]*BatchPlan, error) {
 
 		for _, consumerId := range dependents[producerId] {
 			nextLevel := levels[producerId] + 1
-			if nextLevel > levels[producerId] {
+			if nextLevel > levels[consumerId] {
 				levels[consumerId] = nextLevel
 			}
 
@@ -141,9 +144,9 @@ func coordinateBatches(blueprint *SGraphExecutionPlan) ([]*BatchPlan, error) {
 		}
 	}
 
-	if processed != len(fieldidsByStepOrder) {
+	if processed != len(fieldIdsByStepOrder) {
 		cyclicFieldIds := make([]uint32, 0)
-		for _, fieldId := range fieldidsByStepOrder {
+		for _, fieldId := range fieldIdsByStepOrder {
 			if indegree[fieldId] != 0 {
 				cyclicFieldIds = append(cyclicFieldIds, fieldId)
 			}
@@ -153,7 +156,7 @@ func coordinateBatches(blueprint *SGraphExecutionPlan) ([]*BatchPlan, error) {
 
 	//按照原FieldPlan DFS顺序写入同层batch，保持编排结果稳定
 	batches := make([]*BatchPlan, 0)
-	for _, fieldId := range fieldidsByStepOrder {
+	for _, fieldId := range fieldIdsByStepOrder {
 		targetBatchId := levels[fieldId]
 		batches = ensureBatch(batches, targetBatchId, blueprint.schemaResolveInfo.operation)
 		batches[targetBatchId].steps = append(batches[targetBatchId].steps, stepByFieldId[fieldId])
@@ -220,6 +223,22 @@ func appendBatches(fieldPlan *FieldPlan, parentFieldPlan *FieldPlan, isRoot bool
 			}
 		}
 
+		if bulkResolverFunc != nil && fieldPlan.fieldTypeScope != nil && fieldPlan.fieldTypeScope.dynamicTypeResolver != nil {
+			hasExplicitParentDependency := false
+			for _, paramPlan := range fieldPlan.bulkParamPlans {
+				if paramPlan == nil || paramPlan.dependentFieldId != parentFieldPlan.fieldId {
+					continue
+				}
+				if paramPlan.paramType == PARAM_TYPE_ENUM_FIELD_RESPONSE_ATTRIBUTE || paramPlan.paramType == PARAM_TYPE_ENUM_FIELD_RESPONSE_RAW {
+					hasExplicitParentDependency = true
+					break
+				}
+			}
+			if !hasExplicitParentDependency {
+				return 0, fmt.Errorf("bulk resolver field %d under an abstract parent requires an explicit FIELD_RESPONSE dependency on parent field %d", fieldPlan.fieldId, parentFieldPlan.fieldId)
+			}
+		}
+
 		needsParentFullResponse := step != nil && resolverFunc != nil && bulkResolverFunc == nil && (parentWrapperTypeInfo.isList || fieldPlan.fieldTypeScope.dynamicTypeResolver != nil)
 		if needsParentFullResponse {
 			hasParentFullResponse := false
@@ -240,7 +259,8 @@ func appendBatches(fieldPlan *FieldPlan, parentFieldPlan *FieldPlan, isRoot bool
 		}
 	}
 
-	if step == nil {
+	isIntrospectionResultField := fieldPlan.parentType != nil && isIntrospectionCoordinate(fieldPlan.parentType.Name(), fieldPlan.fieldName)
+	if step == nil && !isIntrospectionResultField {
 		// 无resolver字段的普通参数和批量参数没有执行者
 		for _, paramPlan := range fieldPlan.paramPlans {
 			if paramPlan != nil {
@@ -252,7 +272,7 @@ func appendBatches(fieldPlan *FieldPlan, parentFieldPlan *FieldPlan, isRoot bool
 				return 0, fmt.Errorf("field %d has bulk param plan but no bulk resolver", fieldPlan.fieldId)
 			}
 		}
-	} else {
+	} else if step != nil {
 		stepById[fieldPlan.fieldId] = step
 		*stepOrder = append(*stepOrder, fieldPlan.fieldId)
 	}
@@ -277,7 +297,7 @@ func ensureBatch(batches []*BatchPlan, targetId uint32, opDef ast.Definition) []
 			if !operationDefOk {
 				break
 			}
-			concurrent := operationDef.Name != nil && operationDef.Name.Value == ast.OperationTypeQuery
+			concurrent := operationDef.Operation == ast.OperationTypeQuery
 			batches = append(batches, &BatchPlan{batchId: uint32(len(batches)), concurrent: concurrent})
 		} else {
 			break

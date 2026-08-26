@@ -7,7 +7,6 @@ import (
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/parser"
 	"github.com/graphql-go/graphql/language/source"
-	"github.com/graphql-go/graphql/sgraph"
 )
 
 // SubscribeParams parameters for subscribing
@@ -167,7 +166,7 @@ func ExecuteSubscription(p ExecuteParams) chan *Result {
 			Key: responseName,
 		}
 
-		args := sgraph.getArgumentValues(fieldDef.Args, fieldNode.Arguments, exeContext.VariableValues)
+		args := getArgumentValues(fieldDef.Args, fieldNode.Arguments, exeContext.VariableValues)
 		info := ResolveInfo{
 			FieldName:      fieldName,
 			FieldASTs:      fieldNodes,

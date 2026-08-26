@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/graphql-go/graphql/sgraph"
 	cmap "github.com/orcaman/concurrent-map/v2"
 
 	"github.com/graphql-go/graphql/gqlerrors"
@@ -17,12 +16,7 @@ import (
 )
 
 type ExecuteParams struct {
-	Schema Schema
-
-	// SGraphEngine 绑定固定的 schema / directive registry。
-	// 传入后 Execute 直接复用该 engine，避免每个请求重新计算 schema identity。
-	SGraphEngine *SGraphEngine
-
+	Schema        Schema
 	Root          interface{}
 	AST           *ast.Document
 	OperationName string
@@ -34,74 +28,79 @@ type ExecuteParams struct {
 }
 
 func Execute(p ExecuteParams) (result *Result) {
-	if p.SGraphEngine != nil {
-		// ExecuteParams 是值传递；这里仅修正本次调用使用的 schema，
-		// 保证 extensions 和后续执行使用的 schema 与 engine 绑定的 schema 一致。
-		p.Schema = p.SGraphEngine.schema
+	// 公共执行入口将 query 交给 SGraph；mutation 仍由 executeSGraph 回退到 graphql-go 原生串行链路。
+	return executeSGraph(p)
+}
+
+// executeSGraph 承接公共 Execute 的 SGraph 执行链路，并保留不受支持操作类型的既有处理策略。
+func executeSGraph(p ExecuteParams) (result *Result) {
+	var operationName *string
+	if p.OperationName != "" {
+		operationName = &p.OperationName
+	}
+	operation, operationErr := selectOperationDefinition(p.AST, operationName)
+	if operationErr != nil {
+		return &Result{Errors: gqlerrors.FormatErrors(operationErr)}
 	}
 
-	// Use background context if no context was provided
+	// SGraph 当前只替换 query 执行；mutation 保留 graphql-go 的串行执行语义。
+	if operation.Operation == ast.OperationTypeMutation {
+		return ExecuteGraphQLGo(p)
+	}
+	if operation.Operation == ast.OperationTypeSubscription {
+		return &Result{Errors: gqlerrors.FormatErrors(errors.New("subscription is not supported yet"))}
+	}
+
 	ctx := p.Context
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// run executionDidStart functions from extensions
-	extErrs, executionFinishFn := sgraph.handleExtensionsExecutionDidStart(&p)
+	extErrs, executionFinishFn := handleExtensionsExecutionDidStart(&p)
 	if len(extErrs) != 0 {
-		return &Result{
-			Errors: extErrs,
-		}
+		return &Result{Errors: extErrs}
 	}
-
 	defer func() {
-		extErrs = executionFinishFn(result)
-		if len(extErrs) != 0 {
-			result.Errors = append(result.Errors, extErrs...)
+		if result == nil {
+			result = &Result{}
 		}
-
-		sgraph.addExtensionResults(&p, result)
+		extErrs = executionFinishFn(result)
+		result.Errors = append(result.Errors, extErrs...)
+		addExtensionResults(&p, result)
 	}()
 
-	resultChannel := make(chan *Result, 2)
-
+	resultChannel := make(chan *Result, 1)
 	go func() {
-		result := &Result{}
-
+		graphResult := &Result{}
 		defer func() {
-			if err := recover(); err != nil {
-				result.Errors = append(result.Errors, gqlerrors.FormatError(err.(error)))
+			if recovered := recover(); recovered != nil {
+				graphResult.Errors = append(graphResult.Errors, gqlerrors.FormatError(recoveredValueAsError(recovered)))
 			}
-			resultChannel <- result
+			resultChannel <- graphResult
 		}()
 
-		var operationName *string
-		if p.OperationName != "" {
-			operationName = &p.OperationName
+		// Engine 按 Schema 绑定，不属于单次请求参数。
+		engine, engineErr := getSGraphEngineForSchema(p.Schema)
+		if engineErr != nil {
+			graphResult.Errors = append(graphResult.Errors, gqlerrors.FormatError(engineErr))
+			return
 		}
-
 		root, _ := p.Root.(map[string]any)
-		// Execute 层只把 root 作为无 resolver 字段的结果装配 fallback；
-		// resolver 的执行关系仍然完全由参数依赖生成的 step/batch 决定。
-		engine := p.SGraphEngine
-		if engine == nil {
-			engine = getSGraphEngineForSchema(p.Schema)
-		}
-		engineCtx := p.Context
-		if engineCtx == nil {
-			engineCtx = ctx
-		}
-		// execution hook 已在 public Execute 中触发；extensions 显式传给 GraphSoul 的 field hook。
-		result = engine.executeWithExtensions(p.AST, p.Args, operationName, root, engineCtx, p.Schema.extensions).ToGraphQLResult()
-		resultChannel <- result
+		// 请求值和 extension 状态显式传入，缓存 plan 中不保存请求级数据。
+		graphResult = engine.executeWithCache(
+			p.AST,
+			p.Args,
+			operationName,
+			root,
+			ctx,
+			p.Schema.extensions,
+		).toGraphQLResult()
 	}()
 
 	select {
 	case <-ctx.Done():
-		result := &Result{}
-		result.Errors = append(result.Errors, gqlerrors.FormatError(ctx.Err()))
-		return result
-	case r := <-resultChannel:
-		return r
+		return &Result{Errors: gqlerrors.FormatErrors(ctx.Err())}
+	case graphResult := <-resultChannel:
+		return graphResult
 	}
 }
 
@@ -113,7 +112,7 @@ func ExecuteGraphQLGo(p ExecuteParams) (result *Result) {
 		ctx = context.Background()
 	}
 	// run executionDidStart functions from extensions
-	extErrs, executionFinishFn := sgraph.handleExtensionsExecutionDidStart(&p)
+	extErrs, executionFinishFn := handleExtensionsExecutionDidStart(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
@@ -126,7 +125,7 @@ func ExecuteGraphQLGo(p ExecuteParams) (result *Result) {
 			result.Errors = append(result.Errors, extErrs...)
 		}
 
-		sgraph.addExtensionResults(&p, result)
+		addExtensionResults(&p, result)
 	}()
 
 	resultChannel := make(chan *Result, 2)
@@ -226,7 +225,7 @@ func buildExecutionContext(p buildExecutionCtxParams) (*executionContext, error)
 		return nil, fmt.Errorf(`Must provide an operation.`)
 	}
 
-	variableValues, err := sgraph.getVariableValues(p.Schema, operation.GetVariableDefinitions(), p.Args)
+	variableValues, err := getVariableValues(p.Schema, operation.GetVariableDefinitions(), p.Args)
 	if err != nil {
 		return nil, err
 	}
@@ -601,13 +600,13 @@ func shouldIncludeNode(eCtx *executionContext, directives []*ast.Directive) bool
 	}
 	// precedence: skipAST > includeAST
 	if skipAST != nil {
-		argValues = sgraph.getArgumentValues(SkipDirective.Args, skipAST.Arguments, eCtx.VariableValues)
+		argValues = getArgumentValues(SkipDirective.Args, skipAST.Arguments, eCtx.VariableValues)
 		if skipIf, ok := argValues["if"].(bool); ok && skipIf {
 			return false // excluded selectionSet's fields
 		}
 	}
 	if includeAST != nil {
-		argValues = sgraph.getArgumentValues(IncludeDirective.Args, includeAST.Arguments, eCtx.VariableValues)
+		argValues = getArgumentValues(IncludeDirective.Args, includeAST.Arguments, eCtx.VariableValues)
 		if includeIf, ok := argValues["if"].(bool); ok && !includeIf {
 			return false // excluded selectionSet's fields
 		}
@@ -624,7 +623,7 @@ func doesFragmentConditionMatch(eCtx *executionContext, fragment ast.Node, ttype
 		if typeConditionAST == nil {
 			return true
 		}
-		conditionalType, err := sgraph.typeFromAST(eCtx.Schema, typeConditionAST)
+		conditionalType, err := typeFromAST(eCtx.Schema, typeConditionAST)
 		if err != nil {
 			return false
 		}
@@ -645,7 +644,7 @@ func doesFragmentConditionMatch(eCtx *executionContext, fragment ast.Node, ttype
 		if typeConditionAST == nil {
 			return true
 		}
-		conditionalType, err := sgraph.typeFromAST(eCtx.Schema, typeConditionAST)
+		conditionalType, err := typeFromAST(eCtx.Schema, typeConditionAST)
 		if err != nil {
 			return false
 		}
@@ -727,7 +726,7 @@ func resolveField(eCtx *executionContext, parentType *Object, source interface{}
 	// Build a map of arguments from the field.arguments AST, using the
 	// variables scope to fulfill any variable references.
 	// TODO: find a way to memoize, in case this field is within a List type.
-	args := sgraph.getArgumentValues(fieldDef.Args, fieldAST.Arguments, eCtx.VariableValues)
+	args := getArgumentValues(fieldDef.Args, fieldAST.Arguments, eCtx.VariableValues)
 
 	info := ResolveInfo{
 		FieldName:      fieldName,
@@ -744,7 +743,7 @@ func resolveField(eCtx *executionContext, parentType *Object, source interface{}
 
 	var resolveFnError error
 
-	extErrs, resolveFieldFinishFn := sgraph.handleExtensionsResolveFieldDidStart(eCtx.Schema.extensions, eCtx, &info)
+	extErrs, resolveFieldFinishFn := handleExtensionsResolveFieldDidStart(eCtx.Schema.extensions, eCtx, &info)
 	if len(extErrs) != 0 {
 		eCtx.Errors = append(eCtx.Errors, extErrs...)
 	}
@@ -812,7 +811,7 @@ func completeValue(eCtx *executionContext, returnType Type, fieldASTs []*ast.Fie
 	}
 
 	// If result value is null-ish (null, undefined, or NaN) then return null.
-	if sgraph.isNullish(result) {
+	if isNullish(result) {
 		return nil
 	}
 
@@ -845,7 +844,7 @@ func completeValue(eCtx *executionContext, returnType Type, fieldASTs []*ast.Fie
 	}
 
 	// Not reachable. All possible output types have been considered.
-	err := sgraph.invariantf(false,
+	err := invariantf(false,
 		`Cannot complete value of unexpected type "%v."`, returnType)
 
 	if err != nil {
@@ -903,7 +902,7 @@ func completeAbstractValue(eCtx *executionContext, returnType Abstract, fieldAST
 		runtimeType = defaultResolveTypeFn(resolveTypeParams, returnType)
 	}
 
-	err := sgraph.invariantf(runtimeType != nil, `Abstract type %v must resolve to an Object type at runtime `+
+	err := invariantf(runtimeType != nil, `Abstract type %v must resolve to an Object type at runtime `+
 		`for field %v.%v with value "%v", received "%v".`, returnType, info.ParentType, info.FieldName, result, runtimeType,
 	)
 	if err != nil {
@@ -971,7 +970,7 @@ func completeObjectValue(eCtx *executionContext, returnType *Object, fieldASTs [
 // completeLeafValue complete a leaf value (Scalar / Enum) by serializing to a valid value, returning nil if serialization is not possible.
 func completeLeafValue(returnType Leaf, result interface{}) interface{} {
 	serializedResult := returnType.Serialize(result)
-	if sgraph.isNullish(serializedResult) {
+	if isNullish(serializedResult) {
 		return nil
 	}
 	return serializedResult
@@ -987,8 +986,8 @@ func completeListValue(eCtx *executionContext, returnType *List, fieldASTs []*as
 	if info.ParentType != nil {
 		parentTypeName = info.ParentType.Name()
 	}
-	err := sgraph.invariantf(
-		resultVal.IsValid() && sgraph.isIterable(result),
+	err := invariantf(
+		resultVal.IsValid() && isIterable(result),
 		"User Error: expected iterable, but did not find one "+
 			"for field %v.%v.", parentTypeName, info.FieldName)
 

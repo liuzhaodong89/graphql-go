@@ -1,72 +1,125 @@
-package sgraph
+package graphql
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"reflect"
 	"sort"
+	"sync"
 
-	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
-	"github.com/graphql-go/graphql/language/printer"
-	Lmap "github.com/liuzhaodong89/lockfree-collection/map"
 )
 
 type SGraphEngine struct {
-	schema            *graphql.Schema
+	schema            *Schema
 	directiveRegistry *DirectiveRegistry
+	paramRegistry     *ParamRegistry
 	resultAssembler   *SGraphResultAssembler
-	planCache         *Lmap.Lmap[string, *SGraphExecutionPlan]
+	planCache         *sync.Map
+}
+
+var (
+	defaultSGraphEngineCache   = &sync.Map{}
+	defaultSGraphEngineCacheMu sync.Mutex
+)
+
+func NewSGraphEngine(schema *Schema, directiveRegistry *DirectiveRegistry, paramRegistry *ParamRegistry) (*SGraphEngine, error) {
+	if schema == nil || schema.QueryType() == nil {
+		return nil, errors.New(`schema must have a query type`)
+	}
+	if directiveRegistry == nil {
+		directiveRegistry = NewDirectiveRegistry()
+	}
+
+	return &SGraphEngine{
+		schema:            schema,
+		directiveRegistry: directiveRegistry.cloneAndFreeze(),
+		paramRegistry:     paramRegistry.cloneAndFreeze(),
+		resultAssembler:   &SGraphResultAssembler{schema: schema},
+		planCache:         &sync.Map{},
+	}, nil
+}
+
+// RegisterSGraphEngine 在应用启动阶段将冻结的 Engine 绑定到 Schema。
+// 请求执行时只传入 Schema，执行层会根据 Schema 复用已绑定的 Engine。
+func RegisterSGraphEngine(engine *SGraphEngine) error {
+	if engine == nil {
+		return errors.New("sgraph engine is nil")
+	}
+	if engine.schema == nil || engine.schema.QueryType() == nil {
+		return errors.New("sgraph engine schema is nil")
+	}
+
+	cacheKey := sGraphEngineCacheKey(*engine.schema)
+	defaultSGraphEngineCacheMu.Lock()
+	defer defaultSGraphEngineCacheMu.Unlock()
+
+	registered, ok := defaultSGraphEngineCache.Load(cacheKey)
+	if ok {
+		if registeredEngine, matched := registered.(*SGraphEngine); matched {
+			if registeredEngine == engine {
+				return nil
+			}
+			return errors.New("another sgraph engine is already registered for this schema")
+		}
+
+		return errors.New("sgraph engine registered for this schema is illegal")
+	}
+	defaultSGraphEngineCache.Store(cacheKey, engine)
+	return nil
+}
+
+func (e *SGraphEngine) Execute(document *ast.Document, args map[string]any, operationName *string, root map[string]any, ctx context.Context) *SGraphResult {
+	return e.executeWithCache(document, args, operationName, root, ctx, nil)
 }
 
 func (e *SGraphEngine) executeWithCache(document *ast.Document, args map[string]any, operationName *string, root map[string]any, ctx context.Context, extensions []Extension) *SGraphResult {
 	if e == nil {
 		return newSGraphErrorResult(errors.New("sgraph engine is nil"))
 	}
-	if e.schema.QueryType() == nil {
+	if e.schema == nil || e.schema.QueryType() == nil {
 		return newSGraphErrorResult(errors.New("sgraph engine schema is nil"))
 	}
-	if e.planCache == nil {
-		e.planCache = Lmap.New[string, *SGraphExecutionPlan]()
-	}
-	if e.directiveRegistry == nil {
-		e.directiveRegistry = newDirectiveRegistry()
+	if e.planCache == nil || e.paramRegistry == nil || e.directiveRegistry == nil || e.resultAssembler == nil {
+		return newSGraphErrorResult(errors.New("sgraph engine is not initialized"))
 	}
 
-	cacheKey := buildPlanCacheKey(document, operationName)
-	plan, ok := e.planCache.Get(cacheKey)
+	operationDefinition, selectErr := selectOperationDefinition(document, operationName)
+	if selectErr != nil {
+		return newSGraphErrorResult(selectErr)
+	}
+	if operationDefinition.Operation != ast.OperationTypeQuery {
+		return newSGraphErrorResult(fmt.Errorf("sgraph engine does not support %s operation", operationDefinition.Operation))
+	}
+
+	cacheKey := buildPlanCacheKey(document, operationDefinition)
+	cachePlan, ok := e.planCache.Load(cacheKey)
 	if !ok {
 		var buildErr error
-		plan, buildErr = compileExecutionPlan(document, e.schema, operationName, e.directiveRegistry)
+		cachePlan, buildErr = compileExecutionPlan(document, e.schema, operationName, e.directiveRegistry, e.paramRegistry)
 		if buildErr != nil {
 			return newSGraphErrorResult(buildErr)
 		}
-		operationDef, operationDefOk := plan.schemaResolveInfo.operation.(*ast.OperationDefinition)
-		if !operationDefOk {
-			return newSGraphErrorResult(errors.New("invalid operation definition"))
-		}
-		if operationDef.Name.Value == ast.OperationTypeSubscription {
-			return newSGraphErrorResult(errors.New("subscription is not supported by graphsoul execute"))
-		}
-		e.planCache.Set(cacheKey, plan)
+		e.planCache.LoadOrStore(cacheKey, cachePlan)
 	}
 
-	inputs, inputErr := completeVariables(document, e.schema, operationName, args)
+	// operation在本方法内已经完成选择，变量补全直接复用，避免再次扫描Document。
+	inputs, inputErr := completeVariables(e.schema, operationDefinition, args)
 	if inputErr != nil {
 		return newSGraphErrorResult(inputErr)
+	}
+
+	plan, valid := cachePlan.(*SGraphExecutionPlan)
+	if !valid || plan == nil {
+		return newSGraphErrorResult(errors.New("sgraph engine returned invalid plan"))
 	}
 
 	return e.executePlan(plan, inputs, root, ctx, extensions)
 }
 
 func (e *SGraphEngine) createBatches(executionPlan *SGraphExecutionPlan) ([]*BatchPlan, error) {
-	if executionPlan == nil {
-		return nil, errors.New("executionPlan is nil")
-	}
 	if executionPlan == nil {
 		return nil, errors.New("executionPlan is nil")
 	}
@@ -90,9 +143,16 @@ func (e *SGraphEngine) executePlan(plan *SGraphExecutionPlan, inputs map[string]
 	// 组装本次请求独占的 Rundata；请求数据不能写入可缓存的 plan。
 	maxFieldId := plan.maxFieldId
 	rundata := newRundata(inputs, maxFieldId)
+	// ExecutionPlan在编译完成后冻结字段索引，Rundata在本请求内只读引用。
+	rundata.executionPlan = plan
 	// ResolveInfo 和 extension 所需的请求状态统一由 Rundata 持有，并通过函数参数显式向下传递。
 	rundata.schema = e.schema
-	rundata.resolveInfoRootValue = root
+	//避免出现typed nil
+	if root != nil {
+		rundata.resolveInfoRootValue = root
+	} else {
+		rundata.resolveInfoRootValue = nil
+	}
 	rundata.operation = plan.schemaResolveInfo.operation
 	rundata.fragments = plan.schemaResolveInfo.fragments
 	rundata.extensions = extensions
@@ -108,77 +168,44 @@ func (e *SGraphEngine) executePlan(plan *SGraphExecutionPlan, inputs map[string]
 		return result
 	}
 	//遍历执行Batches，判断遇到中断则返回
+	treeInterrupted := false
 	for _, batch := range batches {
 		br := batch.execute(rundata, ctx)
 		if br.isInterrupt() {
+			treeInterrupted = true
 			break
 		}
 	}
-	//组装结果
-	if e.resultAssembler == nil {
-		e.resultAssembler = &SGraphResultAssembler{
-			schema: e.schema,
-		}
+	if treeInterrupted {
+		// Tree错误表示执行结构已不可信；不组装部分数据，统一返回data:null和已记录错误。
+		rundata.flushPendingBulkBindingErrors()
+		result.errors = rundata.getAllFieldErrors()
+		result.extensionErrors = rundata.getAllExtensionErrors()
+		return result
 	}
+	// Engine在构造完成后保持只读，共享请求只读取绑定的resultAssembler。
 	result = e.resultAssembler.assembleGraphResult(plan, rundata, root, ctx)
 	return result
 }
 
-func buildPlanCacheKey(document *ast.Document, operationName *string) string {
-	hash := sha256.New()
-	if document != nil && document.Loc != nil && document.Loc.Source != nil && len(document.Loc.Source.Body) > 0 {
-		// parser 产出的 AST 保留了原始 query 字节；直接参与 hash，避免每个请求重新打印 AST。
-		hash.Write(document.Loc.Source.Body)
-	} else {
-		// 兼容外部手工构造 AST 且没有 Source 的场景，保留旧的规范化打印逻辑兜底。
-		hash.Write([]byte(fmt.Sprintf("%v", printer.Print(document))))
-	}
-	hash.Write([]byte{'\n'})
-	if operationName != nil {
-		hash.Write([]byte(*operationName))
-	}
-	// schema 和 directiveRegistry 已经由 SGraphEngine 实例固定；
-	// 同一个 engine 内的 plan identity 只需要 document + operationName。
-	return hex.EncodeToString(hash.Sum(nil))
+func buildPlanCacheKey(document *ast.Document, operationDefinition *ast.OperationDefinition) string {
+	return buildDocumentOperationKey(documentIdentityBody(document), operationDefinitionName(operationDefinition))
 }
 
-func completeVariables(document *ast.Document, schema *graphql.Schema, operationName *string, args map[string]any) (map[string]any, error) {
-	if document == nil {
-		return nil, errors.New("document is nil")
-	}
+func completeVariables(schema *Schema, operationDefinition *ast.OperationDefinition, args map[string]any) (map[string]any, error) {
 	if schema == nil {
 		return nil, errors.New("schema is nil")
-	}
-	if args == nil {
-		args = map[string]any{}
-	}
-
-	var operationDefinition *ast.OperationDefinition
-	for _, def := range document.Definitions {
-		opDef, ok := def.(*ast.OperationDefinition)
-		if !ok {
-			continue
-		}
-		if operationName != nil {
-			if opDef.Name != nil && opDef.Name.Value == *operationName {
-				operationDefinition = opDef
-				break
-			}
-			continue
-		}
-		//operationName为空时，如果有多个operation则报错
-		if operationDefinition != nil {
-			return nil, errors.New("operation definition already exists")
-		}
-		operationDefinition = opDef
 	}
 	if operationDefinition == nil {
 		return nil, errors.New("operation definition is nil")
 	}
+	if args == nil {
+		args = map[string]any{}
+	}
 	return completeOperationVariables(schema, operationDefinition.VariableDefinitions, args)
 }
 
-func completeOperationVariables(schema *graphql.Schema, variableDefs []*ast.VariableDefinition, originalInputs map[string]any) (map[string]any, error) {
+func completeOperationVariables(schema *Schema, variableDefs []*ast.VariableDefinition, originalInputs map[string]any) (map[string]any, error) {
 	if originalInputs == nil {
 		originalInputs = make(map[string]any)
 	}
@@ -187,7 +214,7 @@ func completeOperationVariables(schema *graphql.Schema, variableDefs []*ast.Vari
 	for _, variableDef := range variableDefs {
 		name := variableDef.Variable.Name.Value
 
-		inputType, inputTypeErr := graphql.InputTypeFromAST(schema, variableDef.Type)
+		inputType, inputTypeErr := typeFromAST(*schema, variableDef.Type)
 		if inputTypeErr != nil {
 			return nil, inputTypeErr
 		}
@@ -195,11 +222,7 @@ func completeOperationVariables(schema *graphql.Schema, variableDefs []*ast.Vari
 		variableValue, provided := originalInputs[name]
 		if !provided {
 			if variableDef.DefaultValue != nil {
-				defaultValue, defaultValueErr := valueFromAST(variableDef.DefaultValue, inputType, nil)
-				if defaultValueErr != nil {
-					return nil, defaultValueErr
-				}
-				result[name] = defaultValue
+				result[name] = valueFromAST(variableDef.DefaultValue, inputType, nil)
 				continue
 			}
 
@@ -222,7 +245,7 @@ func completeOperationVariables(schema *graphql.Schema, variableDefs []*ast.Vari
 			result[name] = variableValue
 			continue
 		}
-		parsed, parsedErr := parseInputValue(inputType, variableDef)
+		parsed, parsedErr := parseInputValue(inputType, variableValue)
 		if parsedErr != nil {
 			message := fmt.Sprintf("Variable \"$%s\": %s", name, parsedErr.Error())
 			return nil, gqlerrors.NewError(message, []ast.Node{variableDef}, "", nil, nil, parsedErr)
@@ -232,7 +255,7 @@ func completeOperationVariables(schema *graphql.Schema, variableDefs []*ast.Vari
 	return result, nil
 }
 
-func parseInputValue(inputType graphql.Input, source any) (any, error) {
+func parseInputValue(inputType Input, source any) (any, error) {
 	if source != nil {
 		sourceValue := reflect.ValueOf(source)
 
@@ -241,12 +264,12 @@ func parseInputValue(inputType graphql.Input, source any) (any, error) {
 		}
 	}
 
-	if nonNullType, ok := inputType.(*graphql.NonNull); ok {
+	if nonNullType, ok := inputType.(*NonNull); ok {
 		if source == nil {
 			return nil, fmt.Errorf("nonNull input value is required")
 		}
 
-		inner, innerOk := nonNullType.OfType.(graphql.Input)
+		inner, innerOk := nonNullType.OfType.(Input)
 		if !innerOk {
 			return nil, fmt.Errorf("nonNull input value is required")
 		}
@@ -258,8 +281,8 @@ func parseInputValue(inputType graphql.Input, source any) (any, error) {
 	}
 
 	switch typedInput := inputType.(type) {
-	case *graphql.List:
-		inner := typedInput.OfType.(graphql.Input)
+	case *List:
+		inner := typedInput.OfType.(Input)
 
 		if isSlice(source) {
 			sourceItems := toAnySlice(source)
@@ -281,7 +304,7 @@ func parseInputValue(inputType graphql.Input, source any) (any, error) {
 			return nil, singleErr
 		}
 		return []any{single}, nil
-	case *graphql.InputObject:
+	case *InputObject:
 		sourceMap, ok := source.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("expected input object type %q", typedInput.Name())
@@ -333,13 +356,13 @@ func parseInputValue(inputType graphql.Input, source any) (any, error) {
 			result[fieldName] = parsedFieldValue
 		}
 		return result, nil
-	case *graphql.Scalar:
+	case *Scalar:
 		parsed := typedInput.ParseValue(source)
 		if parsed == nil {
 			return nil, fmt.Errorf("expected scalar type %q", typedInput.Name())
 		}
 		return parsed, nil
-	case *graphql.Enum:
+	case *Enum:
 		parsed := typedInput.ParseValue(source)
 		if parsed == nil {
 			return nil, fmt.Errorf("expected enum type %q", typedInput.Name())
@@ -348,4 +371,64 @@ func parseInputValue(inputType graphql.Input, source any) (any, error) {
 	default:
 		return nil, fmt.Errorf("unexpected input type %T", typedInput)
 	}
+}
+
+func selectOperationDefinition(document *ast.Document, operationName *string) (*ast.OperationDefinition, error) {
+	if document == nil {
+		return nil, errors.New("document is nil")
+	}
+	var selected *ast.OperationDefinition
+	for _, definition := range document.Definitions {
+		operation, ok := definition.(*ast.OperationDefinition)
+		if !ok {
+			continue
+		}
+		if operationName != nil {
+			if operation.Name != nil && operation.Name.Value == *operationName {
+				return operation, nil
+			}
+			continue
+		}
+		if selected != nil {
+			return nil, errors.New("operation name is required when document contains multiple operations")
+		}
+		selected = operation
+	}
+	if selected != nil {
+		return selected, nil
+	}
+	if operationName != nil {
+		return nil, fmt.Errorf("no operation definition found for %s", *operationName)
+	}
+	return nil, errors.New("operation definition is nil")
+}
+
+func getSGraphEngineForSchema(schema Schema) (*SGraphEngine, error) {
+	cacheKey := sGraphEngineCacheKey(schema)
+	if engine, ok := defaultSGraphEngineCache.Load(cacheKey); ok {
+		if registeredEngine, matched := engine.(*SGraphEngine); matched {
+			return registeredEngine, nil
+		}
+	}
+
+	// 只在首次绑定 Schema 时加锁；稳态请求直接走 Lmap 的无锁读取。
+	defaultSGraphEngineCacheMu.Lock()
+	defer defaultSGraphEngineCacheMu.Unlock()
+	if engine, ok := defaultSGraphEngineCache.Load(cacheKey); ok {
+		if registeredEngine, matched := engine.(*SGraphEngine); matched {
+			return registeredEngine, nil
+		}
+	}
+
+	engine, err := NewSGraphEngine(&schema, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defaultSGraphEngineCache.Store(cacheKey, engine)
+	return engine, nil
+}
+
+func sGraphEngineCacheKey(schema Schema) uint {
+	// Schema 是值类型，但值拷贝会共享同一个 typeMap，因此可以用它稳定标识 Schema。
+	return uint(reflect.ValueOf(schema.typeMap).Pointer())
 }

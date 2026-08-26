@@ -3,10 +3,8 @@ package graphql
 import (
 	"context"
 
-	"github.com/graphql-go/graphql/language/ast"
-	"github.com/graphql-go/graphql/sgraph"
-
 	"github.com/graphql-go/graphql/gqlerrors"
+	"github.com/graphql-go/graphql/language/ast"
 	"github.com/graphql-go/graphql/language/parser"
 	"github.com/graphql-go/graphql/language/source"
 )
@@ -14,10 +12,6 @@ import (
 type Params struct {
 	// The GraphQL type system to use when validating and executing a query.
 	Schema Schema
-
-	// SGraphEngine 绑定固定的 schema / directive registry。
-	// 传入后 Do 会使用 engine 里的 schema 完成 validate 和 execute，避免两边 schema 不一致。
-	SGraphEngine *SGraphEngine
 
 	// A GraphQL language formatted string representing the requested operation.
 	RequestString string
@@ -41,17 +35,12 @@ type Params struct {
 }
 
 func Do(p Params) *Result {
-	if p.SGraphEngine != nil {
-		// Params 是值传递；这里不会修改调用方持有的 Params。
-		p.Schema = p.SGraphEngine.schema
-	}
-
 	source := source.NewSource(&source.Source{
 		Body: []byte(p.RequestString),
 		Name: "GraphQL request",
 	})
 	//extErrs := make([]gqlerrors.FormattedError, 0)
-	var parseFinishFn sgraph.parseFinishFuncHandler
+	var parseFinishFn parseFinishFuncHandler
 	var AST *ast.Document
 	var err error
 
@@ -59,7 +48,7 @@ func Do(p Params) *Result {
 
 	//if !exist {
 	// run init on the extensions
-	extErrs := sgraph.handleExtensionsInits(&p)
+	extErrs := handleExtensionsInits(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
@@ -69,7 +58,7 @@ func Do(p Params) *Result {
 	//	AST = astVal.(*ast.Document)
 	//}
 
-	extErrs, parseFinishFn = sgraph.handleExtensionsParseDidStart(&p)
+	extErrs, parseFinishFn = handleExtensionsParseDidStart(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
@@ -100,7 +89,7 @@ func Do(p Params) *Result {
 	}
 
 	// notify extensions about the start of the validation
-	extErrs, validationFinishFn := sgraph.handleExtensionsValidationDidStart(&p)
+	extErrs, validationFinishFn := handleExtensionsValidationDidStart(&p)
 	if len(extErrs) != 0 {
 		return &Result{
 			Errors: extErrs,
@@ -131,10 +120,8 @@ func Do(p Params) *Result {
 	//LocalASTbuffer.Set(p.RequestString, AST)
 	//}
 
-	// parse / validate 仍然走 graphql-go 原链路；这里只把 execute 阶段替换为 SGraph。
 	return Execute(ExecuteParams{
 		Schema:        p.Schema,
-		SGraphEngine:  p.SGraphEngine,
 		Root:          p.RootObject,
 		AST:           AST,
 		OperationName: p.OperationName,
