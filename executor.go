@@ -7,9 +7,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
-
-	cmap "github.com/orcaman/concurrent-map/v2"
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
@@ -375,38 +372,16 @@ func executeSubFields(p executeFieldsParams) map[string]interface{} {
 		p.Fields = map[string][]*ast.Field{}
 	}
 
-	signal := sync.WaitGroup{}
-	signal.Add(len(p.Fields))
-
-	//mutex := sync.RWMutex{}
-	//finalResults := make(map[string]interface{}, len(p.Fields))
-	finalResults := cmap.New[interface{}]()
-	//finalResults := sync.Map{}
-
-	mapSetFunc := func(key string, value interface{}) {
-		//mutex.Lock()
-		//finalResults[key] = value
-		//test := sync.Mutex{}
-		finalResults.Set(key, value)
-		//finalResults.Store(key, value)
-		//mutex.Unlock()
-	}
-
+	finalResults := make(map[string]interface{}, len(p.Fields))
 	for responseName, fieldASTs := range p.Fields {
-		go func() {
-			defer signal.Done()
-
-			fieldPath := p.Path.WithKey(responseName)
-			resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs, fieldPath)
-			if !state.hasNoFieldDefs {
-				//finalResults[responseName] = resolved
-				mapSetFunc(responseName, resolved)
-			}
-		}()
+		fieldPath := p.Path.WithKey(responseName)
+		resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs, fieldPath)
+		if !state.hasNoFieldDefs {
+			finalResults[responseName] = resolved
+		}
 	}
-	signal.Wait()
 
-	return finalResults.Items()
+	return finalResults
 }
 
 // dethunkQueue is a structure that allows us to execute a classic breadth-first traversal.
