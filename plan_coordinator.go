@@ -68,11 +68,16 @@ func coordinateBatches(blueprint *SGraphExecutionPlan) ([]*BatchPlan, error) {
 	for _, consumerId := range fieldIdsByStepOrder {
 		fieldPlan := fieldById[consumerId]
 
-		for _, paramPlans := range [3][]*ParamPlan{
+		dependencyParamPlans := [3][]*ParamPlan{
 			fieldPlan.paramPlans,
 			fieldPlan.bulkParamPlans,
-			fieldPlan.directiveParamPlans,
-		} {
+			nil,
+		}
+		// 内部物化只复现无resolver字段的属性读取，不执行其自定义runtime directive。
+		if !fieldPlan.materializeFromParentSource {
+			dependencyParamPlans[2] = fieldPlan.directiveParamPlans
+		}
+		for _, paramPlans := range dependencyParamPlans {
 			for _, pp := range paramPlans {
 				if pp == nil {
 					continue

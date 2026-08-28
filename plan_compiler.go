@@ -845,6 +845,49 @@ func (compiler *PlanCompiler) generateFieldId() uint32 {
 	return uint32(fid)
 }
 
+// ensureFieldResponseRawDependency精确匹配依赖类型和producer fieldId，避免已有其他RAW依赖时漏加当前父字段依赖。
+func ensureFieldResponseRawDependency(paramPlans []*ParamPlan, dependentFieldId uint32) []*ParamPlan {
+	for _, paramPlan := range paramPlans {
+		if paramPlan != nil && paramPlan.paramType == PARAM_TYPE_ENUM_FIELD_RESPONSE_RAW && paramPlan.dependentFieldId == dependentFieldId {
+			return paramPlans
+		}
+	}
+	return append(paramPlans, newFieldResponseRawParamPlan(dependentFieldId))
+}
+
+// childrenRequireParentRuntimeValue判断下游Step是否必须读取当前字段的运行时结果，并向上递归传播物化需求。
+func childrenRequireParentRuntimeValue(children []*FieldPlan, parentIsList bool, parentTypeScope *FieldTypeScope) bool {
+	parentRequiresRuntimeValue := parentIsList || (parentTypeScope != nil && parentTypeScope.dynamicTypeResolver != nil)
+	for _, child := range children {
+		if child == nil {
+			continue
+		}
+		if child.materializeFromParentSource {
+			return true
+		}
+		if parentRequiresRuntimeValue && child.resolverFunc != nil && child.bulkResolverFunc == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// 内省参数已经由内省结果生成器消费；内部物化只允许请求输入、常量和变量模板，不接受FIELD_RESPONSE来源。
+func introspectionParamsAllowInternalMaterialization(paramPlans []*ParamPlan) bool {
+	for _, paramPlan := range paramPlans {
+		if paramPlan == nil {
+			return false
+		}
+		switch paramPlan.paramType {
+		case PARAM_TYPE_ENUM_CONST, PARAM_TYPE_ENUM_INPUT, PARAM_TYPE_ENUM_VAR_TEMPLATE:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (compiler *PlanCompiler) compileFieldPlans(current ast.Field, parentFieldId uint32, parentTypeScope *FieldTypeScope, parentFieldIsList bool, parentPaths []string, directivePlans []*DirectivePlan, directiveDependencyParams []*ParamPlan, skipIncludeDirectivePlans [][]*DirectivePlan, fieldEntries []FieldFlattenEntry) ([]*FieldPlan, error) {
 	if current.Name == nil || current.Name.Value == "" {
 		return nil, errors.New("field name is required")
@@ -905,20 +948,13 @@ func (compiler *PlanCompiler) compileFieldPlans(current ast.Field, parentFieldId
 	}
 
 	//当前Field是否必须在ParentField之后执行
-	usesNormalResolver := fieldDefinition.Resolve != nil && (!parentFieldIsList || fieldDefinition.BulkResolve == nil)
+	resolverFunc := wrapFieldResolverFunc(fieldDefinition.Resolve)
+	bulkResolverFunc := wrapFieldResolverFunc(fieldDefinition.BulkResolve)
+	usesNormalResolver := resolverFunc != nil && (!parentFieldIsList || bulkResolverFunc == nil)
 	//父节点存在且当前节点是普通节点且父节点是List类型或者父节点类型需要运行时动态判定
 	needParentFieldResponseRaw := parentFieldId > 0 && usesNormalResolver && (parentFieldIsList || (parentTypeScope != nil && parentTypeScope.dynamicTypeResolver != nil))
 	if needParentFieldResponseRaw {
-		hasParentFieldResponseRaw := false
-		for _, paramPlan := range paramPlans {
-			if paramPlan != nil && paramPlan.paramType == PARAM_TYPE_ENUM_FIELD_RESPONSE_RAW {
-				hasParentFieldResponseRaw = true
-				break
-			}
-		}
-		if !hasParentFieldResponseRaw {
-			paramPlans = append(paramPlans, newFieldResponseRawParamPlan(parentFieldId))
-		}
+		paramPlans = ensureFieldResponseRawDependency(paramPlans, parentFieldId)
 	}
 
 	//ArrParamPlans
@@ -950,23 +986,33 @@ func (compiler *PlanCompiler) compileFieldPlans(current ast.Field, parentFieldId
 		return nil, childrenFieldsErr
 	}
 
+	materializeFromParentSource := false
+	if parentFieldId > 0 && resolverFunc == nil && bulkResolverFunc == nil && len(paramPlans) == 0 && childrenRequireParentRuntimeValue(childrenFields, fieldWrapperTypeInfo.isList, fieldTypeScope) {
+		materializeFromParentSource = true
+		// 内部物化结果与父occurrence天然一一对应，不依赖父对象业务ID。
+		parentKeyFieldName = ""
+		resolverFunc = newMaterializedSourceResolver(fieldValuePropertyKey(fieldName, responseName, getParentCompositeFromScope(parentTypeScope)))
+		paramPlans = ensureFieldResponseRawDependency(paramPlans, parentFieldId)
+	}
+
 	fieldPlan := &FieldPlan{
-		fieldId:              fieldId,
-		fieldName:            fieldName,
-		responseName:         responseName,
-		paths:                paths,
-		fieldWrapperTypeInfo: *fieldWrapperTypeInfo,
-		fieldASTs:            fieldASTsForFieldPlanAsLegacy(current, fieldEntries),
-		returnType:           fieldDefinition.Type,
-		parentType:           getParentCompositeFromScope(parentTypeScope),
-		parentFieldId:        parentFieldId,
-		resultParentKeyName:  resultParentKeyName,
-		parentKeyFieldName:   parentKeyFieldName,
-		childrenFields:       childrenFields,
-		paramPlans:           paramPlans,
-		resolverFunc:         wrapFieldResolverFunc(fieldDefinition.Resolve),
-		bulkParamPlans:       arrParamPlans,
-		bulkResolverFunc:     wrapFieldResolverFunc(fieldDefinition.BulkResolve),
+		fieldId:                     fieldId,
+		fieldName:                   fieldName,
+		responseName:                responseName,
+		paths:                       paths,
+		fieldWrapperTypeInfo:        *fieldWrapperTypeInfo,
+		fieldASTs:                   fieldASTsForFieldPlanAsLegacy(current, fieldEntries),
+		returnType:                  fieldDefinition.Type,
+		parentType:                  getParentCompositeFromScope(parentTypeScope),
+		parentFieldId:               parentFieldId,
+		resultParentKeyName:         resultParentKeyName,
+		parentKeyFieldName:          parentKeyFieldName,
+		childrenFields:              childrenFields,
+		paramPlans:                  paramPlans,
+		resolverFunc:                resolverFunc,
+		bulkParamPlans:              arrParamPlans,
+		bulkResolverFunc:            bulkResolverFunc,
+		materializeFromParentSource: materializeFromParentSource,
 		// FieldPlan保存字段所属父对象的类型范围；字段返回类型范围只用于递归编译childrenFields。
 		fieldTypeScope:             parentTypeScope,
 		directivePlans:             directivePlans,
@@ -1263,22 +1309,32 @@ func (compiler *PlanCompiler) compileCommonIntrospectionField(current ast.Field,
 	if childrenFieldsErr != nil {
 		return nil, childrenFieldsErr
 	}
+	materializeFromParentSource := false
+	var resolverFunc ResolverFunc
+	if parentFieldId > 0 && introspectionParamsAllowInternalMaterialization(paramPlans) && childrenRequireParentRuntimeValue(childrenFields, fieldWrapperTypeInfo.isList, fieldTypeScope) {
+		// 内省参数已在父级内省结果生成器中生效；物化Step只读取生成后的responseName属性。
+		materializeFromParentSource = true
+		resolverFunc = newMaterializedSourceResolver(fieldValuePropertyKey(fieldName, responseName, getParentCompositeFromScope(parentTypeScope)))
+		paramPlans = ensureFieldResponseRawDependency(paramPlans, parentFieldId)
+	}
 	return &FieldPlan{
-		fieldId:                    fieldId,
-		parentFieldId:              parentFieldId,
-		fieldName:                  fieldName,
-		responseName:               responseName,
-		paths:                      paths,
-		fieldWrapperTypeInfo:       *fieldWrapperTypeInfo,
-		fieldASTs:                  fieldASTsForFieldPlanAsLegacy(current, fieldEntries),
-		returnType:                 fieldDef.Type,
-		parentType:                 getParentCompositeFromScope(parentTypeScope),
-		childrenFields:             childrenFields,
-		paramPlans:                 paramPlans,
-		fieldTypeScope:             parentTypeScope,
-		directivePlans:             directives,
-		directiveParamPlans:        directiveDependencyParams,
-		skipIncludeDirectiveGroups: skipIncludeDirectivesGroup,
+		fieldId:                     fieldId,
+		parentFieldId:               parentFieldId,
+		fieldName:                   fieldName,
+		responseName:                responseName,
+		paths:                       paths,
+		fieldWrapperTypeInfo:        *fieldWrapperTypeInfo,
+		fieldASTs:                   fieldASTsForFieldPlanAsLegacy(current, fieldEntries),
+		returnType:                  fieldDef.Type,
+		parentType:                  getParentCompositeFromScope(parentTypeScope),
+		childrenFields:              childrenFields,
+		paramPlans:                  paramPlans,
+		resolverFunc:                resolverFunc,
+		materializeFromParentSource: materializeFromParentSource,
+		fieldTypeScope:              parentTypeScope,
+		directivePlans:              directives,
+		directiveParamPlans:         directiveDependencyParams,
+		skipIncludeDirectiveGroups:  skipIncludeDirectivesGroup,
 	}, nil
 }
 

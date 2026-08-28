@@ -304,7 +304,8 @@ func (compiler *PlanCompiler) finalizeParamRegistry(roots []*FieldPlan) error {
 			return fmt.Errorf("%s FIELD_RESPONSE source %s.%s at %v is ambiguous", dependency.target, dependency.source.ParentTypeName, dependency.source.FieldName, dependency.source.ResponsePath)
 		}
 		producer := fieldByID[sourceFieldIDs[0]]
-		if producer == nil || (producer.resolverFunc == nil && producer.bulkResolverFunc == nil) {
+		// 内部物化字段不是ParamRegistry可引用的业务producer，不能借此扩大外部参数依赖能力。
+		if producer == nil || producer.materializeFromParentSource || (producer.resolverFunc == nil && producer.bulkResolverFunc == nil) {
 			return fmt.Errorf("%s FIELD_RESPONSE source field %d has no resolver", dependency.target, sourceFieldIDs[0])
 		}
 

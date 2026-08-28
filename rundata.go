@@ -367,12 +367,16 @@ func (fieldResponse *FieldResponse) iterationResponseData(rundata *Rundata) ([]a
 		return nil, nil, nil, nil
 	}
 	state := fieldResponse.bulkState
-	if state == nil || state.iterationState == bulkIterationUnused {
+	if state == nil {
+		return fieldResponse.responseRaws, fieldResponse.responsePaths, nil, nil
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.iterationState == bulkIterationUnused {
 		return fieldResponse.responseRaws, fieldResponse.responsePaths, nil, nil
 	}
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
 	if state.iterationState == bulkIterationReady {
 		return nil, nil, state.iterationResponses, nil
 	}

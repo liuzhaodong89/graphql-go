@@ -231,10 +231,11 @@ type FieldPlan struct {
 	parentType           Composite            //字段所属的父类型，供ResolveInfo.ParentType和extension hook使用
 
 	//Resolver和参数依赖
-	paramPlans       []*ParamPlan //单次参数计划List，NormalStep和IteratorStep中遍历模式执行时使用
-	bulkParamPlans   []*ParamPlan //批量参数计划，IteratorStep中批量模式执行时使用
-	resolverFunc     ResolverFunc //单次执行Resolver方法，NormalStep和IteratorStep中遍历模式执行时使用
-	bulkResolverFunc ResolverFunc //批量执行Resolver方法，IteratorStep中批量模式执行时使用
+	paramPlans                  []*ParamPlan //单次参数计划List，NormalStep和IteratorStep中遍历模式执行时使用
+	bulkParamPlans              []*ParamPlan //批量参数计划，IteratorStep中批量模式执行时使用
+	resolverFunc                ResolverFunc //单次执行Resolver方法，NormalStep和IteratorStep中遍历模式执行时使用
+	bulkResolverFunc            ResolverFunc //批量执行Resolver方法，IteratorStep中批量模式执行时使用
+	materializeFromParentSource bool         // schema字段无resolver但下游Step依赖其结果时，从父结果读取属性并写入Rundata
 
 	//父子结果映射
 	parentKeyFieldName  string //单次/遍历调用时用于标识父节点关联关系的字段名，默认是父节点中的id
@@ -669,7 +670,7 @@ func (i *IterationCallStep) bindIterationResponse(fieldResponse *FieldResponse, 
 	//parentKey存在时保持原有compositeKey语义，不能退回path
 	parentMap, ok := parentResponse.(map[string]any)
 	if !ok {
-		rundata.addFieldErrorAtResponsePath(i.fieldPlan.fieldId, FieldErrorTypeField, fmt.Errorf("parent response for field %s dose not support composite key mapping", i.fieldPlan.fieldName), responsePath)
+		rundata.addFieldErrorAtResponsePath(i.fieldPlan.fieldId, FieldErrorTypeField, fmt.Errorf("parent response for field %s does not support composite key mapping", i.fieldPlan.fieldName), responsePath)
 		return true
 	}
 	if _, exist := parentMap[keyFieldName]; !exist {
@@ -792,17 +793,26 @@ func innerStepCalling(fieldPlan *FieldPlan, paramContext ParamContext, resolverF
 			status = StepExecuteFieldError
 		}
 	}()
-	//判断其他指令的计算结果当前字段是否执行
-	shouldExecute, directiveEvaluateErr := evaluateCommonDirectivesShouldExecuteField(fieldPlan, paramContext, rundata, ctx)
-	if directiveEvaluateErr != nil {
-		if fieldResponse == nil {
-			fieldResponse = acquireFieldResponse()
-		}
-		rundata.addFieldErrorAtResponsePath(fieldPlan.fieldId, FieldErrorTypeField, directiveEvaluateErr, responsePath)
-		return fieldResponse, nil, true, StepExecuteFieldError
-	}
-	if !shouldExecute {
+	// 父对象为null时GraphQL不会执行其子选择集。内部物化Step必须直接跳过，
+	// 避免为原本不会执行的non-null子字段额外记录完成错误。
+	if fieldPlan.materializeFromParentSource && isNilInterfaceValue(paramContext.getParentResponse()) {
 		return fieldResponse, nil, false, StepExecuteSuccess
+	}
+	//判断其他指令的计算结果当前字段是否执行
+	shouldExecute := true
+	if !fieldPlan.materializeFromParentSource {
+		var directiveEvaluateErr error
+		shouldExecute, directiveEvaluateErr = evaluateCommonDirectivesShouldExecuteField(fieldPlan, paramContext, rundata, ctx)
+		if directiveEvaluateErr != nil {
+			if fieldResponse == nil {
+				fieldResponse = acquireFieldResponse()
+			}
+			rundata.addFieldErrorAtResponsePath(fieldPlan.fieldId, FieldErrorTypeField, directiveEvaluateErr, responsePath)
+			return fieldResponse, nil, true, StepExecuteFieldError
+		}
+		if !shouldExecute {
+			return fieldResponse, nil, false, StepExecuteSuccess
+		}
 	}
 
 	//动态类型判定
@@ -818,11 +828,13 @@ func innerStepCalling(fieldPlan *FieldPlan, paramContext ParamContext, resolverF
 	}
 
 	//执行BeforeResolve指令
-	if beforeResolvedParams, beforeResolvedParamsErr := applyBeforeResolveDirectives(fieldPlan, paramContext, rundata, ctx); beforeResolvedParamsErr != nil {
-		rundata.addFieldErrorAtResponsePath(fieldPlan.fieldId, FieldErrorTypeField, beforeResolvedParamsErr, responsePath)
-		return fieldResponse, nil, true, StepExecuteFieldError
-	} else {
-		paramContext.setParams(beforeResolvedParams)
+	if !fieldPlan.materializeFromParentSource {
+		if beforeResolvedParams, beforeResolvedParamsErr := applyBeforeResolveDirectives(fieldPlan, paramContext, rundata, ctx); beforeResolvedParamsErr != nil {
+			rundata.addFieldErrorAtResponsePath(fieldPlan.fieldId, FieldErrorTypeField, beforeResolvedParamsErr, responsePath)
+			return fieldResponse, nil, true, StepExecuteFieldError
+		} else {
+			paramContext.setParams(beforeResolvedParams)
+		}
 	}
 
 	//调用resolver前出发extension hook
@@ -840,15 +852,17 @@ func innerStepCalling(fieldPlan *FieldPlan, paramContext ParamContext, resolverF
 	}
 
 	//执行AfterResolve指令
-	afterResolvedResponse, afterResolvedErr := applyAfterResolveDirectives(fieldPlan, paramContext, res, rundata, ctx)
-	if afterResolvedErr != nil {
-		rundata.addFieldErrorAtResponsePath(fieldPlan.fieldId, FieldErrorTypeField, afterResolvedErr, responsePath)
-		return fieldResponse, nil, true, StepExecuteFieldError
+	if !fieldPlan.materializeFromParentSource {
+		afterResolvedResponse, afterResolvedErr := applyAfterResolveDirectives(fieldPlan, paramContext, res, rundata, ctx)
+		if afterResolvedErr != nil {
+			rundata.addFieldErrorAtResponsePath(fieldPlan.fieldId, FieldErrorTypeField, afterResolvedErr, responsePath)
+			return fieldResponse, nil, true, StepExecuteFieldError
+		}
+		res = afterResolvedResponse
 	}
-	res = afterResolvedResponse
 
-	//处理null值冒泡
-	nilBubbled, completionErrors := processNullValueBubbling(fieldPlan.fieldWrapperTypeInfo, res)
+	// 字段坐标只在真正产生完成错误时生成，避免正常执行路径为每个Step分配字符串。
+	nilBubbled, completionErrors := processNullValueBubbling(fieldPlan, fieldPlan.fieldWrapperTypeInfo, res)
 	if nilBubbled != nil {
 		if fieldPlan.fieldWrapperTypeInfo.isList {
 			fieldResponse.responseRaws = append(fieldResponse.responseRaws, nilBubbled...)
@@ -946,6 +960,13 @@ func execResolveProcess(fieldPlan *FieldPlan, source any, params map[string]any,
 
 	if fieldPlan == nil {
 		return nil, errors.New("field plan is nil")
+	}
+	if fieldPlan.materializeFromParentSource {
+		if resolverFn == nil {
+			return nil, fmt.Errorf("materialized source resolver is nil for field %s", fieldPlan.fieldName)
+		}
+		// 只有内部物化Step接收父字段原始值；用户resolver仍不兼容graphql-go Source。
+		return resolverFn(source, nil, info, ctx)
 	}
 	//__typename特殊处理
 	if fieldPlan.isIntrospectionTypeNameField() {
@@ -1168,20 +1189,22 @@ type listCompletionError struct {
 	indexes []int
 }
 
-func processNullValueBubbling(typeInfo FieldWrapperTypeInfo, fieldResponse any) ([]any, []listCompletionError) {
-	value, _, completionErrors := innerProcessNullValueBubbling(typeInfo, fieldResponse)
+func processNullValueBubbling(fieldPlan *FieldPlan, typeInfo FieldWrapperTypeInfo, fieldResponse any) ([]any, []listCompletionError) {
+	value, _, completionErrors := innerProcessNullValueBubbling(fieldPlan, typeInfo, fieldResponse)
 	return value, completionErrors
 }
 
 // TODO 检查逻辑是否正确
 // 仅在元素需要规范化或发生null值冒泡时复制list， 正常的[]any返回原切片，避免每个list字段都重新分配并复制全部元素。
 // 处理null值冒泡，错误保存相对当前字段的完整List下标路径。
-func innerProcessNullValueBubbling(typeInfo FieldWrapperTypeInfo, fieldResponse any) ([]any, bool, []listCompletionError) {
+// 只在真正产生完成错误的分支读取FieldPlan并生成字段坐标，
+// 使错误文案与 graphql-go 原生链路一致，同时保持成功路径无额外字符串分配。
+func innerProcessNullValueBubbling(fieldPlan *FieldPlan, typeInfo FieldWrapperTypeInfo, fieldResponse any) ([]any, bool, []listCompletionError) {
 	//对于nil和typed nil的response进行处理
 	if isNilInterfaceValue(fieldResponse) {
 		//schema非空却为nil，报错
 		if typeInfo.notNil {
-			return nil, true, []listCompletionError{{err: fmt.Errorf("non-null response is nil")}}
+			return nil, true, []listCompletionError{{err: fmt.Errorf("Cannot return null for non-nullable field %s.", fieldErrorCoordinate(fieldPlan.parentType, fieldPlan.fieldName))}}
 		}
 		//schema可以空且为空List，返回nil不冒泡
 		if typeInfo.isList {
@@ -1199,7 +1222,7 @@ func innerProcessNullValueBubbling(typeInfo FieldWrapperTypeInfo, fieldResponse 
 	//针对封装类型是List且通过非空校验且当前层级不为nil的转换成slice处理
 	list, ok := asListValue(fieldResponse)
 	if !ok {
-		return nil, true, []listCompletionError{{err: fmt.Errorf("list value is not a list")}}
+		return nil, true, []listCompletionError{{err: fmt.Errorf("User Error: expected iterable, but did not find one for field %s.", fieldErrorCoordinate(fieldPlan.parentType, fieldPlan.fieldName))}}
 	}
 
 	var result []any
@@ -1222,7 +1245,7 @@ func innerProcessNullValueBubbling(typeInfo FieldWrapperTypeInfo, fieldResponse 
 				// 继续扫描同层其他元素，确保同一List内的多个错误都被保留。
 				if elementTypeInfo.notNil {
 					completionErrors = append(completionErrors, listCompletionError{
-						err:     fmt.Errorf("element %d is nil", i),
+						err:     fmt.Errorf("Cannot return null for non-nullable field %s.", fieldErrorCoordinate(fieldPlan.parentType, fieldPlan.fieldName)),
 						indexes: []int{i},
 					})
 					listMustBubble = true
@@ -1253,7 +1276,7 @@ func innerProcessNullValueBubbling(typeInfo FieldWrapperTypeInfo, fieldResponse 
 	var completionErrors []listCompletionError
 	listMustBubble := false
 	for i, el := range list {
-		processedElement, elChanged, elementErrors := innerProcessNullValueBubbling(*elementTypeInfo, el)
+		processedElement, elChanged, elementErrors := innerProcessNullValueBubbling(fieldPlan, *elementTypeInfo, el)
 		if len(elementErrors) != 0 {
 			for errorIndex := range elementErrors {
 				indexes := make([]int, len(elementErrors[errorIndex].indexes)+1)
@@ -1295,11 +1318,15 @@ func fieldDependenciesAvailable(fieldPlan *FieldPlan, rundata *Rundata) bool {
 		return false
 	}
 
-	for _, paramPlans := range [3][]*ParamPlan{
+	dependencyParamPlans := [3][]*ParamPlan{
 		fieldPlan.paramPlans,
 		fieldPlan.bulkParamPlans,
-		fieldPlan.directiveParamPlans,
-	} {
+		nil,
+	}
+	if !fieldPlan.materializeFromParentSource {
+		dependencyParamPlans[2] = fieldPlan.directiveParamPlans
+	}
+	for _, paramPlans := range dependencyParamPlans {
 		for _, paramPlan := range paramPlans {
 			if paramPlan == nil {
 				continue
@@ -1451,7 +1478,7 @@ func prepareIterationCallFieldParams(fieldPlan *FieldPlan, rundata *Rundata, ctx
 			}
 		case PARAM_TYPE_ENUM_FIELD_RESPONSE_RAW:
 			if paramPlan.dependentFieldId != fieldPlan.parentFieldId {
-				return nil, fmt.Errorf("iteration step response raw dependency %d dose not match parent field %d", paramPlan.dependentFieldId, fieldPlan.parentFieldId)
+				return nil, fmt.Errorf("iteration step response raw dependency %d does not match parent field %d", paramPlan.dependentFieldId, fieldPlan.parentFieldId)
 			}
 		default:
 			return nil, fmt.Errorf("iteration step param plan has invalid param type %d", paramPlan.paramType)

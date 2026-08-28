@@ -2,14 +2,17 @@ package graphql
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
+	"github.com/graphql-go/graphql/language/printer"
 )
 
 type SGraphEngine struct {
@@ -227,7 +230,7 @@ func completeOperationVariables(schema *Schema, variableDefs []*ast.VariableDefi
 			}
 
 			if isNonNullInput(inputType) {
-				variableErr := fmt.Errorf("variable %s is non-null but has no value", name)
+				variableErr := fmt.Errorf("Variable \"$%s\" of required type \"%v\" was not provided.", name, printer.Print(variableDef.Type))
 				return nil, gqlerrors.NewError(variableErr.Error(), []ast.Node{variableDef}, "", nil, nil, variableErr)
 			}
 
@@ -237,7 +240,7 @@ func completeOperationVariables(schema *Schema, variableDefs []*ast.VariableDefi
 
 		if variableValue == nil {
 			if isNonNullInput(inputType) {
-				variableErr := fmt.Errorf("variable %s is non-null but has nil value", name)
+				variableErr := fmt.Errorf("Variable \"$%s\" of required type \"%v\" was not provided.", name, printer.Print(variableDef.Type))
 				return nil, gqlerrors.NewError(variableErr.Error(), []ast.Node{variableDef}, "", nil, nil, variableErr)
 			}
 
@@ -247,7 +250,10 @@ func completeOperationVariables(schema *Schema, variableDefs []*ast.VariableDefi
 		}
 		parsed, parsedErr := parseInputValue(inputType, variableValue)
 		if parsedErr != nil {
-			message := fmt.Sprintf("Variable \"$%s\": %s", name, parsedErr.Error())
+			// 与原生 values.go 一致：括注的是输入原始值的 JSON 表示，其后换行拼接具体原因。
+			// 不能用 parsed —— parseInputValue 出错时它恒为 nil。
+			inputBytes, _ := json.Marshal(variableValue)
+			message := fmt.Sprintf("Variable \"$%s\" got invalid value %s.\n%s", name, string(inputBytes), parsedErr.Error())
 			return nil, gqlerrors.NewError(message, []ast.Node{variableDef}, "", nil, nil, parsedErr)
 		}
 		result[name] = parsed
@@ -266,12 +272,18 @@ func parseInputValue(inputType Input, source any) (any, error) {
 
 	if nonNullType, ok := inputType.(*NonNull); ok {
 		if source == nil {
-			return nil, fmt.Errorf("nonNull input value is required")
+			// 与原生 values.go 的 isValidInputValue 一致：有名类型报出具体类型，
+			// 无名类型（如内嵌 List）退回通用文案。
+			if innerName := nonNullType.OfType.Name(); innerName != "" {
+				return nil, fmt.Errorf("Expected %q, found null.", innerName+"!")
+			}
+			return nil, errors.New("Expected non-null value, found null.")
 		}
 
 		inner, innerOk := nonNullType.OfType.(Input)
 		if !innerOk {
-			return nil, fmt.Errorf("nonNull input value is required")
+			// schema 定义问题：Non-Null 包裹了非输入类型，与"值为 null"无关，不套用上面的文案。
+			return nil, fmt.Errorf("non-null wrapper of %q does not wrap an input type", nonNullType.OfType.Name())
 		}
 		return parseInputValue(inner, source)
 	}
@@ -291,7 +303,11 @@ func parseInputValue(inputType Input, source any) (any, error) {
 			for index, sourceItem := range sourceItems {
 				item, itemErr := parseInputValue(inner, sourceItem)
 				if itemErr != nil {
-					return nil, fmt.Errorf("at index %d: %w", index, itemErr)
+					// 文案形式对齐原生 values.go 的 isValidInputValue，但序号取真实元素下标。
+					// 原生那里把内层 messages 的下标当成了元素下标（`idx+1` 而非 `i+1`），
+					// 对 [1,"bad",3] 会报 "In element #1" 而实际出错的是第 2 个元素；
+					// 此处不复制该 off-by-one，避免给出指向错误元素的诊断信息。
+					return nil, fmt.Errorf("In element #%d: %w", index+1, itemErr)
 				}
 				result = append(result, item)
 			}
@@ -307,7 +323,7 @@ func parseInputValue(inputType Input, source any) (any, error) {
 	case *InputObject:
 		sourceMap, ok := source.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("expected input object type %q", typedInput.Name())
+			return nil, fmt.Errorf("Expected %q, found not an object.", typedInput.Name())
 		}
 
 		fieldDefs := typedInput.Fields()
@@ -321,8 +337,13 @@ func parseInputValue(inputType Input, source any) (any, error) {
 		}
 
 		if len(unknownFieldNames) > 0 {
+			// 与原生 values.go 一致：每个未知字段各产出一条 In field 消息，排序保证文案稳定。
 			sort.Strings(unknownFieldNames)
-			return nil, fmt.Errorf("in field %q: field is not defined by input object %q", unknownFieldNames[0], unknownFieldNames)
+			unknownFieldMessages := make([]string, 0, len(unknownFieldNames))
+			for _, unknownFieldName := range unknownFieldNames {
+				unknownFieldMessages = append(unknownFieldMessages, fmt.Sprintf("In field %q: Unknown field.", unknownFieldName))
+			}
+			return nil, errors.New(strings.Join(unknownFieldMessages, "\n"))
 		}
 
 		fieldNames := make([]string, 0, len(fieldDefs))
@@ -342,14 +363,14 @@ func parseInputValue(inputType Input, source any) (any, error) {
 				}
 
 				if isNonNullInput(fieldDef.Type) {
-					return nil, fmt.Errorf("field %q is non-null but has no value", fieldName)
+					return nil, fmt.Errorf("In field %q: Expected %q, found null.", fieldName, fieldDef.Type.String())
 				}
 				continue
 			}
 
 			parsedFieldValue, parsedFieldValueErr := parseInputValue(fieldDef.Type, sourceFieldValue)
 			if parsedFieldValueErr != nil {
-				return nil, fmt.Errorf("in field %q: %w", fieldName, parsedFieldValueErr)
+				return nil, fmt.Errorf("In field %q: %w", fieldName, parsedFieldValueErr)
 			}
 
 			//provided=true且结果为nil，表示显式传入nil，此时应保留
@@ -359,13 +380,14 @@ func parseInputValue(inputType Input, source any) (any, error) {
 	case *Scalar:
 		parsed := typedInput.ParseValue(source)
 		if parsed == nil {
-			return nil, fmt.Errorf("expected scalar type %q", typedInput.Name())
+			// 与原生 values.go 的 isValidInputValue 一致：带上实际输入值而非解析结果。
+			return nil, fmt.Errorf("Expected type %q, found %q.", typedInput.Name(), fmt.Sprintf("%v", source))
 		}
 		return parsed, nil
 	case *Enum:
 		parsed := typedInput.ParseValue(source)
 		if parsed == nil {
-			return nil, fmt.Errorf("expected enum type %q", typedInput.Name())
+			return nil, fmt.Errorf("Expected type %q, found %q.", typedInput.Name(), fmt.Sprintf("%v", source))
 		}
 		return parsed, nil
 	default:

@@ -174,6 +174,17 @@ func getParentCompositeFromScope(scope *FieldTypeScope) Composite {
 	return parentComposite
 }
 
+// fieldErrorCoordinate 生成错误文案中的字段坐标，与 graphql-go 原生一致地采用
+// "ParentType.fieldName" 形式（见 executor.go 的 completeValue / completeListValue /
+// completeAbstractValue）。使用 schema 字段名而非 responseName，因此 alias 不影响坐标。
+// parentType 缺失时退化为仅字段名，避免产生 ".field" 这种残缺坐标。
+func fieldErrorCoordinate(parentType Composite, fieldName string) string {
+	if isNilInterfaceValue(parentType) {
+		return fieldName
+	}
+	return parentType.Name() + "." + fieldName
+}
+
 func calculateMaxFieldId(roots []*FieldPlan) uint32 {
 	var max uint32
 	for _, root := range roots {

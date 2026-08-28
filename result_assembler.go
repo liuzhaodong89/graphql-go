@@ -170,7 +170,7 @@ func (a *SGraphResultAssembler) buildListFieldValue(field *FieldPlan, parentResp
 	}
 	fieldResponseAsList, fieldResponseAsListOk := asListValue(fieldResponse)
 	if !fieldResponseAsListOk {
-		err := fmt.Errorf("field response is not a list %s", field.fieldName)
+		err := fmt.Errorf("User Error: expected iterable, but did not find one for field %s.", fieldErrorCoordinate(field.parentType, field.fieldName))
 		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 		return nil
 	}
@@ -198,7 +198,7 @@ func (a *SGraphResultAssembler) buildListValueItems(field *FieldPlan, elementWra
 		if isNilInterfaceValue(item) {
 			if elementWrappTypeInfo.notNil {
 				if !rundata.hasFieldErrorAtPlanPath(field, rundata.assemblyListIndexes) {
-					err := fmt.Errorf("cannot return null for non-nullable list element of field %s", field.responseName)
+					err := fmt.Errorf("Cannot return null for non-nullable field %s.", fieldErrorCoordinate(field.parentType, field.fieldName))
 					rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 				}
 				return nil
@@ -210,7 +210,7 @@ func (a *SGraphResultAssembler) buildListValueItems(field *FieldPlan, elementWra
 		if elementWrappTypeInfo.isList {
 			childItems, ok := asListValue(item)
 			if !ok {
-				err := fmt.Errorf("expected iterable list element for field %s", field.responseName)
+				err := fmt.Errorf("User Error: expected iterable, but did not find one for field %s.", fieldErrorCoordinate(field.parentType, field.fieldName))
 				rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 				if elementWrappTypeInfo.notNil {
 					return nil
@@ -461,12 +461,78 @@ func (a *SGraphResultAssembler) buildListValueInListValueObjectItem(fieldPlan *F
 
 	currentFieldResponseAsList, currentFieldResponseAsListOk := asListValue(currentFieldResponse)
 	if !currentFieldResponseAsListOk {
-		err := fmt.Errorf("expected iterable field %s validated failed while building result", fieldPlan.responseName)
+		err := fmt.Errorf("User Error: expected iterable, but did not find one for field %s.", fieldErrorCoordinate(fieldPlan.parentType, fieldPlan.fieldName))
 		rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 		return nil
 	}
 	fieldWrapperTypeInfo := fieldPlan.fieldWrapperTypeInfo
 	return a.buildListValueItems(fieldPlan, fieldWrapperTypeInfo.elementWrapperTypeInfo, currentFieldResponseAsList, rundata, ctx)
+}
+
+// fieldValuePropertyKey统一结果组装和内部物化Step的属性取值规则。
+// 普通业务对象使用schema fieldName；内省中间结果由生成器按responseName写入。
+func fieldValuePropertyKey(fieldName, responseName string, parentType Composite) string {
+	if responseName == "" || responseName == fieldName || parentType == nil {
+		return fieldName
+	}
+	switch parentType.Name() {
+	case "__Schema", "__Type", "__Field", "__InputValue", "__EnumValue", "__Directive":
+		return responseName
+	default:
+		return fieldName
+	}
+}
+
+// newMaterializedSourceResolver只捕获编译期确定的属性key，不保存任何请求级数据。
+func newMaterializedSourceResolver(propertyKey string) ResolverFunc {
+	return func(source any, _ map[string]any, info ResolveInfo, ctx context.Context) (any, error) {
+		return resolveMaterializedSourceField(source, propertyKey, info, ctx)
+	}
+}
+
+// resolveMaterializedSourceField用于按需提升的无resolver字段。
+// 它只读取父对象属性，不改变用户resolver不接收graphql-go Source的既有约束。
+func resolveMaterializedSourceField(source any, propertyKey string, info ResolveInfo, ctx context.Context) (any, error) {
+	if isNilInterfaceValue(source) {
+		return nil, nil
+	}
+	if sourceMap, ok := source.(map[string]any); ok {
+		result := sourceMap[propertyKey]
+		return result, deferredFunctionPropertyError(propertyKey, result)
+	}
+
+	// FieldResolver优先级与当前组装阶段一致，不能被反射map快路径绕过。
+	if _, isFieldResolver := source.(FieldResolver); !isFieldResolver {
+		sourceValue := reflect.ValueOf(source)
+		if sourceValue.IsValid() && sourceValue.Kind() == reflect.Map && sourceValue.Type().Key().Kind() == reflect.String {
+			mapKey := reflect.New(sourceValue.Type().Key()).Elem()
+			mapKey.SetString(propertyKey)
+			mapValue := sourceValue.MapIndex(mapKey)
+			if !mapValue.IsValid() {
+				return nil, nil
+			}
+			result := mapValue.Interface()
+			return result, deferredFunctionPropertyError(propertyKey, result)
+		}
+	}
+
+	result, err := callDefaultResolveFn(ResolveParams{Source: source, Info: info, Context: ctx})
+	if err != nil {
+		return nil, err
+	}
+	return result, deferredFunctionPropertyError(propertyKey, result)
+}
+
+// deferredFunctionPropertyError拒绝把函数当成已经完成的字段值；需要延迟计算的字段必须显式配置resolver。
+func deferredFunctionPropertyError(fieldName string, value any) error {
+	if value == nil {
+		return nil
+	}
+	valueType := reflect.TypeOf(value)
+	if valueType == nil || valueType.Kind() != reflect.Func {
+		return nil
+	}
+	return fmt.Errorf("field %s resolves to a function value; the result assembler does not evaluate deferred properties, configure a resolver for this field instead", fieldName)
 }
 
 func (a *SGraphResultAssembler) extractFieldResponse(fieldPlan *FieldPlan, parentResponse any, rundata *Rundata, ctx context.Context) (any, error) {
@@ -544,13 +610,7 @@ func (a *SGraphResultAssembler) extractFieldResponse(fieldPlan *FieldPlan, paren
 	}
 
 	// 普通业务对象使用 schema fieldName；内省中间结果当前已经按照 responseName 生成。
-	propertyKey := fieldPlan.fieldName
-	if fieldPlan.responseName != propertyKey && fieldPlan.parentType != nil {
-		switch fieldPlan.parentType.Name() {
-		case "__Schema", "__Type", "__Field", "__InputValue", "__EnumValue", "__Directive":
-			propertyKey = fieldPlan.responseName
-		}
-	}
+	propertyKey := fieldValuePropertyKey(fieldPlan.fieldName, fieldPlan.responseName, fieldPlan.parentType)
 
 	// map 中保存的是已经完成的属性值，不执行函数形式的延迟属性。
 	if parentResponseMap, parentResponseMapOk := parentResponse.(map[string]any); parentResponseMapOk {
@@ -733,7 +793,11 @@ func (a *SGraphResultAssembler) validateAbstractFieldValue(field *FieldPlan, val
 
 	//无法推断运行时类型，报错返回
 	if runtimeType == nil {
-		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, fmt.Errorf("abstract type %s must resolve to an Object type at runtime", abs.Name()), rundata.assemblyListIndexes)
+		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField,
+			// 与原生 executor.go 的 completeAbstractValue 文案一致；runtimeType 在此分支恒为 nil。
+			fmt.Errorf("Abstract type %s must resolve to an Object type at runtime for field %s with value \"%v\", received \"<nil>\".",
+				abs.Name(), fieldErrorCoordinate(field.parentType, field.fieldName), value),
+			rundata.assemblyListIndexes)
 		return "", false
 	}
 
@@ -746,7 +810,7 @@ func (a *SGraphResultAssembler) validateAbstractFieldValue(field *FieldPlan, val
 		}
 	}
 	if !runtimeTypeAllowed {
-		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, fmt.Errorf("runtime object type %q is not a possible type for %q", typeName, abs.Name()), rundata.assemblyListIndexes)
+		rundata.addFieldErrorAtPlanPath(field, FieldErrorTypeField, fmt.Errorf("Runtime Object type %q is not a possible type for %q.", typeName, abs.Name()), rundata.assemblyListIndexes)
 		return "", false
 	}
 
@@ -787,14 +851,13 @@ func callDefaultResolveFn(param ResolveParams) (result any, err error) {
 // 交给叶子序列化后变成 "0x..." 之类的无意义字符串写进响应。
 // 规范 §6.4.3 CoerceResult 要求结果强制转换必须产出该类型的有效值，否则必须抛执行错误。
 func rejectDeferredFunctionProperty(fieldPlan *FieldPlan, value any, rundata *Rundata) error {
-	if fieldPlan == nil || value == nil {
+	if fieldPlan == nil {
 		return nil
 	}
-	valueType := reflect.TypeOf(value)
-	if valueType == nil || valueType.Kind() != reflect.Func {
+	err := deferredFunctionPropertyError(fieldPlan.fieldName, value)
+	if err == nil {
 		return nil
 	}
-	err := fmt.Errorf("field %s resolves to a function value; the result assembler does not evaluate deferred properties, configure a resolver for this field instead", fieldPlan.fieldName)
 	if rundata != nil {
 		rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 	}
@@ -806,7 +869,7 @@ func addNonNullCompletionErrorIfNeeded(fieldPlan *FieldPlan, value any, rundata 
 	if fieldPlan == nil || rundata == nil || !fieldPlan.fieldWrapperTypeInfo.notNil || !isNilInterfaceValue(value) || rundata.hasFieldErrorAtPlanPath(fieldPlan, rundata.assemblyListIndexes) {
 		return
 	}
-	err := fmt.Errorf("cannot return null for non-nullable field %s", fieldPlan.fieldName)
+	err := fmt.Errorf("Cannot return null for non-nullable field %s.", fieldErrorCoordinate(fieldPlan.parentType, fieldPlan.fieldName))
 	rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, err, rundata.assemblyListIndexes)
 }
 
@@ -848,6 +911,8 @@ func serializeLeafValue(fieldPlan *FieldPlan, value any, rundata *Rundata) (seri
 		if originalType := info.baseType; !isNilInterfaceValue(originalType) {
 			typeName = originalType.Name()
 		}
+		// 原生 completeLeafValue 在序列化失败时静默返回 nil，没有对应文案可对齐；
+		// 这里保留 sgraph 自有的语义化描述，避免对可空字段错报 non-nullable。
 		serializeErr := fmt.Errorf("cannot serialize leaf value for %s:%s", fieldPlan.fieldName, typeName)
 		if rundata != nil {
 			rundata.addFieldErrorAtPlanPath(fieldPlan, FieldErrorTypeField, serializeErr, rundata.assemblyListIndexes)
