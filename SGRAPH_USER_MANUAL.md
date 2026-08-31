@@ -1,0 +1,1311 @@
+# sgraph 用户使用手册
+
+> 面向**调用方**（接入 sgraph 的业务工程）的完整使用手册。
+> 覆盖：两条执行链路的差异、从 graphql-go 迁移需要做的改造、以及查询折叠 / 参数依赖 / 批量查询（bulk）/ 自定义指令等特性的配置方法。
+>
+> 基准代码：本仓库当前 `master` 工作副本（根包 `github.com/graphql-go/graphql`）。
+> 规范基准：[GraphQL September 2025](https://spec.graphql.org/September2025/)。
+> 本手册中每一条**行为结论**都来自对当前代码的实测（批次拓扑打点 + 实际执行），不是从注释或旧文档推断的；与旧文档冲突处以本手册为准，冲突点在 §13 单独列出。
+
+---
+
+## 目录
+
+1. [两条链路是什么](#1-两条链路是什么)
+2. [调用方可见差异速查表](#2-调用方可见差异速查表)
+3. [迁移改造清单](#3-迁移改造清单)
+4. [启动装配：Engine 与两个 Registry](#4-启动装配engine-与两个-registry)
+5. [resolver 契约：Source 恒为 nil](#5-resolver-契约source-恒为-nil)
+6. [读取响应：Result.Data 不再是 map](#6-读取响应resultdata-不再是-map)
+7. [查询折叠（Query Folding）](#7-查询折叠query-folding)
+8. [参数依赖：ParamRegistry 完整配置手册](#8-参数依赖paramregistry-完整配置手册)
+9. [批量查询（Bulk）完整配置手册](#9-批量查询bulk完整配置手册)
+10. [自定义指令（DirectiveRegistry）](#10-自定义指令directiveregistry)
+11. [错误模型与响应形态](#11-错误模型与响应形态)
+12. [并发、对象池与共享对象约束](#12-并发对象池与共享对象约束)
+13. [能力边界与已知缺口](#13-能力边界与已知缺口)
+14. [排错手册：错误文案对照表](#14-排错手册错误文案对照表)
+15. [上线检查清单](#15-上线检查清单)
+
+---
+
+## 1. 两条链路是什么
+
+| | 原生链路 | sgraph 链路 |
+|---|---|---|
+| 入口 | `Do` → parse → validate → `Execute` → `ExecuteGraphQLGo` | `Do` → parse → validate → `Execute` → `executeSGraph` → `SGraphEngine` |
+| 执行模型 | 按选择集深度优先递归，父字段完成后才执行子字段 | 编译成 `SGraphExecutionPlan`，按**参数依赖图**拓扑分层成 `BatchPlan`，同一 batch 内的 Step 并发执行，最后统一组装结果 |
+| 父子传值 | 父 resolver 的返回值作为子 resolver 的 `p.Source` | **不传**。父子关系在结果组装阶段重建；需要父数据时用 `ParamRegistry` 显式注入 |
+| 调用次数 | list 下的子字段逐元素调用（N+1） | 可用 bulk 一次调用拿全量，再按业务 key 回填 |
+
+**两条链路共用**：词法/语法解析（parser）、全部校验规则（validate）、Schema 类型系统、内省数据来源、`Params` 入参结构。切换点只有 `executor.go` 中 `Execute` 的一行：
+
+```go
+func Execute(p ExecuteParams) (result *Result) {
+	return executeSGraph(p)   // 换成 ExecuteGraphQLGo(p) 即回到原生链路
+}
+```
+
+路由细则（`executeSGraph`）：
+
+- `query` → 进入 SGraph 引擎；
+- `mutation` → **回退**到 `ExecuteGraphQLGo`，语义与原生完全一致；
+- `subscription` → 返回 request error `subscription is not supported yet`。
+
+因此**本手册所有 sgraph 特性只对 query 生效**。
+
+---
+
+## 2. 调用方可见差异速查表
+
+按"是否会让现有代码出错"排序。✅ = 无需改动，⚠️ = 需要确认，❌ = 必须改造。
+
+| # | 维度 | 原生 | sgraph | 影响 |
+|---|---|---|---|---|
+| 1 | `graphql.Do(Params{...})` 调用方式 | 一致 | 一致 | ✅ |
+| 2 | `Result.Data` 的 Go 类型 | `map[string]interface{}` | `*SGraphResponseOrderedMap` | ❌ 类型断言全部失效，见 §6 |
+| 3 | `json.Marshal(result)` | 字段顺序不定 | 严格按查询字段顺序 | ✅（更合规） |
+| 4 | 业务 resolver 的 `p.Source` | 父字段返回值 | **恒为 `nil`** | ❌ 见 §5 |
+| 5 | 根字段无 resolver | 默认 resolver 从 `RootObject` 取值 | 报错 `field N has no resolver function` | ❌ |
+| 6 | 字段声明了参数但无 resolver | 允许，参数被忽略 | 报错 `field N has param plan but no resolver` | ❌ |
+| 7 | map / struct 里的函数属性（thunk） | 默认 resolver 会调用它 | 不执行，字段置 null 并报字段错误 | ❌ |
+| 8 | schema 声明但未注册的自定义指令 | 静默忽略 | 报错 `no directive compiler found for X` | ❌ 见 §10 |
+| 8b | list 元素类型带 `ID` 字段 | 无特殊含义 | 启用业务 key 绑定：父 resolver 必须返回该字段且值逐父元素唯一 | ❌ 见 §5.4 |
+| 9 | `p.Info.RootValue` | `Params.RootObject` 原值 | 仅当 `RootObject` 是 `map[string]any` 时透传，否则为 nil | ⚠️ |
+| 10 | 叶子结果强制转换失败 | 静默变 null | 产生 field error | ⚠️ `errors` 数组会变长 |
+| 11 | 显式传入的 `null` 变量 | 常被当成"未提供"套默认值 | 区分"未提供"与"显式 null" | ⚠️ 业务默认值行为可能改变 |
+| 12 | 根选择集被**字面量** `@skip(if:true)` 全裁剪 | `{"data":{}}` | request error（**已知缺陷**，变量形式不受影响） | ⚠️ 见 §13.2 |
+| 13 | non-null 冒泡 | 返回字段错误并按 nullable 边界冒泡 | 同左 | ✅ |
+| 14 | `-race` 并发检查 | 当前串行字段执行下通过 | 通过 | ✅ |
+| 15 | mutation | 原生语义 | 同左（回退） | ✅ |
+| 16 | subscription | 支持 | 不支持 | ❌ 若在用则不能迁 |
+| 17 | Extension 钩子 | 全部 | `Init/Parse/Validation/Execution/ResolveField` 均触发 | ✅ |
+
+---
+
+## 3. 迁移改造清单
+
+### 3.1 必做（不做就跑不起来 / 数据错）
+
+| 序号 | 改造项 | 章节 |
+|---|---|---|
+| M1 | 启动阶段装配 Engine，并保证在第一条请求之前完成 | §4 |
+| M2 | 所有读取 `Result.Data` 的代码改为走 JSON | §6 |
+| M3 | 所有 `p.Source` 的使用改为参数注入或自取数 | §5 §8 |
+| M4 | 每个根字段补 resolver | §4.4 |
+| M5 | "声明了参数但没有 resolver"的字段，补 resolver 或删参数 | §4.4 |
+| M6 | map/struct 里的函数属性改成 resolver | §5.3 |
+| M7 | query 文本中出现的每个自定义指令登记到 `DirectiveRegistry` | §10 |
+| M8 | 逐一检查 list 元素类型的 `ID` 字段：确认父 resolver 会返回它、值逐父元素唯一 | §5.4 |
+
+### 3.2 条件必做
+
+| 序号 | 条件 | 改造项 | 章节 |
+|---|---|---|---|
+| C1 | 用到 subscription | 该 operation 保留在原生链路，或不迁 | §1 |
+| C2 | 子 resolver 需要父数据 | 注册 `FIELD_RESPONSE` 参数依赖 | §8 |
+| C3 | list 下的子字段调用量大（N+1） | 配置 bulk | §9 |
+| C4 | 客户端依赖 `errors` 长度 / 顺序 | 回归测试 | §11 |
+
+### 3.3 可选（收益项）
+
+| 序号 | 优化项 | 收益 | 章节 |
+|---|---|---|---|
+| O1 | 让互不依赖的根字段不声明依赖 | 自动同批并发 | §7 |
+| O2 | 把逐元素 resolver 改成 bulk | N 次调用 → 1 次 | §9 |
+| O3 | 让 bulk 不依赖父结果 | bulk 与父字段同批并发 | §7.4 |
+
+---
+
+## 4. 启动装配：Engine 与两个 Registry
+
+### 4.1 价值与原因
+
+**价值**：`SGraphEngine` 持有 Plan 缓存 —— 同一个 (query 文本, operationName) 只编译一次执行计划，之后所有请求复用。参数依赖、自定义指令这两类配置也只能通过 Engine 注入。
+
+**原因**：Engine 与 Schema 的绑定按设计是**一次性、进程内不可变**的。绑定关系一旦建立就不再改变，Plan 缓存、两个 Registry 快照和 Schema 的对应关系在整个进程生命周期内保持稳定，运行期不需要任何同步或失效逻辑。代价是：**顺序错了无法纠正**。
+
+如果第一条请求早于 `RegisterSGraphEngine` 到达，`getSGraphEngineForSchema` 会为该 Schema 兜底创建一个**只含 `@skip`/`@include`、不含任何自定义配置**的默认 Engine 并写入全局缓存。此后再调用 `RegisterSGraphEngine` 会返回 `another sgraph engine is already registered for this schema`，框架不提供解绑或替换接口 —— **只能重启进程**。
+
+### 4.2 样例
+
+```go
+// 1. 构建 Schema（类型、字段、resolver 全部就位）
+schema, err := graphql.NewSchema(graphql.SchemaConfig{
+	Query: queryType,
+	Types: []graphql.Type{userType, orderType},
+})
+if err != nil {
+	log.Fatalf("build schema: %v", err)
+}
+
+// 2. 指令注册表：NewDirectiveRegistry 已自带 @skip / @include
+directives := graphql.NewDirectiveRegistry()
+if err := directives.RegisterMetadataOnly("audit"); err != nil {   // 纯标注型
+	log.Fatalf("register @audit: %v", err)
+}
+if err := directives.Register("authz", AuthzCompiler{}, AuthzHandler{}); err != nil {  // 有执行语义
+	log.Fatalf("register @authz: %v", err)
+}
+
+// 3. 参数依赖注册表
+params := graphql.NewParamRegistry()
+if err := params.RegisterQuery(graphql.QueryParamConfig{ /* 见 §8 */ }); err != nil {
+	log.Fatalf("register param bindings: %v", err)
+}
+
+// 4. 创建 Engine（此处会克隆并冻结两个 Registry）
+engine, err := graphql.NewSGraphEngine(&schema, directives, params)
+if err != nil {
+	log.Fatalf("new engine: %v", err)
+}
+
+// 5. 绑定到 Schema —— 必须在第一条请求之前
+if err := graphql.RegisterSGraphEngine(engine); err != nil {
+	log.Fatalf("register engine: %v", err)   // 返回错误 = 启动失败，不能忽略
+}
+
+// 6. 到这一步之后才允许注册 HTTP 路由 / 开始接收流量
+http.Handle("/graphql", myHandler(schema))
+```
+
+请求侧写法与原生完全一致：
+
+```go
+result := graphql.Do(graphql.Params{
+	Schema:         schema,
+	RequestString:  query,
+	VariableValues: variables,
+	OperationName:  opName,
+	RootObject:     map[string]any{"tenant": tenantID},
+	Context:        ctx,
+})
+```
+
+### 4.3 字段语义与要求
+
+**`NewSGraphEngine(schema *Schema, directiveRegistry *DirectiveRegistry, paramRegistry *ParamRegistry) (*SGraphEngine, error)`**
+
+| 参数 | 类型 | 必填 | 语义与要求 |
+|---|---|---|---|
+| `schema` | `*Schema` | 是 | 必须非 nil 且 `QueryType()` 非 nil，否则返回 `schema must have a query type`。Engine **不克隆** Schema，创建后不得再修改其类型 / 字段 / resolver |
+| `directiveRegistry` | `*DirectiveRegistry` | 否 | 传 nil 时内部自动 `NewDirectiveRegistry()`（只含 `@skip`/`@include`）。传入后会被 `cloneAndFreeze()`，之后改原对象不影响 Engine |
+| `paramRegistry` | `*ParamRegistry` | 否 | 传 nil 合法，等价于"没有任何参数依赖配置"。同样被冻结 |
+
+**`RegisterSGraphEngine(engine *SGraphEngine) error`**
+
+| 返回 | 含义 |
+|---|---|
+| `nil` | 绑定成功；或该 Engine 已经是当前绑定对象（幂等重复调用安全） |
+| `sgraph engine is nil` / `sgraph engine schema is nil` | 传参非法 |
+| `another sgraph engine is already registered for this schema` | 该 Schema 已被**别的** Engine 绑定。**这是启动失败**，必须 fail fast，不能吞掉 |
+
+> Schema 的身份用 `reflect.ValueOf(schema.typeMap).Pointer()` 标识。`Schema` 是值类型但值拷贝共享同一个 `typeMap`，所以传值/传指针都指向同一个绑定关系。
+
+### 4.4 必须配置 resolver 的两种情形
+
+编排阶段（`plan_coordinator.go` 的 `appendBatches`）对以下两种情形直接返回错误，**整个请求失败**：
+
+1. **根字段没有 resolver** → `field %d has no resolver function`
+   原生允许根字段不配 resolver，由默认 resolver 从 `RootObject` 读同名 key；sgraph 不支持。
+2. **字段声明了参数但没有 resolver** → `field %d has param plan but no resolver`
+   （bulk 对应 `field %d has bulk param plan but no bulk resolver`）
+   内省字段豁免这条检查（`__Type.fields(includeDeprecated:)` 之类确实有参数但由内省逻辑读取）。
+
+**改造做法**：
+
+```go
+// ❌ 迁移前：根字段靠 RootObject
+"tenant": &graphql.Field{Type: graphql.String},
+
+// ✅ 迁移后
+"tenant": &graphql.Field{
+	Type: graphql.String,
+	Resolve: func(p graphql.ResolveParams) (any, error) {
+		root, _ := p.Info.RootValue.(map[string]any)
+		return root["tenant"], nil
+	},
+},
+```
+
+```go
+// ❌ 迁移前：声明了参数但没 resolver（原生会忽略参数，走默认取值）
+"nickname": &graphql.Field{
+	Type: graphql.String,
+	Args: graphql.FieldConfigArgument{"upper": &graphql.ArgumentConfig{Type: graphql.Boolean}},
+},
+
+// ✅ 方案 A：补 resolver
+"nickname": &graphql.Field{
+	Type: graphql.String,
+	Args: graphql.FieldConfigArgument{"upper": &graphql.ArgumentConfig{Type: graphql.Boolean}},
+	Resolve: func(p graphql.ResolveParams) (any, error) { /* ... */ },
+}
+// ✅ 方案 B：删掉不再使用的参数声明
+```
+
+---
+
+## 5. resolver 契约：Source 恒为 nil
+
+### 5.1 现象与原因
+
+**这是迁移中影响面最大的一条。**
+
+```go
+// plan.go execResolveProcess，普通字段分支
+return resolverFn(nil, params, info, ctx)
+//                ^^^ 恒为 nil
+```
+
+对应到 `ResolveParams`，**业务 resolver 拿到的 `p.Source` 永远是 `nil`**（`__typename` 是唯一例外，它会拿到父元素实际值用于动态类型判定）。
+
+**原因不是遗漏，而是执行模型的必然结果**：sgraph 把父子字段编排进**同一个 batch 并发执行**（见 §7）。实测中子字段甚至可能先于父字段返回：
+
+```
+BATCH 0 concurrent=true: profile#1(Single), profile.city#2(Single)
+order=[child parent]      ← city 的 resolver 先跑完
+```
+
+在这种模型下，"父结果"在子 resolver 执行时根本还不存在，所以框架不可能把它作为 `Source` 传进来。父子关系是在**结果组装阶段**由响应路径或业务 key 重建的。
+
+### 5.2 三种替代方案
+
+| 方案 | 适用场景 | 是否影响折叠 |
+|---|---|---|
+| **A. resolver 自取数** | 子字段能独立获得数据（走自己的 DAO / 缓存 / 请求变量） | ✅ 不影响，保留同批并发 |
+| **B. `FIELD_RESPONSE` 参数注入** | 子字段确实需要父结果里的某个值 | ⚠️ 建立依赖边，子字段进入下一批次 |
+| **C. bulk** | 父是 list、子字段逐元素调用量大 | ✅ 一次调用，可与父同批（不依赖父结果时） |
+
+方案 B 的最小样例（完整字段语义见 §8）：
+
+```go
+// 迁移前
+"orders": &graphql.Field{
+	Type: graphql.NewList(orderType),
+	Resolve: func(p graphql.ResolveParams) (any, error) {
+		profile := p.Source.(map[string]any)      // ❌ sgraph 下是 nil
+		return orderDAO.ListByUser(profile["id"])
+	},
+},
+
+// 迁移后：把父字段的 id 声明成本字段的一个参数
+"orders": &graphql.Field{
+	Type: graphql.NewList(orderType),
+	Args: graphql.FieldConfigArgument{
+		"userId": &graphql.ArgumentConfig{Type: graphql.ID},   // 必须在 schema 里声明
+	},
+	Resolve: func(p graphql.ResolveParams) (any, error) {
+		return orderDAO.ListByUser(p.Args["userId"])           // ✅ 由框架注入
+	},
+},
+```
+
+### 5.3 属性值不得是函数（不支持惰性属性）
+
+原生 `DefaultResolveFn` 支持把 map / struct 字段的值写成函数，取值时调用它（thunk）：
+
+```go
+map[string]any{"thunk": func() any { return "thunkValue" }}   // 原生：得到 "thunkValue"
+```
+
+**sgraph 不支持**。结果组装阶段处理的是"已经完成的属性值"，命中函数值时该字段返回 `null` 并写入一条字段错误：
+
+```json
+{"data":{"fromMap":{"plain":"plainValue","thunk":null}},
+ "errors":[{"message":"field thunk resolves to a function value; the result assembler does not evaluate deferred properties, configure a resolver for this field instead",
+            "locations":[{"line":1,"column":19}],"path":["fromMap","thunk"]}]}
+```
+
+细则：
+
+- 错误路径指向该字段本身；列表元素逐个判定，N 个元素命中就产出 N 条错误，路径各带 occurrence 下标。
+- 字段处于 non-null 位置时按既有规则向上冒泡，兄弟字段数据不受影响。
+- map 值、命名 map 类型、结构体字段、签名不匹配的函数、typed-nil 函数值，全部按同一规则处理。
+
+**规范依据**：§6.4.2 把 `ResolveFieldValue` 的取值方式留给实现，"不执行惰性属性"本身不违规；但 §6.4.3 `CoerceResult` 要求结果强制转换必须产出该类型的有效值，否则必须抛执行错误 —— 所以不能把函数指针序列化成 `"0x…"` 交给 `String` 字段。
+
+**改造做法**：把惰性属性改成该字段的 resolver。需要保留延迟求值语义时，求值必须发生在执行阶段（resolver 内部），不能寄望于组装阶段。
+
+### 5.4 ⚠️ 父子结果如何重新关联：list 父类型上的 `ID` 字段有副作用
+
+既然 `p.Source` 是 nil、父子并发执行，框架就需要在组装阶段重新判断"哪个子结果属于哪个父元素"。**父字段是 list 时**，用哪种方式重建取决于父类型的形状 —— 这一段对 bulk 和普通逐元素 resolver **同样生效**，很多人误以为只跟 bulk 有关。
+
+框架按下面的顺序推断父侧关联 key（`checkAndCompileParentKeyFieldNames`）：
+
+| | 父类型形状 | 推断结果 | 子字段的绑定方式 |
+|---|---|---|---|
+| 1 | 有名为 `id` 且基础类型是内置 `ID` scalar 的字段 | `id` | **业务 key 绑定** |
+| 2 | 没有可用的 `id`，但**恰好一个** `ID` 类型字段 | 该字段 | **业务 key 绑定** |
+| 3 | 没有可用的 `id`，有**多个** `ID` 类型字段 | 不推断 | 普通迭代走 occurrence 路径绑定；bulk 编译期报错 |
+| 4 | 没有任何 `ID` 类型字段 | 不推断 | 普通迭代走 occurrence 路径绑定；bulk 编译期报错 |
+
+**命中 1 或 2 时，父 resolver 的返回值里必须带上那个 key 字段，且它的值必须逐父元素唯一** —— 即使查询里没有选它，即使子字段完全不用 bulk。
+
+这里还有三个实现边界需要同时满足：
+
+1. **父元素必须是精确的 `map[string]any`**。业务 key 绑定在执行和组装阶段都直接断言这个类型；struct、`type NamedMap map[string]any` 和 `map[string]T` 即使能被默认 resolver 读取，也不能用于 composite key 绑定，会报 `parent response for field X does not support composite key mapping`。
+2. **绑定失败时，list 子字段返回 `[]`，标量/对象子字段返回 `null`**。因此 `[]` 既可能表示真实空集合，也可能表示父子绑定失败；调用方必须同时检查 `errors`。
+3. **key 唯一性按字符串化结果判断**。`generateCompositeKey` 会把 key 值经 `valueToString` 转成字符串，所以 `int(1)`、`int64(1)` 与 `string("1")` 会折叠成同一个 key，多个 `nil` 也都会折叠成 `"null"`。`ID` 同时接受整数和字符串，接入时必须统一运行时 Go 类型。
+
+#### 副作用一：key 字段缺失 → 子字段全部变 null
+
+```go
+// 父类型只有一个 ID 字段 groupId → 命中规则 2
+itemType := graphql.NewObject(graphql.ObjectConfig{Name: "Item", Fields: graphql.Fields{
+	"groupId": &graphql.Field{Type: graphql.NewNonNull(graphql.ID)},
+	"name":    &graphql.Field{Type: graphql.String},
+	"label":   &graphql.Field{Type: graphql.String, Resolve: /* 普通 resolver，不是 bulk */},
+}})
+// 父 resolver 只返回 name，没返回 groupId
+return []map[string]any{{"name": "n1"}, {"name": "n2"}}, nil
+```
+
+实测结果：
+
+```json
+{"data":{"items":[{"name":"n1","label":null},{"name":"n2","label":null}]},
+ "errors":[
+   {"message":"parent key field \"groupId\" is missing for field label","path":["items",0,"label"]},
+   {"message":"parent key field \"groupId\" is missing for field label","path":["items",1,"label"]}]}
+```
+
+`label` 的 resolver 其实成功执行了，结果在绑定环节被丢弃。
+
+#### 副作用二：key 值重复 → 数据错配（比报错更值得警惕）
+
+父类型同样只有 `groupId` 一个 `ID` 字段，两个父元素的 `groupId` 相同，子 resolver 每次返回不同的值：
+
+```json
+{"data":{"items":[{"groupId":"same","label":"call-1"},
+                  {"groupId":"same","label":"call-1"}]},
+ "errors":[{"message":"duplicate parent binding key \"same\" for field label","path":["items",1,"label"]}]}
+```
+
+子 resolver **被调用了 2 次**（`call-1`、`call-2`），但第二个父元素显示的是**第一个父元素的结果**。只有一条错误，`data` 里却是两条错配的数据，而不是一个 null。客户端如果只看有没有 `errors` 就放行，会拿到看起来完全正常的错值。
+
+#### 副作用三：给 list 父类型"顺手加个 ID 字段"会让原本正常的子字段开始报错
+
+对照实验：父类型不含任何 `ID` 字段时（命中规则 4），完全相同的重复数据没有任何问题 —— occurrence 路径绑定按父元素位置关联，不依赖任何业务字段：
+
+```json
+{"data":{"items":[{"code":"same","label":"L"},{"code":"same","label":"L"}]}}
+```
+
+也就是说：把 `code: String` 改成 `code: ID`，或者给类型新增一个 `ID` 字段，会在**没有改动任何 resolver** 的情况下改变父子绑定方式，把上面两种副作用引进来。这是一条隐蔽的 schema 变更风险。
+
+#### 接入建议
+
+- **凡是会作为 list 元素类型出现的对象，显式声明 `id: ID!`**，并保证 resolver 每次都返回它、值逐元素唯一。这条同时让规则 1 命中、让 bulk 可用、让绑定行为可预期。
+- 类型里如果有多个 `ID` 字段（外键、多租户很常见），务必确认 `id` 存在 —— 否则命中规则 3，bulk 直接编译失败（见 §9.5）。
+- 不想启用业务 key 绑定时，不要给 list 元素类型放 `ID` 类型字段；用 `String` 表达非身份语义的标识符。
+
+---
+
+## 6. 读取响应：Result.Data 不再是 map
+
+### 6.1 价值与原因
+
+**价值**：`*SGraphResponseOrderedMap` 保存字段的**查询顺序**，`MarshalJSON` 按该顺序输出，满足规范 §7.1.4 / §7.2.2"响应字段顺序必须与查询中字段出现的顺序一致"。原生返回的 `map[string]interface{}` 在 Go 里是无序的，序列化顺序不可控。
+
+**代价**：类型变了。
+
+### 6.2 实测
+
+```go
+res := graphql.Do(graphql.Params{Schema: schema, RequestString: `{ zeta alpha }`})
+
+fmt.Printf("%T\n", res.Data)                     // *graphql.SGraphResponseOrderedMap
+_, ok := res.Data.(map[string]interface{})       // ok == false
+b, _ := json.Marshal(res)                        // {"data":{"zeta":"z","alpha":"a"}}  ← 保序
+```
+
+`*SGraphResponseOrderedMap` **只导出了 `MarshalJSON` 一个方法**，`get` / `set` / `fields` 都不导出，没有任何按 key 读取的公开入口。
+
+### 6.3 改造做法
+
+```go
+// ❌ 迁移前
+data := result.Data.(map[string]interface{})
+user := data["user"].(map[string]interface{})
+
+// ✅ 方案 A（推荐）：直接把 Result 序列化给客户端，不在服务端拆包
+w.Header().Set("Content-Type", "application/json")
+json.NewEncoder(w).Encode(result)
+
+// ✅ 方案 B：确实需要在 Go 里读字段时，marshal 再 unmarshal
+raw, err := json.Marshal(result.Data)
+if err != nil { /* ... */ }
+var data map[string]any
+if err := json.Unmarshal(raw, &data); err != nil { /* ... */ }
+// 注意：这一步会丢掉字段顺序，且有一次额外的序列化开销
+```
+
+> `Result.Data` 的 json tag 没有 `omitempty`。产生 request error（没有任何执行数据）时 `Data` 是 nil interface，响应仍会带 `"data":null` 这一项 —— 这一点两条链路一致，是共有的规范缺口。
+
+---
+
+## 7. 查询折叠（Query Folding）
+
+### 7.1 是什么
+
+原生链路的执行顺序完全由**选择集的树形结构**决定：父字段跑完 → 拿返回值 → 跑子字段。即使子字段的数据来源和父字段毫无关系，也必须排队。
+
+sgraph 把执行顺序改为由**参数依赖图**决定：
+
+```
+编译 Plan → 收集每个字段的 FIELD_RESPONSE 参数依赖 → 建 DAG
+         → 拓扑排序求每个字段的最长依赖层级 level
+         → level 相同的字段放进同一个 BatchPlan
+         → 逐 batch 执行；query 的 batch 内部并发
+```
+
+**没有参数依赖的字段 indegree 为 0，全部落在 batch 0，无论它们在选择集里是什么层级。** 这就是"折叠"——把树形结构压平成尽可能少的批次。
+
+### 7.2 价值
+
+| 场景 | 原生 | sgraph |
+|---|---|---|
+| 两个互不相关的根字段 | 顺序或有限并发 | 同一 batch 并发 |
+| 父对象字段 + 独立数据源的子字段 | 父跑完才跑子 | 同一 batch 并发 |
+| list 父 + bulk 子（不依赖父结果） | N+1 次串行 | **1 次调用，且与父字段并发** |
+
+关键收益是**批次数下降**：总时延从"依赖链长度 × 单次 RT"变成"依赖**层数** × 单次 RT"。
+
+### 7.3 折叠规则（实测）
+
+**规则 1：无依赖 → 同批。**
+
+```
+query Mix { profile { id city } orders { id } }
+
+无 ParamRegistry 配置：
+  BATCH 0 concurrent=true: orders#4(Single), profile#1(Single)
+```
+
+**规则 2：声明 `FIELD_RESPONSE` 依赖 → 消费者进入下一批。**
+
+```
+给 orders.userId 注册 FIELD_RESPONSE(来源 profile.id) 之后：
+  BATCH 0 concurrent=true: profile#1(Single)
+  BATCH 1 concurrent=true: orders#4(Single)
+```
+
+**规则 3：非 list、非抽象类型的父字段，子字段自动同批。**
+
+```
+query NL { profile { city plain } }
+  BATCH 0 concurrent=true: profile#1(Single), profile.city#2(Single)
+  实测执行顺序：child 先于 parent 完成
+```
+
+**规则 4：父字段是 list（或抽象类型）且子字段用普通 resolver → 编译器自动注入对父的依赖，子字段必进下一批。**
+
+```
+query L { items { id score(id: "x") } }
+  BATCH 0 concurrent=true: items#1(Single)
+  BATCH 1 concurrent=true: items.score#3(Iter)
+```
+
+原因：这种字段被包成 `IterationCallStep`，必须逐个父元素调用，天然需要父结果。编译器在 `compileFieldPlans` 里自动补一个 `PARAM_TYPE_ENUM_FIELD_RESPONSE_RAW` 参数计划指向父字段 —— **调用方不需要手工配置**，但也**无法通过配置绕开**。
+
+**规则 5：bulk 子字段不受规则 4 约束。** 见 §7.4。
+
+**规则 6：batch 内并发只对 query 生效。** `ensureBatch` 里 `concurrent = operationDef.Operation == ast.OperationTypeQuery`；且 batch 内只有 1 个 step 时走串行分支。
+
+**规则 7：依赖成环 → 编译期报错** `field dependency cycle detected:[...]`。
+
+### 7.4 最大化折叠：让 bulk 不依赖父结果
+
+这是 sgraph 最有价值的形态：**list 父字段和它的 bulk 子字段同时开跑**。
+
+```
+query Bulk { groups { id users { id groupId name } } }
+
+BATCH 0 concurrent=true: groups#1(Single), groups.users#3(Bulk)
+```
+
+`users` 的 bulk resolver 和 `groups` 的 resolver **并发**执行；bulk 返回的全量用户按 `groupId` 与父 group 的 `id` 做映射，父子关系在组装阶段重建。实测结果完全正确：
+
+```
+{"groups":[
+  {"id":"g1","users":[{"id":10,"groupId":"g1","name":"A"}]},
+  {"id":"g2","users":[{"id":20,"groupId":"g2","name":"B"},{"id":21,"groupId":"g2","name":"C"}]}]}
+```
+
+**代价与前提**：bulk resolver 拿不到父 id 列表，必须能凭自己的条件（请求变量、租户上下文、全量拉取）确定查询范围。如果必须按父 id 过滤，就得声明 `FIELD_RESPONSE` 依赖，退回两个 batch —— 但仍然是 **1 次调用而不是 N 次**：
+
+```
+BATCH 0 concurrent=true: groups#1(Single)
+BATCH 1 concurrent=true: groups.users#3(Bulk)
+bulkCalls=1  args=map[groupIds:[g1 g2]]
+```
+
+### 7.5 如何验证自己的批次拓扑
+
+框架没有公开的 explain 接口。建议在**测试代码**里用包内 API 打印一次（本手册的所有拓扑结论都用这段代码测得）：
+
+```go
+// 放在 package graphql 的 _test.go 中
+plan, err := compileExecutionPlan(document, engine.schema, &opName,
+	engine.directiveRegistry, engine.paramRegistry)
+if err != nil { t.Fatal(err) }
+batches, err := coordinateBatches(plan)
+if err != nil { t.Fatal(err) }
+for _, b := range batches {
+	for _, s := range b.steps {
+		switch st := s.(type) {
+		case *SingleCallStep:
+			t.Logf("batch %d: %v (Single)", b.batchId, st.fieldPlan.paths)
+		case *IterationCallStep:
+			kind := "Iteration"
+			if st.fieldPlan.bulkResolverFunc != nil { kind = "Bulk" }
+			t.Logf("batch %d: %v (%s)", b.batchId, st.fieldPlan.paths, kind)
+		}
+	}
+}
+```
+
+如果业务工程在包外，等价的黑盒办法是在每个 resolver 里记录进入时间戳，观察哪些 resolver 的执行区间重叠。
+
+---
+
+## 8. 参数依赖：ParamRegistry 完整配置手册
+
+### 8.1 价值与原因
+
+**价值**：这是 sgraph 下**唯一**的跨字段传值手段，同时也是**唯一**能显式控制批次编排的手段。它一次性解决三件事：
+
+1. 替代 `p.Source`（父结果传给子 resolver）；
+2. 让引擎知道字段之间的先后关系，从而正确分批；
+3. 允许把 query 文本里写死的参数在服务端改写成常量或另一个变量。
+
+**原因**：sgraph 不从选择集树推断执行顺序，只从参数依赖推断。**没有声明依赖 = 引擎认为可以并发**。因此依赖关系必须显式登记。
+
+### 8.2 完整样例
+
+```go
+const query = `query Mix { profile { id city } orders(userId: "placeholder") { id } }`
+
+params := graphql.NewParamRegistry()
+err := params.RegisterQuery(graphql.QueryParamConfig{
+	DocumentBody:  query,     // ← 必须与运行时 RequestString 逐字节相同
+	OperationName: "Mix",
+	FieldParams: []graphql.FieldParamBinding{
+		{
+			Target: graphql.FieldParamTarget{
+				ResponsePath:   []string{"orders"},   // 含自身，用 alias（若有）
+				ParentTypeName: "Query",
+				FieldName:      "orders",
+				ParamName:      "userId",
+			},
+			Source: graphql.ParamSource{
+				Kind: graphql.ParamSourceFieldResponse,
+				FieldResponse: &graphql.FieldResponseParamSource{
+					ResponsePath:   []string{"profile"},
+					ParentTypeName: "Query",
+					FieldName:      "profile",
+					ResultPath:     []string{"id"},   // 从 profile 的返回值里取 .id
+				},
+			},
+		},
+	},
+})
+```
+
+效果（实测）：`profile` 进 batch 0，`orders` 进 batch 1，`orders` 的 resolver 拿到 `p.Args["userId"] == "u1"`（`profile` 返回值里的 id），query 里写的 `"placeholder"` 被覆盖。
+
+### 8.3 字段语义与要求
+
+#### `QueryParamConfig`
+
+| 字段 | 类型 | 必填 | 语义与要求 |
+|---|---|---|---|
+| `DocumentBody` | `string` | **是** | 该 operation 所属文档的**原始文本**。空串返回 `param registry document body is empty`。注册键 = `sha256(DocumentBody + "\n" + operationName)`，**逐字节比较**：多一个空格、换行、注释都会导致整套绑定静默失效（见 §8.6） |
+| `OperationName` | `string` | 条件 | 文档含多个 operation 时**必填**，否则返回 `param registry operation name is required for a multi-operation document`。单 operation 文档可省略；若该 operation 有名字，注册键会自动使用它 |
+| `FieldParams` | `[]FieldParamBinding` | 否 | 字段参数绑定列表 |
+| `DirectiveParams` | `[]DirectiveParamBinding` | 否 | 指令参数绑定列表 |
+
+`RegisterQuery` 可对同一 operation 多次调用，绑定会累加；但同一个参数目标重复登记会返回 `duplicate field parameter target ...`。校验先在副本上完成，失败时不会写入半份配置。
+
+#### `FieldParamTarget`（要改哪个字段的哪个参数）
+
+| 字段 | 类型 | 必填 | 语义与要求 |
+|---|---|---|---|
+| `ResponsePath` | `[]string` | **是** | 从根到该字段的响应名路径，**包含字段自身**，使用 alias（若查询里写了 alias）。**不含 list 下标**。空数组或含空串元素 → `field parameter target is incomplete` / `... contains any empty item` |
+| `ParentTypeName` | `string` | **是** | 该字段所属**父类型**的名字（不是字段返回类型）。以 `__` 开头会被拒绝 |
+| `FieldName` | `string` | **是** | schema 中的字段名（不是 alias） |
+| `ParamName` | `string` | **是** | 目标参数名。**该参数必须已经在 schema 的 `Args` 里声明**，否则编译期报 `param registry target X.Y contains unknown argument "Z"`。Registry 不能凭空造参数 |
+
+> 目标定位必须**唯一**。同一 `(ResponsePath, ParentTypeName, FieldName, ParamName)` 若匹配到多个 FieldPlan，编译期报 `field parameter target ... is ambiguous`。
+
+#### `ParamSource`（参数值从哪来）
+
+| 字段 | 类型 | 语义 |
+|---|---|---|
+| `Kind` | `ParamSourceKind` | `ParamSourceConst` / `ParamSourceInput` / `ParamSourceFieldResponse` 三选一 |
+| `ConstValue` | `any` | 仅 `CONST` 使用 |
+| `InputName` | `string` | 仅 `INPUT` 使用，值是变量名（不带 `$`） |
+| `FieldResponse` | `*FieldResponseParamSource` | 仅 `FIELD_RESPONSE` 使用 |
+
+字段间**互斥**，混填会被拒（如 `CONST source contains fields from another source kind`）。
+
+**三种 Kind 的行为对比**：
+
+| Kind | 值来源 | 类型检查 | 是否建立依赖边 | 典型用途 |
+|---|---|---|---|---|
+| `CONST` | `ConstValue` | ✅ 走 `compileInputValue(argDef.Type, ...)`，类型不匹配报 `... has invalid CONST value` | ❌ | 服务端强制覆盖（限流上限、租户隔离条件） |
+| `INPUT` | 本次请求的变量 `$InputName` | ✅ 变量必须被该 operation **实际使用**（`references variable $X which is not used by the validated operation`）、必须已定义、且类型必须是参数类型的子类型 | ❌ | 参数改名、一个变量喂多个字段 |
+| `FIELD_RESPONSE` | 另一个字段的执行结果 | ❌ **不做类型协变，直接把 Go 值塞进 `p.Args`** | ✅ | 跨字段传值、控制批次顺序 |
+
+> `FIELD_RESPONSE` 不校验类型这一点是**刻意的**：注入的是 resolver 的原始返回值（可能是整个 `map[string]any`），无法用 GraphQL 输入类型描述。代价是 resolver 必须自己做类型断言，写错了只有运行期才会暴露。
+
+#### `FieldResponseParamSource`（从哪个字段的结果取值）
+
+| 字段 | 类型 | 必填 | 语义与要求 |
+|---|---|---|---|
+| `ResponsePath` | `[]string` | **是** | 生产者字段的响应名路径，规则同 `FieldParamTarget.ResponsePath` |
+| `ParentTypeName` | `string` | **是** | 生产者字段的父类型名。`__` 开头被拒 |
+| `FieldName` | `string` | **是** | 生产者的 schema 字段名 |
+| `ResultPath` | `[]string` | 否 | 从生产者**返回值**内部继续下钻的路径。留空 = 取整个返回值。例如生产者返回 `{"profile":{"id":"P1"}}`，要拿 `P1` 就写 `[]string{"profile","id"}` |
+
+**生产者必须满足**：
+
+1. **必须有 resolver**（`Resolve` 或 `BulkResolve`），否则 `... FIELD_RESPONSE source field N has no resolver`。
+   没有 resolver 的字段不生成 Step、不产生独立 `FieldResponse`，无法作为依赖来源。**注意**：即使 `profile` 和 `id` 在 FieldPlan 树里各有 fieldId，只要 `id` 没有 resolver，就不能把 `id` 当生产者 —— 正确写法是把生产者指向有 resolver 的 `profile`，再用 `ResultPath: ["id"]` 下钻。
+2. **定位必须唯一**，否则 `... FIELD_RESPONSE source X.Y at [...] is ambiguous`。
+3. **不能被单值消费者消费多值结果**：消费者是 `SingleCallStep`（父不是 list）而生产者可能产出多个结果（自身是 list，或父是 list）时，编译期报 `... cannot consume multi-result FIELD_RESPONSE source field N in SingleCallStep field M`。
+4. **不能自依赖**：`field N cannot depend on itself`。
+
+#### `DirectiveParamBinding` / `DirectiveParamTarget`
+
+用于覆盖指令参数。
+
+| 字段 | 必填 | 语义与要求 |
+|---|---|---|
+| `Location` | **是** | 指令出现的位置，取 `DirectiveLocation*` 常量：`QUERY` / `FRAGMENT_DEFINITION` / `FRAGMENT_SPREAD` / `INLINE_FRAGMENT` / `FIELD`。其他值 → `unsupported directive location %s` |
+| `DirectiveName` | **是** | 指令名（不带 `@`） |
+| `ParamName` | **是** | 指令参数名，同样必须在指令定义里声明 |
+| `FragmentName` | 条件 | `Location` 是 `FRAGMENT_DEFINITION` / `FRAGMENT_SPREAD` 时必填 |
+| `ResponsePath` / `ParentTypeName` / `FieldName` | 条件 | `Location` 是 `FIELD` 时必填，语义同 `FieldParamTarget` |
+| `SourceOffset` | 否 | 同一位置出现多个同名指令时，用**源码字节偏移**区分。不填而又存在歧义 → `directive parameter target @X(Y:) at Z is ambiguous; SourceOffset is required` |
+
+两条硬限制：
+
+- `@skip` / `@include` 的参数**不允许**用 `FIELD_RESPONSE` → `@skip does not support FIELD_RESPONSE parameters`。
+  原因：条件指令在字段收集阶段生效，此时依赖 resolver 不保证已执行；允许读结果会引入非标准的执行期条件语义，list 父节点下还会衍生出"每个父元素分别判断"的额外模型。
+- `FIELD_RESPONSE` 指令参数**只支持 `FIELD` 位置** → `FIELD_RESPONSE directive parameters are only supported at FIELD location`。
+
+#### 内省字段一律不可覆盖
+
+`ParentTypeName` 或 `FieldName` 以 `__` 开头的目标 / 来源全部被拒（`introspection field X.Y cannot be overridden` / `introspection field cannot be a parameter source`）。这条限制只约束 ParamRegistry 的外部覆盖能力，不改变 query 里原有合法内省参数和 `@skip`/`@include` 的执行语义。
+
+### 8.4 编译期的完整性校验
+
+`finalizeParamRegistry` 在 Plan 编译收尾时做一次全量对账：
+
+- 每一条 `FieldParams` 都必须命中一个真实字段，否则 `field parameter target X.Y(Z:) at [...] did not match the operation`；
+- 每一条 `DirectiveParams` 都必须命中一个真实指令 AST，否则 `directive parameter target @X(Y:) at Z did not match the operation`。
+
+**这是好事**：配置写错会在该 query 第一次编译时立刻暴露成 request error，而不是悄悄少注入一个参数。
+
+### 8.5 CONST / INPUT 的额外价值
+
+除了传值，这两种来源可以在**不改 query 文本**的前提下改写参数，适合网关型场景：
+
+```go
+// 强制把分页上限压到 100，无视客户端传的值
+Source: graphql.ParamSource{Kind: graphql.ParamSourceConst, ConstValue: 100}
+
+// 把 query 里的 $q 改喂给另一个参数
+Source: graphql.ParamSource{Kind: graphql.ParamSourceInput, InputName: "q"}
+```
+
+### 8.6 ⚠️ 头号陷阱：DocumentBody 不匹配是**静默**失效
+
+实测：注册文本比运行时文本多一个空格。
+
+```
+注册: `query M {  a b }`
+运行: `query M { a b }`
+
+BATCH 0 concurrent=true: a#1(Single), b#2(Single)      ← 依赖边没建立
+RESULT=data={"a":"A","b":"x=<nil>"}  errors=[]         ← 无任何错误
+```
+
+对照（文本一致时）：
+
+```
+BATCH 0: a#1(Single)
+BATCH 1: b#2(Single)
+RESULT=data={"a":"A","b":"x=A"}
+```
+
+**原因**：找不到绑定时 `compiler.paramBindings == nil`，`finalizeParamRegistry` 直接返回 nil，跳过全部对账。整套绑定被当作"这个 query 本来就没有配置"。
+
+**防护做法**：
+
+1. 把 query 文本定义成**唯一的 Go 常量**，注册和执行都引用它，杜绝两处各写一份：
+
+   ```go
+   const QueryMix = `query Mix { profile { id city } orders(userId: "x") { id } }`
+
+   params.RegisterQuery(graphql.QueryParamConfig{DocumentBody: QueryMix, ...})
+   graphql.Do(graphql.Params{RequestString: QueryMix, ...})
+   ```
+
+2. 前端持久化查询（persisted query）场景下，服务端存的文本就是唯一来源，天然安全。
+3. 允许客户端自由传 query 文本的场景，**不适合用 ParamRegistry**（任何格式化差异都会导致配置失效），应改用方案 A（resolver 自取数）或 bulk。
+4. 在启动自检里为每条注册的 query 跑一次编译，确认拿到的批次拓扑符合预期。
+
+---
+
+## 9. 批量查询（Bulk）完整配置手册
+
+### 9.1 价值与原因
+
+**价值**：消灭 N+1。
+
+| | 逐元素（Iteration） | 批量（Bulk） |
+|---|---|---|
+| 父 list 有 N 个元素 | resolver 调用 **N** 次 | 调用 **1** 次 |
+| 批次位置 | 必定在父的下一批 | 不依赖父结果时可与父**同批并发** |
+| 结果映射 | 按父 occurrence 路径 | 按业务 key（composite key） |
+
+**原因**：bulk 结果允许**乱序**和**一对多**，只能用业务 key 关联回父元素；这也正是它能脱离父执行顺序的前提。
+
+### 9.2 配置入口：只能改内部 FieldDefinition
+
+⚠️ **公开的 `graphql.Field` 结构体没有 bulk 相关字段**：
+
+```go
+type Field struct {
+	Name, Description, DeprecationReason string
+	Type              Output
+	Args              FieldConfigArgument
+	Resolve, Subscribe FieldResolveFn
+}
+```
+
+bulk 三件套只存在于 schema 构建后生成的内部 `FieldDefinition` 上：
+
+```go
+type FieldDefinition struct {
+	Name string; Description string; Type Output
+	Args     []*Argument
+	BulkArgs []*Argument                  // ⚠️ 见 9.4，当前未被读取
+	Resolve, Subscribe, BulkResolve FieldResolveFn
+	DeprecationReason string
+	BulkResultMappedFieldName string
+}
+```
+
+所以配置方式是：**先建 schema，再取出 FieldDefinition 赋值**。
+
+### 9.3 完整样例
+
+```go
+userType := graphql.NewObject(graphql.ObjectConfig{Name: "User", Fields: graphql.Fields{
+	"id":      &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
+	"groupId": &graphql.Field{Type: graphql.NewNonNull(graphql.ID)},  // 回填 key，必须在结果里
+	"name":    &graphql.Field{Type: graphql.String},
+}})
+
+groupType := graphql.NewObject(graphql.ObjectConfig{Name: "Group", Fields: graphql.Fields{
+	"id": &graphql.Field{Type: graphql.NewNonNull(graphql.ID)},       // 父 key，见 9.5
+	"users": &graphql.Field{
+		Type: graphql.NewList(userType),
+		// Resolve 不是必须的（实测：只配 BulkResolve 也能正常执行）。
+		// 建议保留一个等价的逐元素实现作为兜底，见 §9.7。
+		Resolve: func(p graphql.ResolveParams) (any, error) {
+			return []map[string]any{}, nil
+		},
+	},
+}})
+
+// —— 关键：schema 构建后改内部定义 ——
+usersDef := groupType.Fields()["users"]
+usersDef.BulkResultMappedFieldName = "groupId"
+usersDef.BulkResolve = func(p graphql.ResolveParams) (any, error) {
+	// 一次拿回全部 group 的 user，顺序任意
+	return []map[string]any{
+		{"id": 20, "groupId": "g2", "name": "B"},
+		{"id": 10, "groupId": "g1", "name": "A"},
+		{"id": 21, "groupId": "g2", "name": "C"},
+	}, nil
+}
+
+queryType := graphql.NewObject(graphql.ObjectConfig{Name: "Query", Fields: graphql.Fields{
+	"groups": &graphql.Field{Type: graphql.NewList(groupType), Resolve: func(graphql.ResolveParams) (any, error) {
+		return []map[string]any{{"id": "g1"}, {"id": "g2"}}, nil
+	}},
+}})
+schema, _ := graphql.NewSchema(graphql.SchemaConfig{Query: queryType, Types: []graphql.Type{groupType, userType}})
+```
+
+查询 `{ groups { id users { id groupId name } } }` 的实测结果：
+
+```
+BATCH 0 concurrent=true: groups#1(Single), groups.users#3(Bulk)     ← 并发
+{"groups":[
+  {"id":"g1","users":[{"id":10,"groupId":"g1","name":"A"}]},
+  {"id":"g2","users":[{"id":20,"groupId":"g2","name":"B"},{"id":21,"groupId":"g2","name":"C"}]}]}
+```
+
+乱序的 bulk 结果被正确分配回两个 group，一对多也正确成组。
+
+### 9.4 字段语义与要求
+
+| 字段 | 类型 | 必填 | 语义与要求 |
+|---|---|---|---|
+| `BulkResolve` | `FieldResolveFn` | 是（启用 bulk 时） | 批量 resolver。`p.Source` 为 nil；`p.Args` 由 `bulkParamPlans` 物化。**必须返回可迭代结果**（`[]map[string]any` / `[]any` 等），否则 `bulk resolver for field X must return an iterable result`。允许返回**嵌套一层**的分组切片，框架会自动摊平 |
+| `BulkResultMappedFieldName` | `string` | **是** | 结果元素里代表"属于哪个父元素"的字段名。为空 → 编译期 `result parent key field name for result binding is empty`。**必须出现在每个结果元素中**，缺失 → `bulk result key field %q is missing for field X` |
+| `BulkArgs` | `[]*Argument` | **否 —— 当前无效** | 结构体里声明了，但全仓库**没有任何读取点**。bulk 的参数计划是 `Args` 的副本（`arrParamPlans := append([]*ParamPlan(nil), paramPlans...)`）。**bulk 需要的参数请声明在 `Args` 里**，不要指望 `BulkArgs` |
+
+**硬性前置条件**：
+
+1. **父字段必须是 list**。非 list 父下配 bulk → `field %d should not use bulk resolver`。
+2. **根字段不能用 bulk** → `root field %d should not use bulk resolver`。
+3. **返回基础类型不能是 Scalar / Enum** → `bulk resolver field X must return object values carrying <key>`。结果元素必须是对象，才能携带回填 key。
+4. **父类型必须能提供唯一确定的关联 key**（见 §9.5）。没有任何 `ID` 字段 → `parent key field name for bulk resolver X result binding is empty`；有多个 `ID` 字段又没有 `id` → `parent key field name for bulk resolver X result binding is ambiguous: parent type Y declares multiple ID fields [...]`。
+5. **父类型是抽象类型（interface / union）时，必须显式声明对父的 `FIELD_RESPONSE` 依赖** → `bulk resolver field %d under an abstract parent requires an explicit FIELD_RESPONSE dependency on parent field %d`。原因是抽象父需要先拿到父结果做运行时类型判定，不能与父并发。
+6. **结果元素必须是 `map[string]any`** → 否则 `bulk resolver for field X returned an item of unsupported type %T`。
+
+### 9.5 父子映射规则
+
+映射是"父元素的 key" ↔ "结果元素的 `BulkResultMappedFieldName` 值"：
+
+**父侧 key（`parentKeyFieldName`）由框架自动推断**，规则见 §5.4 的推断表。落到 bulk 上：
+
+| 父类型形状 | bulk 能否使用 |
+|---|---|
+| 有 `id: ID!` | ✅ 用 `id` |
+| 没有 `id`，恰好一个 `ID` 字段 | ✅ 用该字段 |
+| 没有 `id`，多个 `ID` 字段 | ❌ 编译期报错 `... is ambiguous`，见下 |
+| 没有任何 `ID` 字段 | ❌ 编译期报错 `... is empty` |
+
+多个 `ID` 字段时框架**不猜**，直接在编译期报错并列出候选：
+
+```
+parent key field name for bulk resolver users result binding is ambiguous:
+parent type Group declares multiple ID fields [alphaId betaId],
+declare an id: ID! field on the parent type to disambiguate
+```
+
+原因：父侧 key 的值要和 `BulkResultMappedFieldName` 的值**语义对齐**。选错字段不会报错，只会让全部映射落空、每个父元素返回空列表 —— 实测 `errors` 长度为 0、`users` 全是 `[]`。这种静默数据丢失比编译期失败危险得多，所以候选不唯一时框架选择不启动。
+
+> GraphQL 规范对一个对象能声明几个 `ID` 字段没有限制（§3.6 只要求字段名唯一），外键、多租户、Relay 场景下多 `ID` 字段很常见，因此这条并不罕见。**解决办法是给父类型显式声明 `id: ID!`**，让规则 1 命中。
+
+> ⚠️ 该 key 字段的值必须存在于父 resolver 的**返回值**里。不需要出现在 query 的选择集中，但必须出现在返回的 map 中，且逐父元素唯一 —— 违反时的两种表现见 §5.4。
+
+**一对多与去重**：
+
+- 字段是 list（`[User]`）：同一个 key 的多条结果会 append 成一个列表；
+- 字段不是 list（`User`）：同一个 key 出现第二次 → `bulk resolver for non-list field X returned duplicate key %q`。
+
+**绑定错误的处理**：绑定失败不会中断请求，错误暂存在 `bulkState.bindingErrors`，由结果组装阶段的 `reportBulkBindingErrors` 补齐完整 list 路径后写入。未能命中任何父 occurrence 的残留错误，在请求结束前由 `flushPendingBulkBindingErrors` 按静态字段路径落库 —— **错误不会丢，但这部分错误的 `path` 不含 list 下标**。
+
+### 9.6 让 bulk 拿到父 id 列表
+
+需要按父 id 过滤时，声明一个 `FIELD_RESPONSE` 参数（会退回两个 batch，但仍是 1 次调用）：
+
+```go
+// schema 侧：给 users 声明参数
+"users": &graphql.Field{
+	Type: graphql.NewList(userType),
+	Args: graphql.FieldConfigArgument{
+		"groupIds": &graphql.ArgumentConfig{Type: graphql.NewList(graphql.ID)},
+	},
+	Resolve: func(graphql.ResolveParams) (any, error) { return []map[string]any{}, nil },
+}
+
+// registry 侧
+FieldParams: []graphql.FieldParamBinding{{
+	Target: graphql.FieldParamTarget{
+		ResponsePath: []string{"groups", "users"}, ParentTypeName: "Group",
+		FieldName: "users", ParamName: "groupIds",
+	},
+	Source: graphql.ParamSource{Kind: graphql.ParamSourceFieldResponse,
+		FieldResponse: &graphql.FieldResponseParamSource{
+			ResponsePath: []string{"groups"}, ParentTypeName: "Query",
+			FieldName: "groups", ResultPath: []string{"id"},   // 取每个 group 的 id
+		}},
+}}
+```
+
+bulk resolver 侧：
+
+```go
+usersDef.BulkResolve = func(p graphql.ResolveParams) (any, error) {
+	ids, _ := p.Args["groupIds"].([]any)    // 实测：[]any{"g1","g2"}
+	return userDAO.ListByGroupIDs(ids)
+}
+```
+
+实测：
+
+```
+BATCH 0 concurrent=true: groups#1(Single)
+BATCH 1 concurrent=true: groups.users#3(Bulk)
+bulkCalls=1  args=map[string]interface{}{"groupIds":[]interface{}{"g1","g2"}}  source=<nil>
+```
+
+**取值语义**：来源指向**父字段**时，值是"父结果列表中每个元素按 `ResultPath` 取出的值"组成的 `[]any`；指向**非父字段**（祖先或旁支）时，读取该字段的全部结果并同样按 `ResultPath` 展开。
+
+### 9.7 与逐元素模式的关系
+
+同一个字段可以同时配 `Resolve` 和 `BulkResolve`。运行期在 `IterationCallStep.Execute` 里**优先走 bulk**，`BulkResolve` 为 nil 时才回退到逐元素模式。
+
+`Resolve` **不是必填项** —— 实测只配 `BulkResolve` 的字段可以正常执行（bulk 分支本身就会生成 `IterationCallStep`，所以"有参数必须有 resolver"的检查也不会触发）。但建议保留一个等价的 `Resolve`：
+
+- 它是灰度开关 —— 把 `BulkResolve` 置 nil 就能一键退回逐元素模式做对比；
+- 逐元素模式在小数据量下延迟更低，某些场景可能更合适。
+
+---
+
+## 10. 自定义指令（DirectiveRegistry）
+
+### 10.1 价值与原因
+
+**价值**：把鉴权、审计、脱敏、灰度等横切逻辑挂到指令上，编译期就能裁剪选择集，运行期能在 resolver 前后做切面。
+
+**原因（也是迁移必改项）**：sgraph 在 Plan 编译阶段要求**文档中出现的每一个指令**都在 `DirectiveRegistry` 里有归属，否则报 `no directive compiler found for <name>`，整个请求变成 request error。
+
+原生链路对"schema 声明了但执行期无语义"的指令是**零成本忽略**的，所以这类指令在迁移后会成片报错。
+
+> `SchemaConfig.Directives` 与 `DirectiveRegistry` 是**两份独立配置**，框架不做交叉对账。建议启动阶段遍历 `schema.Directives()` 与 Registry 对一次账，把缺失暴露在启动期。
+
+### 10.2 两种登记方式
+
+```go
+directives := graphql.NewDirectiveRegistry()   // 已含 @skip / @include
+
+// A. 纯标注型：只保留名称、位置和参数计划，运行期什么都不做
+if err := directives.RegisterMetadataOnly("audit"); err != nil { log.Fatal(err) }
+
+// B. 有语义：注册 compiler（编译期）和/或 runtime handler（运行期）
+if err := directives.Register("authz", AuthzCompiler{}, AuthzHandler{}); err != nil { log.Fatal(err) }
+```
+
+`Register(name, compiler, handler)` 的语义：
+
+| 参数 | 允许值 | 语义 |
+|---|---|---|
+| `name` | 非空 | 指令名（不带 `@`）。已登记为 metadata-only 时报 `directive %s is already registered as metadata-only` |
+| `compiler` | `DirectiveCompiler` 或 nil | 编译期决定是否静态裁剪该 selection、是否生成运行期计划 |
+| `handler` | `DirectiveRuntimeHandler` 或 nil | 运行期切面。传其他类型 → `unsupported directive runtime handler for %s` |
+
+`RegisterMetadataOnly(name)` 与 `Register` **互斥**：已有 compiler 或 handler 时报 `directive %s already has a compiler or runtime handler`。
+
+### 10.3 实现接口
+
+```go
+type DirectiveCompiler interface {
+	Compile(name string, location string, args map[string]any, schema *Schema) (*DirectiveCompileResult, error)
+}
+
+type DirectiveCompileResult struct {
+	IncludeDecision      *bool            // true 保留 / false 编译期删除 / nil 不做静态裁剪
+	RuntimePlans         []*DirectivePlan // 运行期指令计划
+	DependencyParamPlans []*ParamPlan     // 运行期依赖的参数计划
+}
+
+type DirectiveRuntimeHandler interface {
+	ShouldExecute(fieldPlan *FieldPlan, directiveArgs, params map[string]any,
+		parentResponse any, originalInputs map[string]any, ctx context.Context) (bool, error)
+	BeforeResolve(fieldPlan *FieldPlan, directiveArgs, params map[string]any,
+		parentResponse any, originalInputs map[string]any, ctx context.Context) (map[string]any, error)
+	AfterResolve(fieldPlan *FieldPlan, directiveArgs, params map[string]any,
+		parentResponse, currentResponse any, originalInputs map[string]any, ctx context.Context) (any, error)
+}
+```
+
+内置实现可直接参照：`SkipDirectiveCompiler` / `IncludeDirectiveCompiler`（编译期按字面量裁剪）、`SkipDirectiveRuntimeHandler` / `IncludeDirectiveRuntimeHandler`（变量参数走运行期判断）、`DefaultEmptyDirectiveRuntimeHandler`（全部放行的空实现，适合只做埋点的场景）。
+
+参数含变量、无法在编译期求值时，实现 `RuntimeDirectivePlanCompiler`：
+
+```go
+type RuntimeDirectivePlanCompiler interface {
+	RuntimeCompile(name string, location string, argPlans []*ParamPlan, schema *Schema) (*DirectiveCompileResult, error)
+}
+```
+
+### 10.4 ⚠️ 无 resolver 字段上的指令限制
+
+没有 resolver 的字段不生成 Step，它的值只在**结果组装阶段**从父对象读取。该阶段：
+
+- ✅ 支持 `@skip(if:)` / `@include(if:)`（字面量和请求变量都可以）；
+- ❌ **不执行**任何自定义 runtime directive 阶段（`ShouldExecute` / `BeforeResolve` / `AfterResolve`），handler 根本不会被调用，`directiveParamPlans` 也不会被物化。
+
+**这意味着**：想让自定义指令在某个字段上真正生效，**该字段必须配 resolver**。不要因为字段上挂了指令就以为它会生效。
+
+---
+
+## 11. 错误模型与响应形态
+
+### 11.1 三类错误
+
+| 类型 | 触发 | 后果 |
+|---|---|---|
+| **request error** | 编译期失败、operation 选择失败、指令未登记、参数绑定不匹配等 | 无 `data`，只返回 `errors` |
+| **field error**（`FieldErrorTypeField`） | resolver 返回 error / panic、参数物化失败、结果强制转换失败、绑定失败 | 该字段为 null（或按 non-null 冒泡），其余数据保留 |
+| **tree error**（`FieldErrorTypeTree`） | 执行结构不可信（Step 为 nil、逃逸到 `executeStepSafely` 的 panic） | 中断后续 batch，返回 `data:null` + 已记录错误 |
+
+### 11.2 同一字段的多条错误全部保留
+
+错误按 `fieldId` 存在 `[]atomic.Pointer[FieldError]` 里，用 **CAS 头插单向链表**，并发 Step 同时写同一字段不会互相覆盖。以下场景会产生多条并**全部出现在响应中**：
+
+- 同一字段在多个 list item 上分别报错；
+- list 多个元素在结果完成阶段分别发生抽象类型解析错误；
+- 同一字段在执行阶段和组装阶段先后报错。
+
+例：`[[String!]]` 返回 `[["a", nil], [nil, "d"]]` → 两条错误，路径 `["matrix",0,1]` 和 `["matrix",1,0]`。
+
+### 11.3 错误路径
+
+`FieldError.responsePath` 是 `[]any`，元素只可能是 `string`（responseName / alias）或 `int`（list 下标），形状与规范 §7.1.6 一致：
+
+```go
+[]any{"people", 1, "failForBob"}
+```
+
+**使用要求**：
+
+- 不要假设一个字段最多一条错误；
+- 错误在响应中的整体顺序是**按 fieldId 升序**，不是按发生时间；同一字段内部恢复发生顺序。**客户端不应依赖跨字段的错误顺序**；
+- bulk 绑定错误中未命中父 occurrence 的那部分，`path` 不含 list 下标。
+
+### 11.4 响应字段顺序
+
+`SGraphResponseOrderedMap` + 自定义 `MarshalJSON` 保证响应字段严格按查询顺序输出（§7.1.4 / §7.2.2）。如果既有客户端依赖原生那种"按 map 随机顺序"的行为（极少见），需要回归。
+
+---
+
+## 12. 并发、对象池与共享对象约束
+
+### 12.1 调用方必须保证的事
+
+Engine 创建后，以下对象被多个请求、多个 goroutine 共享，**必须只读或自行保证并发安全**：
+
+- Schema 及其类型、字段、resolver、动态类型解析函数；
+- 注册进 `DirectiveRegistry` 的 compiler / runtime handler（Registry 的冻结只保证"名字→对象"的映射不变，**不保护对象自身的内部状态**）；
+- `ParamRegistry` 里 `CONST` 引用的可变数据（map / slice / pointer）。注册完成后**不得再修改**，否则会跨请求污染并形成数据竞态；
+- 调用方传入的 `Args`、`RootObject` —— 传进来之后不要在其他 goroutine 里改。
+
+resolver、compiler、handler 应当**无请求状态**。请求数据通过方法参数（`params` / `info` / `ctx`）显式传递，不要写进共享对象字段，也不要新增私有 context key 隐式传递；`context.Context` 只用于取消、超时和调用链上下文。
+
+### 12.2 框架保证的事
+
+- 每个请求使用独立的 `Rundata`，请求数据不会写入可缓存的 Plan；
+- Plan、BatchPlan、两个 Registry 快照在运行期只读；
+- 字段错误用 `atomic.Pointer` CAS 链表 + mutex，并发写安全；
+- `-race` 下并发用例（128 并发请求 + 并发根字段 + 单 Engine 64 并发请求）全部通过。
+
+### 12.3 Schema / Registry 创建后不得热更新
+
+- 修改传入的原始 `DirectiveRegistry` / `ParamRegistry` **不会**影响已创建的 Engine（已被 `cloneAndFreeze`）；
+- 新配置生效必须用完整的新配置创建新 Engine —— 但同一个 Schema 无法重新绑定，实际意味着**重启进程或换一个 Schema 实例**；
+- 不要用零值 `&graphql.DirectiveRegistry{}` 代替 `NewDirectiveRegistry()`，否则不含 `@skip` / `@include` 的默认实现；
+- Engine 创建后不得再修改其绑定 Schema 的类型、字段、resolver、directive、extension（既有并发读写风险，也会让已缓存 Plan 与 Schema 不一致）。
+
+---
+
+## 13. 能力边界与已知缺口
+
+### 13.1 设计边界（不是缺陷，但会影响接入）
+
+| 边界 | 说明 |
+|---|---|
+| 业务 resolver 的 `p.Source` 恒为 nil | §5 |
+| 根字段必须有 resolver | §4.4 |
+| 带参数的字段必须有 resolver（内省字段豁免） | §4.4 |
+| 不支持惰性属性（函数值） | §5.3 |
+| 文档中的自定义指令必须全部登记 | §10 |
+| `FIELD_RESPONSE` 来源字段必须有 resolver | §8.3 |
+| Engine 绑定一次性、进程内不可变 | §4.1 |
+| bulk 只能改内部 `FieldDefinition`，公开 `Field` 没有对应字段 | §9.2 |
+| `BulkArgs` 声明了但未被读取 | §9.4 |
+| list 元素类型上的 `ID` 字段会启用业务 key 绑定，父 resolver 必须返回该字段且值唯一 | §5.4 |
+| list 元素类型有多个 `ID` 字段又没有 `id` 时，bulk 编译期报歧义错误 | §5.4 §9.5 |
+| mutation 不进 batch 链路（回退原生）；subscription 不支持 | §1 |
+| 无 resolver 字段上的自定义 runtime directive 不生效 | §10.4 |
+| Plan cache 无容量上限、TTL 或淘汰；每个不同的 document body + operationName 都会在 Engine 生命周期内保留一个 Plan | 长生命周期服务必须限制可执行文档集合或在外层控制 Engine 生命周期 |
+
+### 13.2 已知缺陷（sgraph 独有，14 条叶子用例）
+
+| 严重度 | 问题 | 条数 | 现状 |
+|---|---|---:|---|
+| **P0** | 根选择集被**字面量** `@skip`/`@include` 全部裁剪时返回 request error（`no roots found for ...`），而非 `{"data":{}}` | 11 | 未修复，见下方规避方案 |
+| 行为差异 | 不执行 map 中的函数属性 | 2 | 静默部分已修复（改为 null + field error），仍与原生行为不同 |
+| 能力边界 | subscription 不支持 | 1 | 按设计 |
+
+**矩阵外 P1 缺陷**：Interface 声明范围内直接选择字段时，当前按 Interface 的 `FieldDefinition` 编译，不会改用运行时 Object 上同名字段的 resolver；需要实现类型 resolver 时只能使用 Object 内联片段规避。同一 responseName 同时出现在直接选择和 Object 内联片段中时会生成不同 FieldPlan，当前结果可能受书写顺序影响。该问题未被现有 526 用例覆盖，因此不计入上表 14 条。
+
+**已修复的历史缺陷**（记录在此便于对照旧版本行为）：
+
+| 缺陷 | 症状 | 修复方式 |
+|---|---|---|
+| 空列表在冷池下被补全为 `null` | 同一请求在进程不同时刻返回 `null` 或 `[]` | `acquireFieldResponse` / `acquireBulkFieldResponseState` 保证切片非 nil |
+| 函数属性被序列化成 `"0x…"` 且不报错 | 静默数据错误 | 组装阶段拦截函数值，返回 null + field error（§5.3） |
+| 父侧关联 key 在多个 `ID` 字段时随机选取 | 父类型有 ≥2 个 `ID` 字段又没有 `id` 时，**每次进程启动**随机绑定到不同字段：普通迭代随机报 `parent key field "X" is missing` / `duplicate parent binding key`，bulk 随机静默返回空列表 | `checkAndCompileParentKeyFieldNames` 改为候选唯一才推断；歧义时普通迭代回退 occurrence 路径绑定，bulk 编译期报错并列出候选（§5.4 §9.5） |
+
+> 最后一条的隐蔽之处在于时间粒度：推断发生在 Plan 编译期并进入 Plan 缓存，因此**进程内完全稳定、跨进程启动才变化**。表现为"测试环境反复跑都正常，某次重启后整片接口报错，回滚重启又好了"。
+
+**P0 的边界与规避方案（实测）**：这个缺陷**只影响编译期静态裁剪**，也就是条件写成字面量的情况。条件用变量时走的是运行期判断分支，行为完全正确：
+
+```
+query S($s: Boolean!) { a @skip(if: $s) }   变量 s=true   → {"data":{}}          ✅
+query S($s: Boolean!) { a @skip(if: $s) }   变量 s=false  → {"data":{"a":"A"}}   ✅
+query L { a @skip(if: true) }                             → {"data":null,"errors":[{"message":"no roots found for L"}]}   ❌
+```
+
+因此规避方案是：**把根字段上的条件指令参数从字面量改成变量**。注意这只在"全部根字段都被裁掉"时才会触发；部分根字段被裁掉不受影响。
+
+### 13.3 两条链路共有的规范缺口（85 条）
+
+绝大部分位于**共用的 parse / validate 阶段**或属于当前 schema 模型无法表达的能力，迁移到 sgraph **不会**改善也不会恶化：
+
+- parse：`null` 字面量、可执行定义 description、`VARIABLE_DEFINITION` 指令位置、`\u{...}` 转义、代理对合成；
+- validate：Executable Definitions、Operation Type Existence、Single Root Field、fragment 环（**栈溢出**而非报错）、Input Object Field Uniqueness（规则注册键错误导致从未触发）、Directives Are Unique per Location；
+- 输入强制转换过宽：`Int!` 接受 `true`/`"5"`/`1.5`，`Boolean` 接受 `0`/`1` 等；
+- request error 响应仍含 `data` 键；
+- September 2025 新增内省能力缺失：`__Schema.description`、`__Type.specifiedByURL`、`__Type.isOneOf`、`includeDeprecated` 系列、`__Directive.isRepeatable`、内置 `@specifiedBy` / `@oneOf`、OneOf 输入对象等。
+
+### 13.4 与旧文档的冲突点
+
+| 位置 | 旧文档写法 | 实际 |
+|---|---|---|
+| `SGRAPH_USAGE_NOTES.md` §参数依赖字段限制 | 使用 `fieldResultPaths` 作为配置名 | 公开配置字段是 `FieldResponseParamSource.ResultPath`；`fieldResponsePaths` 是内部字段名，调用方接触不到 |
+| 旧报告 | 称函数属性问题为"输出指针字符串且不报错" | 已修复为 null + field error |
+| 本手册旧版 §9.5 | 称父侧 key 推断为"遍历父类型全部字段，取第一个 `ID` 类型字段"，并把多 `ID` 字段仅标注为"结果不确定"的提示 | 已按候选唯一才推断修复；多候选时 bulk 编译期报歧义错误。且该推断影响的是**所有** list 子字段，不只是 bulk（§5.4） |
+
+---
+
+## 14. 排错手册：错误文案对照表
+
+> 表中带具体值的文案（`field 1 has no resolver function`、`bulk result key field "groupId" is missing for field users` 等）均已实际触发核对，不是从源码格式串推断的。
+
+| 错误文案 | 阶段 | 原因 | 处置 |
+|---|---|---|---|
+| `another sgraph engine is already registered for this schema` | 启动 | 该 Schema 已被别的 Engine 绑定（常见于请求早于注册，被兜底 Engine 抢占） | 视为启动失败。检查启动顺序：注册必须在任何请求（含健康检查、预热）之前 |
+| `schema must have a query type` | 启动 | `NewSGraphEngine` 传入的 schema 为 nil 或无 Query 类型 | 检查 schema 构建 |
+| `directive registry is frozen` / `ParamRegistry already frozen` | 启动 | Engine 创建后又往 Registry 里注册 | 全部注册必须在 `NewSGraphEngine` 之前 |
+| `no directive compiler found for X` | 编译 | 文档里用了未登记的指令 | `Register` 或 `RegisterMetadataOnly` 补登记（§10） |
+| `field %d has no resolver function` | 编排 | 根字段没有 resolver | 补 resolver（§4.4） |
+| `field %d has param plan but no resolver` | 编排 | 字段声明了参数但没有 resolver | 补 resolver 或删参数（§4.4） |
+| `field %d has bulk param plan but no bulk resolver` | 编排 | 同上，bulk 版本 | 补 `BulkResolve` 或删参数 |
+| `no roots found for X` | 编排 | 根选择集被**字面量**条件指令全部裁剪 | **已知缺陷**（§13.2）。规避：把条件参数改成变量（`@skip(if: $s)`），实测行为正确 |
+| `field dependency cycle detected:[...]` | 编排 | `FIELD_RESPONSE` 依赖成环 | 检查参数绑定，打破环 |
+| `field %d cannot depend on itself` | 编排 | 参数来源指向自身 | 改来源 |
+| `field %d depends on field %d which does not produce a FieldResponse` | 编排 | `FIELD_RESPONSE` 依赖边指向了没有 Step、因而不能产出 `FieldResponse` 的 FieldPlan | ParamRegistry 的 producer 必须有显式 `Resolve`/`BulkResolve`。符合内部物化条件的无 resolver 中间字段会自动生成 Step；字段自身带参数、无需运行时物化或不满足物化条件时仍不会产出 `FieldResponse` |
+| `field %d should not use bulk resolver` | 编排 | 非 list 父字段下配了 bulk | 只有 list 父的子字段能用 bulk |
+| `root field %d should not use bulk resolver` | 编排 | 根字段配了 bulk | 移除 |
+| `bulk resolver field %d under an abstract parent requires an explicit FIELD_RESPONSE dependency on parent field %d` | 编排 | 抽象类型父下的 bulk 没声明父依赖 | 按 §9.6 加一条指向父字段的 `FIELD_RESPONSE` 绑定 |
+| `parent key field name for bulk resolver X result binding is empty` | 编译 | 父类型找不到 `ID` 类型字段 | 给父类型加 `id: ID!` |
+| `parent key field name for bulk resolver X result binding is ambiguous: parent type Y declares multiple ID fields [...]` | 编译 | 父类型有多个 `ID` 字段又没有 `id`，无法唯一确定身份字段 | 给父类型加 `id: ID!`（§5.4 §9.5）。框架不猜：选错字段会让映射整体落空并静默返回空列表 |
+| `result parent key field name for result binding is empty` | 编译 | 配了 `BulkResolve` 但没配 `BulkResultMappedFieldName` | 补上 |
+| `bulk resolver field X must return object values carrying <key>` | 编译 | bulk 字段的基础返回类型是 Scalar/Enum | 改成对象类型 |
+| `param registry target X.Y contains unknown argument "Z"` | 编译 | 目标参数没在 schema `Args` 里声明 | 在 schema 里声明该参数 |
+| `field parameter target X.Y(Z:) at [...] did not match the operation` | 编译 | 绑定的路径/类型名/字段名与实际 plan 对不上 | 核对 `ResponsePath`（含自身、用 alias）、`ParentTypeName`（父类型名） |
+| `... FIELD_RESPONSE source field N has no resolver` | 编译 | 来源字段没有 resolver | 把来源指向有 resolver 的祖先字段，用 `ResultPath` 下钻（§8.3） |
+| `... FIELD_RESPONSE source X.Y at [...] is ambiguous` | 编译 | 来源定位命中多个字段 | 补全 `ResponsePath` 使其唯一 |
+| `... cannot consume multi-result FIELD_RESPONSE source field N in SingleCallStep field M` | 编译 | 单值字段消费了可能多值的来源 | 改用 bulk，或把消费者放到 list 内 |
+| `@skip does not support FIELD_RESPONSE parameters` | 注册 | 给条件指令配了字段结果来源 | 只能用 `CONST` / `INPUT`（§8.3） |
+| `introspection field X.Y cannot be overridden` | 注册 | 目标是内省字段 | 内省字段不可覆盖 |
+| `... references variable $X which is not used by the validated operation` | 编译 | `INPUT` 来源引用了 operation 未使用的变量 | 改用被实际使用的变量，或改用 `CONST` |
+| `bulk result key field %q is missing for field X` | 运行 | bulk 结果元素缺少回填 key | 保证每个结果元素都带 `BulkResultMappedFieldName` 字段 |
+| `bulk resolver for non-list field X returned duplicate key %q` | 运行 | 非 list 字段的 bulk 结果里同一 key 出现多次 | 去重，或把字段类型改成 list |
+| `bulk resolver for field X must return an iterable result` | 运行 | bulk 返回了非切片 | 返回切片 |
+| `parent key field %q is missing for field X` | 运行 | list 父类型带 `ID` 字段启用了业务 key 绑定，但父 resolver 的返回值里没有该字段。**普通逐元素字段同样会触发，不限于 bulk** | 父 resolver 在返回 map 里带上该 key（不需要出现在选择集里）；或让父类型不含 `ID` 字段以走 occurrence 路径绑定（§5.4） |
+| `duplicate parent binding key %q for field X` | 运行 | 父 key 的值在多个父元素上重复 | ⚠️ 只报一条错，但 `data` 里重复 key 的父元素会**显示同一份子结果**（错配而非 null）。保证 key 值逐父元素唯一（§5.4） |
+| `parent response for field X does not support composite key mapping` | 执行/组装 | 启用了业务 key 绑定，但父元素不是精确的 `map[string]any` | 父 resolver 返回 `map[string]any`，或者去掉父类型的 `ID` 字段以使用 occurrence 路径绑定（§5.4） |
+| `Cannot return null for non-nullable field Parent.field.` | 执行/组装 | non-null 字段或 non-null list item 完成后为 null | 修正 resolver 返回值；错误会按规范冒泡到最近的 nullable 父级 |
+| `User Error: expected iterable, but did not find one for field Parent.field.` | 执行/组装 | list 字段返回了非 slice/array/可迭代值 | 返回合法列表载体 |
+| `Abstract type X must resolve to an Object type at runtime ... received "<nil>".` | 组装 | `ResolveType` 与 possible type 的 `IsTypeOf` 都无法确定运行时 Object | 补齐 `ResolveType` 或实现对象的 `IsTypeOf`，并保证返回值可被识别 |
+| `Runtime Object type "X" is not a possible type for "Y".` | 组装 | `ResolveType` 返回的 Object 不属于 Interface/Union 的 possible types | 修正抽象类型注册或 `ResolveType` 返回值 |
+| `cannot serialize leaf value for X:T` | 组装 | Scalar/Enum 的 `Serialize` 返回 nullish、panic，或值不在枚举/标量有效范围内 | 修正 resolver 返回值或自定义 scalar 的 `Serialize` |
+| `Variable "$x" of required type "T!" was not provided.` | 变量 | 必填变量未提供，或按当前变量协变规则被判定为缺失 | 提供合法的非 null 变量值 |
+| `Variable "$x" got invalid value <JSON>.\n<原因>` | 变量 | 变量值无法转换为声明的 GraphQL 输入类型 | 按后续原因修正值；原因会包含 `Expected type`、`Expected "T!", found null`、`In field`、`In element #N` 或 `found not an object` 等路径信息。`N` 为 1 起始的元素序号 |
+| `field X resolves to a function value; ...` | 组装 | map/struct 属性是函数 | 改成 resolver（§5.3） |
+| **配置好像没生效，也没有任何报错** | — | `DocumentBody` 与运行时 query 文本不是逐字节相同 | §8.6，把 query 抽成唯一常量 |
+| **bulk 子字段全是 `[]`，`errors` 为空** | — | 父侧 key 与 `BulkResultMappedFieldName` 的值语义不对齐，映射整体落空 | 核对两端取的是不是同一个业务标识；父类型显式声明 `id: ID!`（§9.5） |
+
+---
+
+## 15. 上线检查清单
+
+**启动装配**
+
+- [ ] Schema 构建完成后才创建 Registry，Registry 注册完成后才 `NewSGraphEngine`
+- [ ] `RegisterSGraphEngine` 的返回值被检查，出错即 fail fast
+- [ ] HTTP / RPC 路由注册、健康检查、预热请求、启动自检**全部**晚于 `RegisterSGraphEngine`
+- [ ] 多 Schema 场景下每个 Schema 各自完成一遍上述顺序
+- [ ] 启动时遍历 `schema.Directives()` 与 `DirectiveRegistry` 对账，缺失即启动失败
+
+**代码改造**
+
+- [ ] 全仓搜索 `p.Source` / `params.Source`，确认业务 resolver 不再依赖它
+- [ ] 全仓搜索 `.Data.(map[string]interface{})`，改成 JSON 路径
+- [ ] 每个根字段都有 `Resolve`
+- [ ] 每个有 `Args` 的字段都有 `Resolve`（内省字段除外）
+- [ ] 没有 map/struct 属性写成函数
+- [ ] subscription 相关代码另行处理
+
+**ParamRegistry**
+
+- [ ] 每条注册的 query 文本抽成唯一常量，注册与执行共用
+- [ ] 启动自检对每条注册的 query 跑一次编译，确认无 `did not match the operation`
+- [ ] 关键 query 的批次拓扑被测试固化（避免后续改动意外把并发变串行）
+
+**list 父子关联（对 bulk 和普通逐元素字段同样适用，§5.4）**
+
+- [ ] 逐一检查会作为 list 元素出现的每个对象类型：有没有 `ID` 字段？
+- [ ] 有 `ID` 字段的，显式声明 `id: ID!`（避免多 `ID` 字段歧义）
+- [ ] 父 resolver 的返回 map 里**每次都带上**该 key 字段（查询里选不选它无关）
+- [ ] 该 key 的值逐父元素唯一（重复会造成子结果错配，只报一条错但 data 是错的）
+- [ ] 不想启用业务 key 绑定的类型，标识符用 `String` 而不是 `ID`
+
+**Bulk**
+
+- [ ] bulk 结果每个元素都带 `BulkResultMappedFieldName` 字段
+- [ ] `BulkResultMappedFieldName` 的值与父侧 key 取的是**同一个业务标识**（不对齐会静默返回空列表）
+- [ ] 非 list 字段的 bulk 结果无重复 key
+- [ ] bulk 参数声明在 `Args`（不是 `BulkArgs`）
+- [ ] 保留了等价的 `Resolve` 兜底
+
+**回归**
+
+- [ ] 响应字段顺序变化对客户端无影响
+- [ ] `errors` 数组变长（叶子强制转换失败现在会报错）对客户端无影响
+- [ ] 显式 `null` 变量的默认值行为变化已确认
+- [ ] `-race` 下跑一遍并发用例
+- [ ] 全量 query 集合跑一遍，确认没有 `no roots found` / `no directive compiler found`
+
+---
+
+## 附：一页速查
+
+```
+装配顺序   Schema → DirectiveRegistry → ParamRegistry → NewSGraphEngine → RegisterSGraphEngine → 放流量
+
+传值        p.Source 恒为 nil
+            → resolver 自取数（保持折叠）
+            → FIELD_RESPONSE 参数注入（进下一批次）
+            → bulk（1 次调用）
+
+折叠规则    无依赖              → 同批并发
+            有 FIELD_RESPONSE   → 消费者进下一批
+            list/抽象父 + 普通 resolver → 自动依赖父，必进下一批
+            list 父 + bulk 且不依赖父   → 与父同批并发   ← 最优形态
+
+父子关联    list 元素类型有 ID 字段 → 业务 key 绑定（父 resolver 必须返回它、值须唯一）
+            list 元素类型无 ID 字段 → occurrence 路径绑定（不依赖任何业务字段）
+            多个 ID 字段又无 id     → 普通迭代走路径绑定；bulk 编译期报歧义
+
+读响应      Result.Data 是 *SGraphResponseOrderedMap，只能 json.Marshal
+
+三个静默陷阱
+            ① ParamRegistry 的 DocumentBody 与运行时 query 差一个字节 → 全部绑定静默失效
+            ② bulk 两端 key 语义不对齐 → 子字段全是 []，errors 为空
+            ③ 父 key 值重复 → 只报一条错，但 data 里多个父元素显示同一份子结果
+```
