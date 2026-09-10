@@ -1,0 +1,51 @@
+{
+  "shopify": {
+    "enabled": true,
+    "shop": "your-dev-store",
+    "version": "2026-07",
+    "token_env": "SHOPIFY_STOREFRONT_TOKEN"
+  },
+  "shopline": {
+    "enabled": false,
+    "handle": "your-store",
+    "version": "v20250301",
+    "token_env": "SHOPLINE_STOREFRONT_TOKEN"
+  },
+  "fixtures": {
+    "page_size": 10,
+    "product_handles": [
+      "seeded-product-0001",
+      "seeded-product-0002",
+      "seeded-product-0003"
+    ],
+    "collection_handles": [
+      "seeded-collection-01",
+      "seeded-collection-02"
+    ],
+    "search_terms": ["shirt", "mug", "poster"],
+    "accounts": []
+  },
+  "run": {
+    "scenarios": [],
+    "samples_per_scenario": 200,
+    "warmup_per_scenario": 20,
+    "concurrency": 1,
+    "pair_gap_ms": 30,
+    "qps_readonly": 4,
+    "qps_auth": 0.5,
+    "timeout": "10s",
+    "accept_encoding_identity": true,
+    "seed": 1,
+    "bootstrap_iters": 2000,
+    "throttle": {
+      "shopify": { "mode": "qps", "qps": 4 },
+      "shopline": { "mode": "compute_budget", "budget_seconds_per_second": 1.0, "safety": 0.6 }
+    }
+  },
+  "gates": {
+    "size_delta_max": 0.10,
+    "req_size_abs_tolerance_bytes": 256,
+    "max_semantic_depth": 2,
+    "max_error_rate": 0.01
+  }
+}
